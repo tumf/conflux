@@ -770,6 +770,7 @@ mod acceptance_execution_boundary_context {
             },
             executable_identity: "f".repeat(64),
             gates,
+            declaration_defects: Vec::new(),
             created_at: chrono::Utc::now(),
             absolute_deadline_secs: 3600,
             work_budget_secs: 3570,
@@ -780,6 +781,9 @@ mod acceptance_execution_boundary_context {
         ManifestGate {
             verification_id: id.to_string(),
             argv: vec!["cargo".to_string(), "test".to_string(), id.to_string()],
+            env_names: Vec::new(),
+            env_binding_digest: crate::orchestration::acceptance::verification_evidence::empty_env_binding_digest(),
+            env: Default::default(),
             cwd: ".".to_string(),
             automation_path: "src/lib.rs".to_string(),
             automation_blob_oid: "1".repeat(40),
@@ -961,6 +965,37 @@ mod acceptance_execution_boundary_context {
         );
         assert!(
             context.contains("never a finding against the change"),
+            "{context}"
+        );
+    }
+
+    /// The reviewer is told which bindings a gate carries, never their values.
+    #[test]
+    fn rerun_leading_env_boundary_context_lists_names_and_never_values() {
+        use crate::orchestration::acceptance::verification_evidence::EnvBindings;
+        const SENTINEL: &str = "rerun-leading-env-sentinel-e1a7c3";
+        let env = EnvBindings::from_assignments([("DJANGO_SETTINGS_MODULE", SENTINEL)]);
+        let gate = ManifestGate {
+            env_names: env.names(),
+            env_binding_digest: env.digest(),
+            env,
+            ..gate("focused-gate")
+        };
+
+        let context = boundary(
+            &manifest(vec![gate]),
+            &GateResults::default(),
+            &store_root(),
+        );
+
+        assert!(!context.contains(SENTINEL), "{context}");
+        assert!(
+            context.contains("\"env_names\":[\"DJANGO_SETTINGS_MODULE\"]"),
+            "{context}"
+        );
+        assert!(
+            context
+                .contains("DJANGO_SETTINGS_MODULE=\\u003credacted\\u003e cargo test focused-gate"),
             "{context}"
         );
     }

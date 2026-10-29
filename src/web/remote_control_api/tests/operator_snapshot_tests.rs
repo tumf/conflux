@@ -2062,3 +2062,85 @@ async fn summary_totals_classify_pushed_and_rejecting_the_same_in_both_construct
         assert_eq!(snapshot.total_changes, 3, "{path}: every row is counted");
     }
 }
+
+/// A gate failure's operator detail is built from Conflux-generated command
+/// metadata: planner defects, gate verdict evidence, and the redacted command.
+/// Projected through `/api/v2` state, none of it carries a binding value.
+#[tokio::test]
+async fn rerun_leading_env_error_detail_projection_carries_no_binding_value() {
+    use crate::openspec::VerificationDeclaration;
+    use crate::orchestration::acceptance::execution_manifest::{
+        plan_declared_gates, GateOutcome, GateResults,
+    };
+    use crate::orchestration::acceptance::gate_execution::{classify_gate_results, GateVerdict};
+
+    const SENTINEL: &str = "rerun-leading-env-sentinel-0b93fe";
+    let declaration = |id: &str, command: String| VerificationDeclaration {
+        id: Some(id.to_string()),
+        phase: Some("pre-integration".to_string()),
+        execution_class: Some("repository-local".to_string()),
+        completion_role: Some("change-blocking".to_string()),
+        automation: Some("Cargo.toml".to_string()),
+        evidence: Some(command.clone()),
+        rerun: Some(command),
+        prerequisites: Some(Vec::new()),
+        ..VerificationDeclaration::default()
+    };
+
+    let valid = plan_declared_gates(&[declaration(
+        "env-gate",
+        format!("DJANGO_SETTINGS_MODULE={SENTINEL} cargo test"),
+    )]);
+    let request = &valid.gates[0];
+    let failed = GateResults {
+        outcomes: vec![GateOutcome::Failed {
+            verification_id: request.verification_id.clone(),
+            exit_code: 1,
+            artifact_path: "gates/env-gate.log".to_string(),
+        }],
+    };
+    let GateVerdict::Failed { evidence } = classify_gate_results(&failed) else {
+        panic!("a failed gate is a fail verdict");
+    };
+    let invalid = plan_declared_gates(&[declaration(
+        "bad-gate",
+        format!("1BAD={SENTINEL} cargo test"),
+    )]);
+
+    let detail = format!(
+        "Acceptance failed on a declared change-blocking verification: {} | {} | {}",
+        request.render(),
+        evidence.join(" | "),
+        invalid
+            .defects
+            .iter()
+            .map(|defect| defect.summary())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+
+    let (web_state, reducer, _) = wired_web_state(&["c1"]).await;
+    web_state.update(&[change("c1")]).await;
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::ProcessingError {
+            id: "c1".to_string(),
+            error: detail,
+        },
+    )
+    .await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let published = snapshot.changes[0].error_detail.as_deref().unwrap();
+    assert!(
+        published.contains("DJANGO_SETTINGS_MODULE=<redacted>"),
+        "{published}"
+    );
+    assert!(
+        published.contains("declaration_invalid_assignment"),
+        "{published}"
+    );
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    assert!(!serialized.contains(SENTINEL), "{serialized}");
+}

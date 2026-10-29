@@ -23,7 +23,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use super::execution_manifest::{
-    digest_change_inputs, digest_text, eligible_gates, partition_deadline,
+    digest_change_inputs, digest_text, partition_deadline, plan_declared_gates,
     AcceptanceExecutionManifest, ManifestGate, SkillIdentity, MANIFEST_SCHEMA,
 };
 use super::verification_evidence::{EvidenceStore, RepositoryFacts, ToolIdentity};
@@ -183,8 +183,16 @@ pub async fn build_manifest<F: RepositoryFacts>(
         format!("{review_base_commit}..{candidate_commit_oid}")
     };
 
+    // The shared planner, never a filter: a required declaration that cannot be
+    // supervised is recorded as a defect on the frozen manifest instead of
+    // silently leaving the allowlist. A defect is a statement about the
+    // candidate, not a build failure, so it never becomes a
+    // `ManifestBuildError` (which would classify as a runtime hold). The plan
+    // carries no gate when it carries a defect.
+    let plan = plan_declared_gates(declarations);
+    let declaration_defects = plan.defects;
     let mut gates = Vec::new();
-    for request in eligible_gates(declarations) {
+    for request in plan.gates {
         let automation_blob_oid = facts
             .tracked_blob_oid(workspace, &request.automation_path)
             .await
@@ -204,6 +212,9 @@ pub async fn build_manifest<F: RepositoryFacts>(
         gates.push(ManifestGate {
             verification_id: request.verification_id,
             argv: request.argv,
+            env_names: request.env.names(),
+            env_binding_digest: request.env.digest(),
+            env: request.env,
             cwd: request.cwd,
             automation_path: request.automation_path,
             automation_blob_oid,
@@ -233,6 +244,7 @@ pub async fn build_manifest<F: RepositoryFacts>(
         skill,
         executable_identity: executable_identity(),
         gates,
+        declaration_defects,
         created_at: Utc::now(),
         absolute_deadline_secs: partition.absolute_secs,
         work_budget_secs: partition.work_secs,

@@ -132,6 +132,8 @@ Gate result statuses and what each means for you:
 | `refused` | the runtime could not run it (environment, prerequisite, earlier failure) | a runtime/environment fact; never a finding against the change |
 | `deadline_exhausted` | the shared budget ran out before it finished | a runtime fact; never a finding against the change |
 
+A declared gate whose command starts with environment assignments is shown as `NAME=<redacted>` followed by the executable argv, with the names also listed in `env_names`. The runtime applied the real values to the gate's child process and bound them into gate identity by digest; you never need a value to judge the gate, and its absence is not a finding.
+
 If no manifest is supplied, the guidance in the rest of this skill applies unchanged.
 
 ## Verification Completion Ownership

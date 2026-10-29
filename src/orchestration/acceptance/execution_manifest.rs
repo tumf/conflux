@@ -54,9 +54,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::verification_evidence::{
-    eligible_request, is_storable_verification_id, EvidenceStore, ToolIdentity, VerificationRequest,
+    eligible_request, empty_env_binding_digest, is_storable_verification_id, render_command,
+    DeclarationDefect, EnvBindings, EvidenceStore, IneligibleReason, ToolIdentity,
+    VerificationRequest,
 };
-use crate::openspec::VerificationDeclaration;
+use crate::openspec::{
+    VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
+};
 
 /// The only phase whose declarations may block a change before integration.
 pub const PRE_INTEGRATION_PHASE: &str = "pre-integration";
@@ -414,7 +418,22 @@ pub fn partition_deadline(absolute_secs: u64) -> DeadlinePartition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestGate {
     pub verification_id: String,
+    /// Executable plus arguments. Never contains a leading assignment.
     pub argv: Vec<String>,
+    /// Sorted, distinct names of the effective environment bindings.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    /// Full-length digest of the effective bindings — identity by digest,
+    /// never by value.
+    #[serde(default = "empty_env_binding_digest")]
+    pub env_binding_digest: String,
+    /// The binding values themselves, in memory only.
+    ///
+    /// Never serialized: a manifest written to the store carries names and the
+    /// digest, never a value. The manifest is frozen and executed by the same
+    /// owner, so the runtime that starts the child still holds the values.
+    #[serde(skip)]
+    pub env: EnvBindings,
     pub cwd: String,
     pub automation_path: String,
     /// Full-length blob ID of the automation file at the candidate commit, or
@@ -436,6 +455,8 @@ impl ManifestGate {
         serde_json::json!({
             "verification_id": self.verification_id,
             "argv": self.argv,
+            "env_names": self.env_names,
+            "env_binding_digest": self.env_binding_digest,
             "cwd": self.cwd,
             "automation_path": self.automation_path,
             "automation_blob_oid": self.automation_blob_oid,
@@ -452,6 +473,7 @@ impl ManifestGate {
         VerificationRequest {
             verification_id: self.verification_id.clone(),
             argv: self.argv.clone(),
+            env: self.env.clone(),
             cwd: self.cwd.clone(),
             automation_path: self.automation_path.clone(),
         }
@@ -726,7 +748,17 @@ pub struct AcceptanceExecutionManifest {
     #[serde(default)]
     pub executable_identity: String,
     /// Every eligible declared change-blocking gate, ordered by verification ID.
+    ///
+    /// Always empty when [`Self::declaration_defects`] is not: an invalid
+    /// required manifest offers no gate to run and no gate to reuse.
     pub gates: Vec<ManifestGate>,
+    /// Typed defects of the proposal's declaration list, in declaration order.
+    ///
+    /// Empty for a valid manifest. Non-empty is an *invalid required manifest*,
+    /// which is what distinguishes "a required declaration could not be
+    /// supervised" from a legitimately empty allowlist.
+    #[serde(default)]
+    pub declaration_defects: Vec<DeclarationDefect>,
     pub created_at: DateTime<Utc>,
     /// Shared effective absolute deadline, in seconds, for gates plus review.
     #[serde(default)]
@@ -761,6 +793,11 @@ impl AcceptanceExecutionManifest {
                 .iter()
                 .map(ManifestGate::fingerprint_value)
                 .collect::<Vec<_>>(),
+            "declaration_defects": self
+                .declaration_defects
+                .iter()
+                .map(DeclarationDefect::to_json)
+                .collect::<Vec<_>>(),
         });
         // `serde_json::Value` serializes maps in the order this literal declares,
         // and every nested value is built the same way, so the byte sequence is
@@ -785,6 +822,14 @@ impl AcceptanceExecutionManifest {
         !self.gates.is_empty()
     }
 
+    /// Whether the proposal's required declarations could not all be planned.
+    ///
+    /// Distinct from `!has_gates()`: an empty allowlist with no defects is a
+    /// legitimate boundary, an invalid required manifest is a `fail` verdict.
+    pub fn is_declaration_invalid(&self) -> bool {
+        !self.declaration_defects.is_empty()
+    }
+
     /// Machine-readable projection handed to the semantic reviewer.
     ///
     /// Carries the frozen candidate, the exact review range, the fingerprint,
@@ -803,9 +848,15 @@ impl AcceptanceExecutionManifest {
                 .iter()
                 .map(|gate| serde_json::json!({
                     "verification_id": gate.verification_id,
-                    "command": gate.argv.join(" "),
+                    "command": render_command(&gate.env_names, &gate.argv),
+                    "env_names": gate.env_names,
                     "automation": gate.automation_path,
                 }))
+                .collect::<Vec<_>>(),
+            "declaration_defects": self
+                .declaration_defects
+                .iter()
+                .map(DeclarationDefect::to_json)
                 .collect::<Vec<_>>(),
         })
     }
@@ -916,6 +967,11 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<AcceptanceExecutionManifest, Manif
             }
         }
         previous = Some(gate.verification_id.as_str());
+    }
+    if !manifest.declaration_defects.is_empty() && !manifest.gates.is_empty() {
+        return Err(ManifestDefect::Malformed(
+            "a manifest with declaration defects must carry no gate".to_string(),
+        ));
     }
     Ok(manifest)
 }
@@ -1331,30 +1387,173 @@ where
     }
 }
 
-/// Which declarations the manifest is allowed to contain.
+/// The shared declaration planner's answer for one proposal.
 ///
-/// All four conditions, conjunctively. A declaration that fails any of them is
-/// not a weaker gate — it is simply not part of the blocking boundary, and its
-/// absence can never keep Acceptance open.
-pub fn is_eligible_declaration(declaration: &VerificationDeclaration) -> bool {
-    let phase_ok = declaration
-        .phase
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|phase| phase == PRE_INTEGRATION_PHASE);
-    phase_ok && eligible_request(declaration).is_ok()
+/// The only way any consumer — strict validation, `cflx openspec verify`, or the
+/// native Acceptance manifest — derives the blocking gate set. `gates` is empty
+/// whenever `defects` is not, so a consumer that forgets to look at the defects
+/// still cannot run or reuse a gate from an invalid required manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclarationPlan {
+    /// Supervisable requests of every required declaration, in canonical
+    /// verification-ID order. Empty when any defect exists.
+    pub gates: Vec<VerificationRequest>,
+    /// Every declaration defect, in declaration order.
+    pub defects: Vec<DeclarationDefect>,
 }
 
-/// Select and normalize every eligible declared gate, in canonical order.
-pub fn eligible_gates(declarations: &[VerificationDeclaration]) -> Vec<VerificationRequest> {
-    let mut requests: Vec<VerificationRequest> = declarations
-        .iter()
-        .filter(|declaration| is_eligible_declaration(declaration))
-        .filter_map(|declaration| eligible_request(declaration).ok())
-        .collect();
-    requests.sort_by(|left, right| left.verification_id.cmp(&right.verification_id));
-    requests.dedup_by(|left, right| left.verification_id == right.verification_id);
-    requests
+impl DeclarationPlan {
+    /// Whether the required set is usable as a blocking boundary.
+    pub fn is_valid(&self) -> bool {
+        self.defects.is_empty()
+    }
+}
+
+/// Plan the blocking gate set of one proposal's ordered declaration list.
+///
+/// Classification is separate from eligibility, which is the whole point: a
+/// required (`completion_role: change-blocking`) declaration that cannot be
+/// supervised is a typed defect rather than something that silently leaves the
+/// allowlist. Rules, in order:
+///
+/// 1. A non-empty trimmed `id` declared more than once makes every occurrence a
+///    `declaration_duplicate_id` defect, whatever its role. No deduplication.
+/// 2. Required-ness is read from `completion_role` alone; non-required and
+///    legacy declarations produce neither gates nor defects.
+/// 3. A required declaration off `pre-integration` or off `repository-local` is
+///    `declaration_role_conflict` on the offending field.
+/// 4. Identity, command, and automation, through the same derivation reuse uses.
+///
+/// Pure: no PATH lookup, no Git state, no network.
+pub fn plan_declared_gates(declarations: &[VerificationDeclaration]) -> DeclarationPlan {
+    let trimmed_id = |declaration: &VerificationDeclaration| {
+        declaration
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    };
+    let mut positions_by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        if let Some(id) = trimmed_id(declaration) {
+            positions_by_id.entry(id).or_default().push(index + 1);
+        }
+    }
+
+    let mut plan = DeclarationPlan::default();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let position = index + 1;
+        let id = trimmed_id(declaration);
+        let label = id
+            .clone()
+            .unwrap_or_else(|| format!("<position {position}>"));
+        let defect = |field: &str, code: &str, detail: String| DeclarationDefect {
+            verification_id: label.clone(),
+            position,
+            field: field.to_string(),
+            code: code.to_string(),
+            detail,
+        };
+
+        if let Some(positions) = id
+            .as_ref()
+            .and_then(|id| positions_by_id.get(id))
+            .filter(|positions| positions.len() > 1)
+        {
+            let listed = positions
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            plan.defects.push(defect(
+                "id",
+                "declaration_duplicate_id",
+                format!(
+                    "verification id '{label}' is declared more than once (positions {listed})"
+                ),
+            ));
+            continue;
+        }
+
+        let required = declaration
+            .completion_role
+            .as_deref()
+            .and_then(VerificationCompletionRole::parse)
+            == Some(VerificationCompletionRole::ChangeBlocking);
+        if !required {
+            continue;
+        }
+
+        let phase = declaration.phase.as_deref().map(str::trim).unwrap_or("");
+        let local = declaration
+            .execution_class
+            .as_deref()
+            .and_then(VerificationExecutionClass::parse)
+            .is_some_and(VerificationExecutionClass::is_repository_local);
+        let mut role_conflict = false;
+        if phase != PRE_INTEGRATION_PHASE {
+            role_conflict = true;
+            plan.defects.push(defect(
+                "phase",
+                "declaration_role_conflict",
+                format!(
+                    "completion_role: change-blocking requires phase: {PRE_INTEGRATION_PHASE}, \
+                     found '{phase}'"
+                ),
+            ));
+        }
+        if !local {
+            role_conflict = true;
+            plan.defects.push(defect(
+                "execution_class",
+                "declaration_role_conflict",
+                format!(
+                    "completion_role: change-blocking requires execution_class: repository-local, \
+                     found '{}'",
+                    declaration.execution_class.as_deref().unwrap_or("").trim()
+                ),
+            ));
+        }
+        if role_conflict {
+            continue;
+        }
+
+        match eligible_request(declaration) {
+            Ok(request) => plan.gates.push(request),
+            Err(reason) => {
+                let field = match &reason {
+                    IneligibleReason::MissingId | IneligibleReason::UnstorableId(_) => "id",
+                    IneligibleReason::MissingCommand => "rerun",
+                    IneligibleReason::ShellSyntax(_)
+                    | IneligibleReason::InvalidAssignment(_)
+                    | IneligibleReason::AssignmentOnly
+                        if declaration.rerun.is_none() =>
+                    {
+                        "evidence"
+                    }
+                    IneligibleReason::ShellSyntax(_)
+                    | IneligibleReason::InvalidAssignment(_)
+                    | IneligibleReason::AssignmentOnly => "rerun",
+                    IneligibleReason::MissingAutomation => "automation",
+                    // Unreachable after the role checks above; reported under
+                    // the role field rather than dropped if that ever changes.
+                    IneligibleReason::NotRepositoryLocal => "execution_class",
+                    IneligibleReason::NotChangeBlocking => "completion_role",
+                };
+                plan.defects
+                    .push(defect(field, reason.code(), reason.detail()));
+            }
+        }
+    }
+
+    if plan.defects.is_empty() {
+        plan.gates
+            .sort_by(|left, right| left.verification_id.cmp(&right.verification_id));
+    } else {
+        plan.gates.clear();
+    }
+    plan
 }
 
 /// Digest a set of canonical change inputs into one full-length value.

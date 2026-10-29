@@ -2040,3 +2040,432 @@ fn configurable_state_root_rejects_a_relative_root_at_the_tui_entrypoint() {
         );
     }
 }
+
+// ─── Required verification declarations fail closed (real binary) ──────────
+//
+// Every case runs the built `cflx` against a disposable Git repository with
+// HOME, XDG_CONFIG_HOME, and XDG_STATE_HOME pointed at a separate temporary
+// directory, so no evidence, log, or state lands inside the repository.
+
+/// A disposable repository plus the out-of-repository home its state goes to.
+struct FailClosedProject {
+    repo: tempfile::TempDir,
+    home: tempfile::TempDir,
+}
+
+impl FailClosedProject {
+    fn new() -> Self {
+        let project = Self {
+            repo: tempfile::tempdir().expect("repo dir"),
+            home: tempfile::tempdir().expect("home dir"),
+        };
+        init_git_repo(project.repo.path());
+        fs::create_dir_all(project.home.path().join("config")).unwrap();
+        fs::create_dir_all(project.home.path().join("state")).unwrap();
+        project
+    }
+
+    fn state_root(&self) -> std::path::PathBuf {
+        self.home.path().join("state")
+    }
+
+    /// Write `entries` as the change's verification list and commit everything.
+    fn write_change(&self, change: &str, entries: &[String]) {
+        let dir = self.repo.path().join("openspec/changes").join(change);
+        fs::create_dir_all(dir.join("specs/fail-closed")).unwrap();
+        fs::write(
+            dir.join("proposal.md"),
+            format!(
+                "---\nverifications:\n{}---\n# Fail closed fixture\n\n**Change Type**: implementation\n\n## Problem\nfixture\n",
+                entries.concat()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] 1. fixture (verification: unit - cargo test --lib; verification-id: valid-gate)\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("specs/fail-closed/spec.md"),
+            "## ADDED Requirements\n\n### Requirement: Fail closed\n\nThe fixture SHALL fail closed.\n\n#### Scenario: Fail closed\n- **WHEN** it runs\n- **THEN** it fails closed\n",
+        )
+        .unwrap();
+        git(self.repo.path(), &["add", "-A"]);
+        git(self.repo.path(), &["commit", "--quiet", "-m", change]);
+    }
+
+    fn cflx(&self, args: &[&str]) -> std::process::Output {
+        cflx_output_bounded_with_env(
+            self.repo.path(),
+            args,
+            &[
+                ("HOME", self.home.path()),
+                ("XDG_CONFIG_HOME", &self.home.path().join("config")),
+                ("XDG_STATE_HOME", &self.state_root()),
+            ],
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Every file under the state root, by path, with its bytes.
+    fn state_snapshot(&self) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut stack = vec![self.state_root()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    snapshot.insert(path.clone(), fs::read(&path).unwrap());
+                }
+            }
+        }
+        snapshot
+    }
+}
+
+fn fail_closed_declaration(
+    change: &str,
+    id: &str,
+    phase: &str,
+    owner: &str,
+    class: &str,
+    role: &str,
+    command: &str,
+) -> String {
+    format!(
+        "  - id: {id}\n    requirement: fixture behavior\n    phase: {phase}\n    owner: {owner}\n    trigger: pull request\n    automation: openspec/changes/{change}/proposal.md\n    evidence: \"{command}\"\n    rerun: \"{command}\"\n    prerequisites: []\n    execution_class: {class}\n    completion_role: {role}\n"
+    )
+}
+
+fn required_gate(change: &str, id: &str, command: &str) -> String {
+    fail_closed_declaration(
+        change,
+        id,
+        "pre-integration",
+        "conflux-acceptance",
+        "repository-local",
+        "change-blocking",
+        command,
+    )
+}
+
+#[test]
+fn required_verification_fail_closed_validate_rejects_shell_syntax_required_gate() {
+    let project = FailClosedProject::new();
+    project.write_change(
+        "shell-required",
+        &[required_gate(
+            "shell-required",
+            "valid-gate",
+            "cargo test | tee out.log",
+        )],
+    );
+
+    for mode in ["--strict", "--archive-gate"] {
+        let output = project.cflx(&["openspec", "validate", "shell-required", mode]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{mode} must fail: {stderr}");
+        assert!(
+            stderr.contains("shell-required: verification 'valid-gate': rerun: ")
+                && stderr.contains("(declaration_shell_syntax)"),
+            "{mode} must name the ID, field, and code: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn required_verification_fail_closed_validate_accepts_non_required_shell_syntax() {
+    let project = FailClosedProject::new();
+    let change = "shell-observation";
+    project.write_change(
+        change,
+        &[
+            required_gate(change, "valid-gate", "git --version"),
+            fail_closed_declaration(
+                change,
+                "deployed-observation",
+                "post-integration",
+                "repository-automation",
+                "deployed-service",
+                "operational-observation",
+                "curl -fsS https://example.invalid/health | jq .status",
+            ),
+        ],
+    );
+
+    for mode in ["--strict", "--archive-gate"] {
+        let output = project.cflx(&["openspec", "validate", change, mode]);
+        assert!(
+            output.status.success(),
+            "{mode}: a non-required declaration is never rejected for its command: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn required_verification_fail_closed_verify_runs_nothing_and_keeps_evidence() {
+    let project = FailClosedProject::new();
+    let change = "invalid-set";
+    let markers = tempfile::tempdir().expect("marker dir");
+    let valid_marker = markers.path().join("valid-ran");
+    let invalid_marker = markers.path().join("invalid-ran");
+    let valid = required_gate(
+        change,
+        "valid-gate",
+        &format!("touch {}", valid_marker.display()),
+    );
+
+    // A valid required set first: real evidence recorded outside the repository.
+    project.write_change(change, std::slice::from_ref(&valid));
+    let first = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert!(
+        first.status.success(),
+        "the valid set must capture evidence: {} {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(valid_marker.exists(), "the valid gate really ran once");
+    fs::remove_file(&valid_marker).unwrap();
+    let before = project.state_snapshot();
+    assert!(
+        before
+            .keys()
+            .any(|path| path.ends_with("gates/valid-gate.json")),
+        "a pre-existing evidence record is required: {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    // Then a defective required declaration beside it.
+    project.write_change(
+        change,
+        &[
+            valid,
+            required_gate(
+                change,
+                "piped-gate",
+                &format!("touch {} && true", invalid_marker.display()),
+            ),
+        ],
+    );
+    for args in [
+        vec!["openspec", "verify", change, "--plan", "--json"],
+        vec!["openspec", "verify", change, "--json"],
+    ] {
+        let output = project.cflx(&args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{args:?}: stdout must be JSON ({e}): {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        let defects = report["declaration_defects"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{args:?}: declaration_defects missing: {report}"));
+        assert_eq!(defects.len(), 1, "{report}");
+        assert_eq!(defects[0]["verification_id"], "piped-gate");
+        assert_eq!(defects[0]["field"], "rerun");
+        assert_eq!(defects[0]["code"], "declaration_shell_syntax");
+    }
+    assert!(!valid_marker.exists(), "not even the valid gate may run");
+    assert!(!invalid_marker.exists(), "the defective gate never runs");
+    assert_eq!(
+        project.state_snapshot(),
+        before,
+        "existing evidence must be byte-identical"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project.repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "nothing may be written inside the repository: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+// ─── Leading environment assignments in declared commands (real binary) ────
+
+/// The POSIX prefix form runs for real: the child sees the value, the
+/// assignment-free twin fails, and the owner environment is untouched.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn rerun_leading_env_verify_runs_the_prefix_form_through_the_real_binary() {
+    let project = FailClosedProject::new();
+    let change = "leading-env";
+    assert!(std::env::var_os("DJANGO_SETTINGS_MODULE").is_none());
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "env-gate",
+            "DJANGO_SETTINGS_MODULE=config.test_settings printenv DJANGO_SETTINGS_MODULE",
+        )],
+    );
+
+    let plan = project.cflx(&["openspec", "verify", change, "--plan", "--json"]);
+    assert!(
+        plan.status.success(),
+        "--plan must succeed: {}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    assert_eq!(plan["verifications"][0]["outcome"], "rerun", "{plan}");
+
+    let run = project.cflx(&["openspec", "verify", change, "--json"]);
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "the child must observe its binding: {stdout} {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("run JSON");
+    let captured = &report["verifications"][0];
+    assert_eq!(captured["outcome"], "captured", "{report}");
+    assert_eq!(
+        captured["evidence"]["argv"],
+        serde_json::json!(["printenv", "DJANGO_SETTINGS_MODULE"])
+    );
+    assert_eq!(
+        captured["evidence"]["env_names"],
+        serde_json::json!(["DJANGO_SETTINGS_MODULE"])
+    );
+    let artifact = captured["artifact_location"].as_str().expect("artifact");
+    assert!(
+        !Path::new(artifact).starts_with(project.repo.path()),
+        "the artifact lives outside the repository: {artifact}"
+    );
+    assert_eq!(
+        fs::read_to_string(artifact).unwrap().trim(),
+        "config.test_settings"
+    );
+
+    // The same command without the assignment exits non-zero.
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "env-gate",
+            "printenv DJANGO_SETTINGS_MODULE",
+        )],
+    );
+    let bare = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert_eq!(bare.status.code(), Some(1), "unset without the binding");
+    let bare: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("run JSON");
+    assert_eq!(bare["verifications"][0]["outcome"], "command_failed");
+
+    assert!(
+        std::env::var_os("DJANGO_SETTINGS_MODULE").is_none(),
+        "the test process environment is unchanged"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project.repo.path())
+        .output()
+        .unwrap();
+    assert!(status.stdout.is_empty(), "nothing written inside the repo");
+}
+
+/// A non-echoing child proves that no Conflux-generated metadata — `verify`
+/// text and JSON reports, plan reports, or anything under the state root —
+/// carries an assignment value. Raw child output is a separate artifact and
+/// this child prints nothing.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn rerun_leading_env_verify_metadata_never_carries_an_assignment_value() {
+    const SENTINEL: &str = "rerun-leading-env-sentinel-a4c2e9";
+    let project = FailClosedProject::new();
+    let change = "leading-env-secret";
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "secret-gate",
+            &format!("SECRET_TOKEN={SENTINEL} true"),
+        )],
+    );
+
+    let mut outputs = Vec::new();
+    for args in [
+        vec!["openspec", "verify", change, "--plan", "--json"],
+        vec!["openspec", "verify", change, "--plan"],
+        vec!["openspec", "verify", change, "--json"],
+        vec!["openspec", "verify", change],
+        vec!["openspec", "verify", change, "--plan", "--json"],
+    ] {
+        let output = project.cflx(&args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        outputs.push((args, output));
+    }
+    for (args, output) in &outputs {
+        for stream in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            assert!(!text.contains(SENTINEL), "{args:?} leaked: {text}");
+        }
+    }
+    let first_run: serde_json::Value =
+        serde_json::from_slice(&outputs[2].1.stdout).expect("run JSON");
+    assert_eq!(
+        first_run["verifications"][0]["evidence"]["env_names"],
+        serde_json::json!(["SECRET_TOKEN"])
+    );
+    let replan: serde_json::Value =
+        serde_json::from_slice(&outputs[4].1.stdout).expect("plan JSON");
+    assert_eq!(replan["verifications"][0]["verification_id"], "secret-gate");
+
+    let state = project.state_snapshot();
+    assert!(
+        state
+            .keys()
+            .any(|path| path.ends_with("gates/secret-gate.json")),
+        "an envelope was written: {:?}",
+        state.keys().collect::<Vec<_>>()
+    );
+    for (path, bytes) in &state {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(SENTINEL),
+            "{} carries the value",
+            path.display()
+        );
+    }
+
+    // An invalid assignment is a declaration defect: non-zero, typed, value-free.
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "secret-gate",
+            &format!("1BAD={SENTINEL} true"),
+        )],
+    );
+    let refused = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let refused_text = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(!refused_text.contains(SENTINEL), "{refused_text}");
+    let refused: serde_json::Value = serde_json::from_str(&refused_text).expect("JSON");
+    assert_eq!(
+        refused["declaration_defects"][0]["code"],
+        "declaration_invalid_assignment"
+    );
+    assert_eq!(refused["declaration_defects"][0]["field"], "rerun");
+    let strict = project.cflx(&["openspec", "validate", change, "--strict"]);
+    assert!(!strict.status.success(), "strict validation fails");
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("(declaration_invalid_assignment)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
+}

@@ -141,7 +141,9 @@ Each verification declaration MUST contain a unique non-empty `id`, a non-empty 
 
 ### Requirement: Verification evidence reuse is bound to current repository state
 
-Conflux MAY reuse successful Apply or runtime-owned Acceptance verification evidence during Acceptance only from a versioned Conflux-owned external cache created by a Conflux-runtime-owned executor that directly supervised the declared process and bound the result to one declared verification ID. The cache MUST resolve outside the target repository and every managed worktree under the configured or platform-default Conflux state root, isolated by project, workspace, and change identity. An agent-authored record MUST NOT be reusable. The version-2 record MUST include the full-length candidate commit object ID and tree ID, exact review base and range, exact argv, repository-relative working directory, tracked automation-file blob identity, tool executable identity, start and end timestamps, exit code, store-relative evidence artifact path and content digest, and clean index/worktree state before and after execution. Acceptance MUST compare every binding with current Git state, the current proposal declaration, and the runtime-owned execution manifest while evaluating target cleanliness without Conflux-path exclusions. A missing, malformed, stale, dirty, mismatched, unsuccessful, agent-authored, deleted, or unverifiable cache record MUST force runtime-owned command execution or a typed hold and MUST NOT imply PASS. Absence or invalidity of cache causes rerun only and never changes the next workflow action. External records MUST remain cache and diagnostics only and MUST NOT control admission, retry, archive, merge, or next-action selection. An unavailable external store or a store resolving inside the target repository or any managed worktree MUST fail closed before command execution and MUST NOT fall back to a target-worktree path.
+Conflux MAY reuse successful Apply or runtime-owned Acceptance verification evidence during Acceptance only from a versioned Conflux-owned external cache created by a Conflux-runtime-owned executor that directly supervised the declared process and bound the result to one declared verification ID. The cache MUST resolve outside the target repository and every managed worktree under the configured or platform-default Conflux state root, isolated by project, workspace, and change identity. An agent-authored record MUST NOT be reusable. The version-2 record MUST include the full-length candidate commit object ID and tree ID, exact review base and range, exact executable argv, the effective environment binding names and their full-length binding digest (never a value), repository-relative working directory, tracked automation-file blob identity, tool executable identity, start and end timestamps, exit code, store-relative evidence artifact path and content digest, and clean index/worktree state before and after execution. Acceptance MUST compare every binding with current Git state, the current proposal declaration, and the runtime-owned execution manifest while evaluating target cleanliness without Conflux-path exclusions. A missing, malformed, stale, dirty, mismatched, unsuccessful, agent-authored, deleted, or unverifiable cache record MUST force runtime-owned command execution or a typed hold and MUST NOT imply PASS. Absence or invalidity of cache causes rerun only and never changes the next workflow action. External records MUST remain cache and diagnostics only and MUST NOT control admission, retry, archive, merge, or next-action selection. An unavailable external store or a store resolving inside the target repository or any managed worktree MUST fail closed before command execution and MUST NOT fall back to a target-worktree path.
+
+The environment binding digest is one more all-fields binding: an envelope whose `env_binding_digest` differs from the current declaration's effective bindings MUST rerun with mismatch field `env_binding_digest`, and an envelope lacking the field MUST be read as the digest of empty bindings.
 
 #### Scenario: Exact successful evidence is reused
 
@@ -227,3 +229,135 @@ Conflux MAY reuse successful Apply or runtime-owned Acceptance verification evid
 **When**: the new runtime evaluates cleanliness or evidence reuse
 **Then**: it does not open, parse, migrate, rewrite, hide, or delete that content
 **And**: a dedicated existence probe reports the path for explicit repository-owner cleanup without evaluating unrelated ignored paths
+
+#### Scenario: Environment binding mismatch reruns
+
+**Given**: otherwise valid evidence whose `env_binding_digest` was recorded for different effective bindings than the current declaration's
+**When**: Acceptance evaluates the record
+**Then**: it reruns the verification with mismatch field `env_binding_digest`
+**And**: no assignment value appears in the mismatch detail
+
+### Requirement: Required verification declarations fail closed
+
+Conflux MUST derive the Acceptance gate set from a proposal's ordered verification declarations through one shared declaration planner that returns both the eligible gate requests and an ordered list of typed declaration defects. The planner MUST be the single selection path for strict validation, `cflx openspec verify`, and the native Acceptance manifest; no consumer may select gates by discarding declarations that fail to convert into a supervisable request.
+
+A declaration is *required* exactly when its structured metadata declares `completion_role: change-blocking`. Legacy declarations without role metadata and `operational-observation` declarations are non-required: they MUST produce neither gates nor defects, regardless of their command text.
+
+The planner MUST report, in this order of evaluation: `declaration_duplicate_id` for every occurrence of an `id` that appears more than once in the list, with identical or different content, naming the ID and every position, with no gate produced for that ID and no deduplication; `declaration_role_conflict` for a required declaration whose `phase` is not `pre-integration` or whose `execution_class` is not `repository-local`; `declaration_missing_id` and `declaration_unstorable_id` for a required declaration without a safe single-component ID; `declaration_missing_command` for a required declaration whose `rerun` (or `evidence` when `rerun` is absent) is empty; `declaration_shell_syntax` for a required command containing any of `|`, `&`, `;`, `<`, `>`, `(`, `)`, `` ` ``, `$`, or that the POSIX-quote tokenizer cannot split, or that yields an empty argv or a blank argument; and `declaration_missing_automation` for a required declaration whose `automation` is absent, empty, absolute, or parent-traversing. Each defect MUST carry the verification ID (or the 1-based position when the ID is missing), the field, the stable code, and a detail; the `declaration_shell_syntax` detail MUST name the offending construct and MUST NOT echo the full command text. The planner MUST NOT resolve executables, read Git state, or access a network.
+
+With zero defects the gates MUST be the required declarations' requests in canonical verification-ID order. With one or more defects the required manifest is *invalid*: no gate from it may be executed or reused by any consumer, and the outcome MUST be distinguishable from a legitimately empty allowlist (zero required declarations, zero defects).
+
+`cflx openspec validate --strict` and `--archive-gate` MUST fail on every defect with a diagnostic naming the change, the verification ID, and the field. `cflx openspec verify --plan` and `cflx openspec verify` MUST report every defect (`declaration_defects` in JSON output), execute no declared command, leave existing evidence records unread and unmodified, and exit non-zero. Native Acceptance MUST record the defects on the frozen manifest and, when any exist, settle as a typed `fail` verdict about the candidate with one finding per defect carrying the leading code `[DECLARATION_INVALID]`, the verification ID, the field, the code, the detail, and the declaration path; it MUST NOT execute or reuse any gate, start a reviewer, write evidence, classify the outcome as `tool_unavailable` or as an external prerequisite, or record a non-resumable execution hold. No configuration, environment variable, or proposal field may bypass the planner, and no implicit shell may be introduced. The supervisable command syntax itself is unchanged by this requirement.
+
+#### Scenario: Valid required declaration becomes exactly one gate
+
+- **GIVEN** a proposal declares one `pre-integration`, `repository-local`, `change-blocking` verification whose command is a plain argv and whose automation path is tracked
+- **WHEN** the declaration planner runs
+- **THEN** it returns exactly one gate for that verification ID and zero defects
+- **AND** native Acceptance executes that gate exactly once before the reviewer starts
+
+#### Scenario: Shell syntax in a required declaration is a defect, not an omission
+
+- **GIVEN** a required declaration whose `rerun` is `cargo test | tee out.log`, `cargo test && cargo clippy`, `cargo test > out.log`, or a command with an unbalanced quote
+- **WHEN** the declaration planner runs
+- **THEN** it returns a `declaration_shell_syntax` defect naming the verification ID, the field, and the offending construct without echoing the full command
+- **AND** it returns no gate for that declaration
+- **AND** the result is an invalid required manifest rather than an empty allowlist
+
+#### Scenario: Duplicate IDs are rejected before any selection
+
+- **GIVEN** two required declarations share the ID `local-tests`, in one case with identical content and in another case with different commands
+- **WHEN** the declaration planner runs
+- **THEN** it returns `declaration_duplicate_id` naming `local-tests` and both positions
+- **AND** no gate is produced for `local-tests`
+- **AND** no declaration is dropped by deduplication
+
+#### Scenario: Non-required declarations and legitimately empty sets are preserved
+
+- **GIVEN** a proposal declares one valid required verification and one `operational-observation` verification whose command contains `$`
+- **WHEN** the declaration planner runs
+- **THEN** it returns one gate and zero defects
+- **AND** a proposal that declares only non-required or legacy declarations yields zero gates and zero defects, and Acceptance proceeds with a closed empty boundary
+
+#### Scenario: Strict validation reports the defect before Apply
+
+- **GIVEN** an active implementation proposal whose required declaration has shell syntax or a missing automation path
+- **WHEN** `cflx openspec validate <id> --strict` or `--archive-gate` runs
+- **THEN** validation fails with a diagnostic naming the change, the verification ID, and the field
+- **AND** an operational-observation declaration with the same command text produces no error from this rule
+
+#### Scenario: verify reports defects and runs nothing
+
+- **GIVEN** a proposal with one defective required declaration and one valid required declaration that would create a marker file when executed
+- **WHEN** `cflx openspec verify <id> --plan` or `cflx openspec verify <id>` runs
+- **THEN** the output reports the defect with its verification ID, field, and code
+- **AND** no declared command is executed and no marker file exists
+- **AND** a pre-existing valid evidence record for the other declaration is unchanged
+- **AND** the exit status is non-zero
+
+#### Scenario: Native Acceptance fails closed without a reviewer
+
+- **GIVEN** a managed candidate whose proposal declares a defective required verification
+- **WHEN** the runtime-owned Acceptance boundary is derived
+- **THEN** the frozen manifest records the defect
+- **AND** Acceptance settles as a `fail` verdict whose findings carry `[DECLARATION_INVALID]`, the verification ID, the field, and `openspec/changes/<id>/proposal.md`
+- **AND** no reviewer subprocess is started, no gate is executed or reused, and no evidence is written
+- **AND** the outcome is neither `tool_unavailable`, nor an external-prerequisite block, nor a non-resumable execution hold
+
+#### Scenario: Declaration defects are never infrastructure
+
+- **GIVEN** a required declaration whose command is defective and whose first token would not resolve on PATH
+- **WHEN** Acceptance classifies the outcome
+- **THEN** the classification is the declaration defect
+- **AND** the executable is never resolved and no `tool_unavailable` prerequisite is reported
+
+### Requirement: Declared verification commands admit leading environment assignments
+
+A declared verification command (`rerun`, or `evidence` when `rerun` is absent) MUST be tokenized with the existing shell-metacharacter refusal and POSIX-quote tokenizer, after which leading tokens of the form `NAME=value` with `NAME` matching `[A-Za-z_][A-Za-z0-9_]*` MUST be consumed in order as environment assignments. The first token that is not an assignment is the executable; later tokens are ordinary arguments even when they contain `=`. The value is everything after the first `=`; it MAY be empty and MAY contain `=`, spaces, or quotes supplied through the tokenizer. Multiple assignments are allowed; when a name repeats, the last assignment wins and the effective bindings are the resulting map. A leading token containing `=` whose name is not a valid identifier MUST be the declaration defect `declaration_invalid_assignment`; a command consisting only of assignments MUST be the declaration defect `declaration_missing_command`; both are repository-local declaration defects under the fail-closed declaration contract and MUST NOT be classified as `tool_unavailable` or as an external prerequisite. Expansion, substitution, redirection, pipelines, conditionals, and compound commands remain `declaration_shell_syntax`. `env NAME=value cmd` MUST remain an ordinary argv whose executable is `env`.
+
+Bindings MUST be applied to the supervised child process only, on top of the environment it would otherwise inherit, and MUST NOT mutate the owner process environment or introduce an intermediary shell. Tool resolution, tool identity, and the `tool_unavailable` prerequisite MUST use the executable token only. The effective bindings MUST enter gate identity and evidence identity by digest and by name only: the frozen manifest gate and the evidence record carry `env_names` (sorted, distinct) and `env_binding_digest` (full-length SHA-256 over name-sorted `name NUL value NUL` pairs), the manifest fingerprint includes both, and evidence reuse compares `env_binding_digest` as one more all-fields binding. No persisted record, manifest, log, event, API field, TUI line, reviewer context, or `verify` report MAY contain an assignment value; every rendered command MUST show bindings as `NAME=<redacted>` followed by the executable argv. This restriction applies to Conflux-generated command metadata, not arbitrary raw child stdout/stderr. A child can deliberately print a value into the native gate output artifact, which is not promised safe for sharing; use a separate non-echoing fixture for metadata sentinel-absence tests.
+
+#### Scenario: Real verifier executes the POSIX prefix form
+
+- **GIVEN** a required declaration whose command is `DJANGO_SETTINGS_MODULE=config.test_settings printenv DJANGO_SETTINGS_MODULE`
+- **WHEN** the runtime executor supervises the gate
+- **THEN** `printenv` is the resolved executable, the child exits `0`, and the captured artifact contains `config.test_settings`
+- **AND** the owner process environment does not contain `DJANGO_SETTINGS_MODULE` afterwards
+- **AND** the same command without the assignment exits non-zero
+
+#### Scenario: Quoting, empty values, duplicates, and explicit env
+
+- **GIVEN** declared commands `'A=hello world' cmd`, `A=x=y cmd`, `A= cmd`, `A=1 B=2 cmd`, `A=1 A=2 cmd`, `env A=1 cmd`, and `cmd a=b`
+- **WHEN** the declaration planner converts them to requests
+- **THEN** the bindings are respectively `A=hello world`, `A=x=y`, `A=` (empty), `A=1` and `B=2`, `A=2`, none (executable `env` with argument `A=1`), and none (argument `a=b` retained)
+- **AND** the executable argv never contains an assignment token
+
+#### Scenario: Invalid assignment and assignment-only commands are declaration defects
+
+- **GIVEN** declared commands `1ABC=x cmd`, `A-B=x cmd`, and `A=1`
+- **WHEN** the declaration planner runs
+- **THEN** the first two are `declaration_invalid_assignment` and the third is `declaration_missing_command`, each naming the verification ID and the field
+- **AND** strict validation fails, `cflx openspec verify` exits non-zero, and native Acceptance settles as a `fail` verdict with `[DECLARATION_INVALID]`
+- **AND** none is reported as `tool_unavailable` or as an external prerequisite
+
+#### Scenario: Missing actual executable remains infrastructure
+
+- **GIVEN** a required declaration `A=1 definitely-not-installed-tool --flag`
+- **WHEN** the manifest is frozen and the gate phase runs
+- **THEN** the outcome is the existing `tool_unavailable` resumable external prerequisite naming the executable
+- **AND** the assignment is not named as the missing tool
+
+#### Scenario: Changing a binding invalidates prior evidence
+
+- **GIVEN** an exact evidence record bound to a gate whose effective bindings were `A=1`
+- **WHEN** the declaration changes to `A=2`, adds `B=1`, or drops the assignment
+- **THEN** the manifest fingerprint differs
+- **AND** the record decides `Rerun` with mismatch field `env_binding_digest`
+- **AND** an envelope written before the field existed matches an assignment-free declaration and reruns for one with assignments
+
+#### Scenario: Assignment values are never rendered or persisted
+
+- **GIVEN** a declaration whose assignment value is a unique sentinel
+- **WHEN** the gate is planned, executed, reused, reported by `verify`, injected into the reviewer boundary context, logged, projected into a hold or `error_detail`, or rendered in the TUI
+- **THEN** the sentinel appears in no Conflux-generated command metadata, manifest/envelope JSON or display; the test uses a non-echoing child, and raw child output is not covered by this guarantee
+- **AND** `env_names` lists the name and the rendered command shows `NAME=<redacted>`
