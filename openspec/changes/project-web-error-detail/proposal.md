@@ -13,9 +13,9 @@ verifications:
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
-    automation: tests/web/helpers/console.js
-    evidence: npm --prefix tests/web test -- error-detail.spec.js --reporter=verbose
-    rerun: npm --prefix tests/web test -- error-detail.spec.js --reporter=verbose
+    automation: tests/web/package.json
+    evidence: npm --prefix tests/web test -- error-detail.spec.js responsive.spec.js contrast.spec.js --reporter=verbose
+    rerun: npm --prefix tests/web test -- error-detail.spec.js responsive.spec.js contrast.spec.js --reporter=verbose
     prerequisites: [Node.js and npm, npm ci --prefix tests/web --ignore-scripts --no-audit --no-fund]
     execution_class: repository-local
     completion_role: change-blocking
@@ -58,7 +58,7 @@ Preserve status grouping, progress, unrelated Details fields, lifecycle and per-
 
 ## Explicit Completion Conditions
 
-The shipped `renderChangeRow` path consumes current `error_detail` with `appendDetail` only for error rows; the new test file runs the real console through `tests/web/helpers/console.js` and fixture server, not a duplicate renderer. Gate output must name `error-detail.spec.js`, report at least 12 executed tests and zero skips/todos, and show all required matrix rows evaluated. The implementation must add a test-side fail-closed inventory check and individual behavioral assertions; reading a prefilled PASS report is not execution. The current old renderer must fail the positive-content assertion. All implementation checkboxes remain open until this exists and the declared single gate succeeds.
+The shipped `renderChangeRow` path consumes current `error_detail` with `appendDetail` only for error rows; the new test file runs the real console through `tests/web/helpers/console.js` and fixture server, not a duplicate renderer. Gate output must name `error-detail.spec.js`, report at least 15 executed tests from the new file (one per each of the 14 required rows plus the inventory assertion), the explicitly selected existing responsive/contrast checks, and zero skips/todos, and show all required matrix rows evaluated. The implementation must add a test-side fail-closed inventory check and individual behavioral assertions; reading a prefilled PASS report is not execution. The current old renderer must fail the positive-content assertion. All implementation checkboxes remain open until this exists and the declared single gate succeeds.
 
 ## Verification plan / limitations
 
