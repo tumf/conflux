@@ -25,7 +25,7 @@ fn closed_command_set_matches_the_advertised_list() {
             "create_worktree" => {
                 r#"{"type":"create_worktree","target":{"change_id":"a"},"params":{}}"#.to_string()
             }
-            "delete_worktree" | "merge_worktree" => {
+            "delete_worktree" | "merge_worktree" | "merge_worktree_abort_on_conflict" => {
                 format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
             }
             "refresh_proposal" => format!(
@@ -426,6 +426,60 @@ mod legacy_owner_shape {
         // The sibling additive surfaces decode the same way, by the same rule.
         assert!(!capabilities.execution_sinks.available);
         assert!(!capabilities.proposal_subscriptions.available);
+    }
+
+    #[test]
+    fn remote_merge_abort_old_owner_capabilities_decode_as_unavailable() {
+        // An owner that predates the abort-on-conflict merge: five worktree
+        // operations, no `merge_abort` block, no new command.
+        let mut capabilities = legacy_capabilities();
+        let worktrees = capabilities["worktrees"].as_object_mut().unwrap();
+        worktrees
+            .remove("merge_abort")
+            .expect("this build publishes `merge_abort`");
+        worktrees.insert(
+            "operations".to_string(),
+            serde_json::json!(["list", "detail", "create", "delete", "merge"]),
+        );
+
+        let decoded: CapabilitiesResponse = serde_json::from_value(capabilities)
+            .expect("an older owner's capabilities must still decode on this build");
+        assert!(!decoded.worktrees.merge_abort.available);
+        assert!(decoded.worktrees.merge_abort.command.is_empty());
+        assert!(!decoded
+            .commands
+            .iter()
+            .any(|command| command == "merge_worktree_abort_on_conflict"));
+        // The preserving contract reads the same on both owners.
+        assert!(decoded.worktrees.merge_conflict_preserves_state);
+        assert_eq!(
+            decoded.worktrees.merge_conflict_recovery,
+            "local_or_tui_required"
+        );
+
+        // This build always writes the block, available.
+        let current = crate::web::remote_control_api::worktrees::WorktreeCapabilities::default();
+        assert!(current.merge_abort.available);
+        assert_eq!(
+            current.merge_abort.command,
+            "merge_worktree_abort_on_conflict"
+        );
+        assert!(current.merge_abort.predicted_conflict_refused);
+        assert_eq!(
+            current.merge_abort.restore_verification,
+            ["head_equals_premerge", "no_merge_head", "root_clean"]
+        );
+        assert_eq!(
+            current.merge_abort.reasons,
+            [
+                "predicted_conflict",
+                "conflict_aborted",
+                "abort_failed",
+                "restore_unknown"
+            ]
+        );
+        assert!(current.merge_conflict_preserves_state);
+        assert!(current.operations.iter().any(|op| op == "merge_abort"));
     }
 
     #[test]

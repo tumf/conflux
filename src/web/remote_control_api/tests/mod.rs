@@ -13,6 +13,7 @@ mod event_ownership_tests;
 mod execution_mark_event_tests;
 mod execution_status_tests;
 mod force_stop_change_tests;
+mod merge_abort_tests;
 mod operator_snapshot_tests;
 mod parallel_control_tests;
 mod projection_tests;
@@ -116,6 +117,9 @@ impl RemoteControlExecutor for RecordingExecutor {
                 }
                 CommandSpec::MergeWorktree { target, .. } => {
                     return port.merge(&target.worktree_id).await
+                }
+                CommandSpec::MergeWorktreeAbortOnConflict { target, .. } => {
+                    return port.merge_abort_on_conflict(&target.worktree_id).await
                 }
                 _ => {}
             }
