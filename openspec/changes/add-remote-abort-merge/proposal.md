@@ -92,8 +92,10 @@ the truth:
   confirmed restoration settles `merge_conflict_aborted` (the merge failed;
   the root is proven clean at the pre-merge `HEAD`; a next merge is
   possible). Anything else settles `merge_abort_failed` with the observed
-  facts, the root stays `root_busy` for incompatible mutations until local or
-  TUI recovery, and nothing claims the state was preserved on purpose.
+  facts, the root reports `root_busy` for incompatible mutations while `MERGE_HEAD`
+  remains; if it is absent but the root is dirty, the ordinary clean-state
+  check still refuses a merge until local or TUI recovery. Nothing claims
+  the state was preserved on purpose.
 - The same typed abort report flows to the TUI: `merge_branch` becomes a
   wrapper over the new typed function and its error text names the verified
   outcome, and the `MergeFailed` event carries it. `on_merged` runs only

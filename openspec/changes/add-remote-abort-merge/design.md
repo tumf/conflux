@@ -94,8 +94,9 @@ Command `merge_worktree_abort_on_conflict { target: WorktreeTarget, params: Empt
 and refreshes the observation afterwards (so `root_busy`/`conflict` facts are
 current).
 
-Result kind `merge_abort` (present on success and on every refusal after
-eligibility):
+Result kind `merge_abort` is present on success and on
+`merge_conflict_predicted`, `merge_conflict_aborted`, and `merge_abort_failed`.
+It is absent on `root_busy`, not-found, and other ineligibility refusals:
 
 ```json
 {"kind": "merge_abort", "worktree_id": "…", "branch": "feature-x",
@@ -206,7 +207,8 @@ registered in `tests/mod.rs`:
   `on_merged` hook counter 1, result `outcome: merged`).
 - `remote_merge_abort_predicted_conflict_is_refused_with_files` (real Git:
   fresh targeted inspection predicts; `MERGE_HEAD` absent, base `HEAD`
-  unchanged, `merge_conflict_predicted`, files listed).
+  unchanged, `merge_conflict_predicted`, files listed, result kind `merge_abort`
+  present with `outcome: predicted_conflict`).
 - `remote_merge_abort_real_conflict_settles_with_restoration_evidence`
   (service over a fake backend inside the real router: `merge_conflict_aborted`
   for confirmed, `merge_abort_failed` for failed/unknown with
@@ -215,6 +217,9 @@ registered in `tests/mod.rs`:
   state produced by the VCS function under a failing shim; a following
   `merge_worktree` of another branch is `root_busy`; after `git merge --abort`
   run by the test — standing in for local recovery — it succeeds).
+- `remote_merge_abort_dirty_without_merge_head_refuses_clean_check` (real Git:
+  dirty root with `MERGE_HEAD` absent; a subsequent merge is refused by the
+  ordinary clean-state check, not falsely classified as `root_busy`).
 - `remote_merge_abort_next_merge_after_confirmed_abort_succeeds` (real Git:
   the VCS abort path on branch A, then the API merges clean branch B).
 - `remote_merge_abort_merge_worktree_default_is_unchanged`: the existing
