@@ -31,14 +31,38 @@ not examined), `not_regular_file`, `executable` (any execute bit),
 `root_missing` — and with `target_ineligible` and reason `change_active`,
 `change_admitted`, `managed_process_live`, or `root_busy` when the owning
 change is in an active display status, is admitted (`queue_intent` queued or
-display status `queued` / `blocked`), when the owner holds a live managed
-process group whose working directory is the target root or below it
-regardless of the change ID that group carries, or when the repository root
+display status `queued` / `blocked`), when the owner's managed writer
+coverage for the target root is not `Clear`, or when the repository root
 mutation guard is held or a base merge or resolve is in progress — the last
 applying to the main worktree row and every change directory alike. The read
-response MUST publish `editable` and `edit_blocked_reason` from the same
-classifier. A nested worktree MUST be editable only through its own opaque
-worktree ID, never through a path from another root.
+response MUST publish `editable`, `edit_blocked_reason`, and a bounded
+diagnostic `edit_blocked_detail` from the same classifier. A nested worktree
+MUST be editable only through its own opaque worktree ID, never through a
+path from another root.
+
+Managed writer coverage MUST be a tri-state (`Clear`, `Busy`, `Unknown`)
+computed from one process-local ledger, never a boolean, and `Busy` and
+`Unknown` MUST both refuse as `managed_process_live`. The ledger MUST account
+for every owner-managed writer: every run command scope the owner has
+installed, retained until each of its identities is proven quiescent and
+never dropped because a later run replaced it, a shutdown took it, or a
+quiescence budget expired; every spawn that bypasses the scope, including
+the shell command path and the configured worktree session, held as a lease
+from before the spawn until the child's exit is reaped; and spawns with no
+working directory, bound to the owner's own canonical working directory.
+Each writer's working directory MUST be canonicalized at registration and
+compared to the canonical root by component-wise path containment, so a
+symlink alias binds the real path and a sibling whose name shares a prefix
+is not bound. A failed canonicalization, an unreaped lease, or an owner with
+no ledger attached MUST be `Unknown`; the absence of a current scope, of a
+termination port, or of a ledger MUST NOT be read as `Clear`. `Clear` MUST be
+provable by an owner — a headless `cflx run` included — whose ledger exists
+and is empty. The coverage MUST be read once, as part of the eligibility
+snapshot at the start of a write, and the contract MUST state that a writer
+admitted after that snapshot and before the rename is in the same window as
+an external writer. Reaching `Clear` MUST NOT kill, sweep, or reset any
+process or ledger entry, and `force_stop_change`, `owns_managed_process`,
+and `kill_managed_process` MUST keep their current target and scope.
 
 `content_id` MUST be `sha256:` followed by the lowercase hex SHA-256 of the
 exact file bytes. A write MUST compare the current bytes to `expected`
@@ -104,11 +128,42 @@ gain no verb.
 
 #### Scenario: Active writers exclude remote edits
 
-- **GIVEN** change `alpha` is `applying`, or the owner holds a live managed process group whose working directory is under `alpha`'s worktree (with or without a change ID), or the root guard is held, or a resolve is running
+- **GIVEN** change `alpha` is `applying`, or the owner's writer coverage for `alpha`'s worktree is `Busy` (a registered writer with or without a change ID), or the root guard is held, or a resolve is running
 - **WHEN** a client reads and then writes a file in `alpha`'s worktree
 - **THEN** the read reports `editable: false` with the matching reason
 - **AND** the write fails `target_ineligible` with the same reason and writes nothing
-- **AND** a live managed process group bound to a sibling path leaves the target editable
+- **AND** a writer bound only to a sibling path leaves the target editable
+
+#### Scenario: Retained writers from a previous run exclude remote edits
+
+- **GIVEN** a previous run's scope holds an identity spawned under `alpha`'s worktree that was never proven quiescent, and a new run has since been started with a fresh scope
+- **WHEN** a client reads and then writes a file in `alpha`'s worktree
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail naming the retained identity
+- **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a sibling worktree stays editable, nothing is killed, and `actions.force_stop_change` is unchanged
+- **AND** once the identity is released with confirmed quiescence the same read reports `editable: true`
+
+#### Scenario: Unknown writer coverage fails closed
+
+- **GIVEN** an owner with no writer ledger attached to its termination port, or a ledger holding a lease whose child was never reaped, or a writer whose working directory could not be canonicalized
+- **WHEN** a client reads a file in any worktree, in the main worktree, or in a change directory
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail saying coverage is unknown
+- **AND** the write fails `target_ineligible` and writes nothing
+- **AND** the change-keyed `managed_process_live` on the state snapshot is unchanged
+
+#### Scenario: Unscoped and session writers are covered
+
+- **GIVEN** a child spawned through the shell command path or through the configured worktree session with `alpha`'s worktree as its working directory and no change ID
+- **WHEN** a client reads a file in `alpha`'s worktree while the child is alive, and again after its exit was reaped
+- **THEN** the first read reports `editable: false` with `managed_process_live` and a sibling directory is `Clear`
+- **AND** the second read reports `editable: true`
+
+#### Scenario: Canonical containment decides a binding
+
+- **GIVEN** a writer registered through a symlink alias of `alpha`'s worktree, and a sibling worktree whose name begins with `alpha`
+- **WHEN** a client reads a file in each
+- **THEN** `alpha` reports `editable: false` with `managed_process_live` and the sibling reports `editable: true`
+- **AND** a writer whose working directory no longer exists at registration refuses every root
 
 #### Scenario: Admitted targets exclude remote edits
 

@@ -52,6 +52,38 @@
   and `:1860`), and `ManagedProcessTermination`
   (`src/orchestration/operator_command.rs:1704`) answers ownership by change
   ID only.
+- The registry is not complete coverage of owner-managed writers, and the
+  current-run view of it is not complete coverage of the registry:
+  - `LiveRunManagedProcesses` (`src/orchestration/operator_command.rs:3333-3362`)
+    re-reads *only* the supervisor's current scope slot and answers "owns
+    nothing" when that slot is `None`. The supervisor overwrites the slot on
+    every launch (`src/tui/run_supervisor.rs:404`) and empties it on shutdown
+    (`take_run`, `:252`), so a previous run's `UnconfirmedRetained` entries
+    (`ExecutionPhase`, `src/ai_command_runner.rs:100-112`) and the identities
+    a timed-out `wait_quiescent` could not prove are no longer visible to the
+    query even though the processes may still be alive.
+  - `execute_streaming_with_retry` registers into the scope only when the
+    runner carries one; with `run_command_scope == None` the spawn is
+    unregistered (`src/ai_command_runner.rs:904-916`). The configured
+    `worktree_command` session (`src/tui/terminal.rs:41-51`) calls exactly that
+    path on the TUI's own runner with `change_id: None`, so an operator
+    session running inside a worktree is invisible to the registry.
+  - The shell path `execute_streaming` (`src/ai_command_runner.rs:1857`)
+    spawns `sh -c` through the command queue and registers nothing at all.
+  - A headless `cflx run` never installs a termination port on `WebState`
+    (`src/web/state.rs:452-460`), and the snapshot maps that absence to
+    `managed_process_live: false` (`src/web/state.rs:739-746`), which is
+    correct for `force_stop_change` availability but is not evidence that no
+    writer exists.
+  - The external lifecycle adapter (`src/lifecycle_integration.rs:452`) is
+    spawned without a working directory and is never handed a worktree path;
+    its contract is a stdin event stream with stdout and stderr discarded, so
+    it is not an owner-managed writer and is excluded from coverage by
+    contract rather than by observation.
+  - `.wt/setup` runs with `current_dir(worktree_path)` during worktree
+    creation (`src/vcs/git/commands/worktree.rs:1216`) and `.wt/teardown`
+    during deletion (`:1057`); both execute under the repository root guard,
+    which `root_busy` already covers.
 
 ## Contract
 
@@ -119,16 +151,16 @@ before the replace step. Test vector: the bytes `hello\n` identify as
 `classify_text_eligibility` is one pure function used by both the read
 resource and the command. Inputs: scope, the change's display status and
 `queue_intent` (for a worktree, those of the change whose `worktree` relation
-equals the bound path, if any), whether the owner holds a live managed process
-group *bound to a path under the target root*, whether the root guard is
-currently held, `base_merge_in_progress` and `is_resolving`. Reasons are
-evaluated in table order and the first match is published:
+equals the bound path, if any), the owner's *managed writer coverage* for the
+target root (the tri-state defined below, never a boolean), whether the root
+guard is currently held, `base_merge_in_progress` and `is_resolving`. Reasons
+are evaluated in table order and the first match is published:
 
 | reason (`target_ineligible`) | change scope | worktree scope |
 |---|---|---|
 | `change_active` | `is_active_status(display_status)` | the owning change's status is active |
 | `change_admitted` | `queue_intent == queued` or display status `queued` / `blocked` | the owning change is admitted the same way |
-| `managed_process_live` | a live managed process group's working directory is the change directory or below it | a live managed process group's working directory is the worktree directory or below it |
+| `managed_process_live` | managed writer coverage for the change directory is `Busy` or `Unknown` | managed writer coverage for the worktree directory is `Busy` or `Unknown` |
 | `root_busy` | root guard held, base merge in progress, or `is_resolving` | root guard held, base merge in progress, or `is_resolving` |
 
 `change_admitted` follows `refresh_proposal`'s `target_admitted`: a `queued`
@@ -137,25 +169,124 @@ passing the command application gate, so a save that landed between admission
 and dispatch would race the agent's first write. The TUI editor has no such
 gate only because its operator is local.
 
-`managed_process_live` is path-bound, not change-bound. The termination port
-gains `async fn owns_managed_process_under(&self, root: &Path) -> bool`,
-answered from the same registry the kill walks, and the registry records the
-`cwd` each managed command was spawned with on its `ScopeEntry`. A live group
-whose working directory is the target root or a descendant of it blocks the
-edit whatever its `change_id` is — including an entry with no change ID at
-all, which is how a future configured session or any other non-change-keyed
-managed process is covered without a dependency on it. A live group spawned
-with no `cwd` runs in the owner's own working directory, the project root,
-and therefore blocks the main worktree row and every change directory. The
-existing change-keyed `owns_managed_process` and `actions.force_stop_change`
-are unchanged.
+`managed_process_live` is path-bound, not change-bound, and it is answered
+by coverage, not by a boolean. The existing change-keyed
+`owns_managed_process`, `kill_managed_process`, and `actions.force_stop_change`
+are unchanged: the kill still addresses the current run's scope by change ID,
+and nothing in this design widens what may be signalled.
+
+#### Managed writer coverage
+
+```rust
+pub enum WriterCoverage {
+    /// Every owner-managed writer is accounted for and none is bound to the root.
+    Clear,
+    /// At least one accounted writer is bound to the root or below it.
+    Busy,
+    /// Coverage is incomplete: some writer's binding cannot be decided.
+    Unknown { detail: String },
+}
+```
+
+The termination port gains
+`async fn writer_coverage_under(&self, root: &Path) -> WriterCoverage`.
+`Busy` and `Unknown` both publish `managed_process_live`; only `Clear` lets
+the classifier fall through to `root_busy`. No new public reason is
+introduced. The read response and the refused record carry the coverage's
+bounded `detail` text (at most 512 bytes, diagnostic only, never parsed by
+clients) so an operator can tell "a process is running under this root" from
+"the owner cannot prove nothing is", without a second read.
+
+Coverage is computed by one process-local `ManagedWriterLedger`
+(`src/ai_command_runner.rs`, beside `RunCommandScope`), created once per
+owner process next to the run supervisor, handed to every `AiCommandRunner`
+the process builds (`set_writer_ledger`, called where `set_run_command_scope`
+is today), and read by `LiveRunManagedProcesses`. It is the union of these
+sources, and every source is required — the ledger does not know how to say
+"probably":
+
+1. **Every run scope the supervisor ever installed.** `ScopeEntry` gains
+   `cwd: WriterCwd` (`Known(PathBuf)` canonical, `OwnerCwd`, or
+   `Unknown(reason)`), recorded by `register` *before* the spawn from the
+   `cwd` argument. A scope registers itself with the ledger when the
+   supervisor installs it, and the ledger keeps its clone until the scope is
+   *resolved*: every entry released with confirmed quiescence, so that
+   `entries` is empty. Replacing the current scope on the next launch, taking
+   it on shutdown, a `CleanupUnconfirmed` outcome, or a timed-out
+   `wait_quiescent` never drops a scope from the ledger; only positive proof
+   — the confirmed-quiescence release, or a later `force_cleanup_retained`
+   sweep that proves the retained identities empty — does. An entry in
+   `WaitingToSpawn`, `Running`, `Cleaning`, or `UnconfirmedRetained` counts;
+   an entry whose `unproven_pids` is empty but whose runner task has not
+   ended counts too, because the spawn is imminent.
+2. **Unscoped spawns.** The two paths that bypass the scope — the shell path
+   `execute_streaming` and the `run_command_scope == None` branch of
+   `execute_streaming_with_retry`, which is also the configured
+   `worktree_command` session's path — take a `WriterLease { cwd }` from the
+   ledger immediately before `Command::spawn` and release it only at the
+   point where the child's exit status is reaped (the streaming task's wait,
+   or `ManagedChild::wait`). A lease whose reap never happens — a dropped
+   handle, a failed wait — stays in the ledger as `Unknown` with the lease's
+   own detail; it is never dropped on a timer. A spawn that fails returns the
+   lease on the error path before the error is reported.
+3. **The owner's own working directory.** `OwnerCwd` entries are spawns with
+   no `cwd`, which run in the process's working directory. The ledger
+   canonicalizes `std::env::current_dir()` once at creation; an `OwnerCwd`
+   entry is `Busy` for every root the owner cwd is under or equal to, and
+   `Unknown` for every root when that canonicalization failed.
+
+Decision for a root `R` (canonical, as the scope root already is):
+
+- `Unknown` if the ledger has any entry whose `cwd` is `Unknown`, or any
+  unreaped lease, or if no ledger is attached to the port at all (an owner
+  wired without one answers `Unknown` for every root, never `Clear`);
+- else `Busy` if any entry's canonical `cwd` satisfies `cwd.starts_with(R)`
+  (component-wise `Path::starts_with`, so `/w/alpha2` is not under
+  `/w/alpha`), or is an `OwnerCwd` entry with the owner cwd under `R`;
+- else `Clear`.
+
+`Clear` therefore means "every writer this owner can launch has been
+accounted for and none is bound here", and it is provable by a headless
+`cflx run` with nothing running or a TUI that has never started a run — the
+ledger exists and is empty — but never by the *absence* of a scope, a port,
+or a ledger. A missing current scope is not evidence; an empty ledger is.
+`cflx run` installs the same ledger-backed port on its `WebState` so its
+reads publish `editable: true` when that is true; the snapshot's change-keyed
+`managed_process_live` keeps its current `None => false` mapping because it
+feeds `force_stop_change` availability, not writer exclusion.
+
+Canonicalization: the `cwd` is canonicalized with `std::fs::canonicalize` at
+registration, before the spawn, while the spawn itself keeps the path it was
+given; failure (a dangling symlink, a directory removed before the spawn, a
+permission error) records `Unknown(reason)` — never "no cwd", never absent.
+The root is canonicalized the same way, so a symlink alias of a worktree on
+either side compares equal to the real path and can neither clear nor
+mis-attribute a binding.
+
+Snapshot timing: coverage is read once, in write step 1, under the application
+gate, together with the active/admitted facts — the eligibility snapshot. A
+scheduler dispatch or a lease taken *after* that snapshot and before step 4's
+rename is not detected; this is the same window as the external
+compare-and-rename limitation below, it is bounded by the duration of one
+write transaction, and no atomicity is claimed for it. What the snapshot does
+close is the stale-view class: a writer that was already live, retained, or
+unresolved when the snapshot was taken is always seen.
+
+Not done, on purpose: no durable registry (the ledger dies with the process,
+as the constitution requires, and a restarted owner begins with an empty
+ledger and whatever processes outlived it are outside its coverage by
+definition); no sweep or reset of retained entries to make a root editable;
+no SIGTERM or SIGKILL sent to anything to clear coverage; no change to what
+`force_stop_change` may signal. An operator facing `Unknown` resolves it
+through the existing paths — the retained-identity escalation on shutdown, or
+restarting the owner — not through the editor.
 
 `WorktreeService` gains `pub fn root_guard_is_held(&self) -> bool`
 (a `try_lock` probe released immediately). The read response publishes
-`editable` and `edit_blocked_reason` from the same classifier; a `worktree`
-row with no owning change — the main worktree row included — is editable only
-while no live managed process group is bound to a path under it and the root
-is not busy by the same inputs the change scope uses.
+`editable`, `edit_blocked_reason`, and `edit_blocked_detail` from the same
+classifier; a `worktree` row with no owning change — the main worktree row
+included — is editable only while managed writer coverage for it is `Clear`
+and the root is not busy by the same inputs the change scope uses.
 
 ### Read resource
 
@@ -169,7 +300,7 @@ is not busy by the same inputs the change scope uses.
   "scope": {"kind": "worktree", "worktree_id": "…"},
   "path": "src/lib.rs", "exists": true,
   "content": "…", "content_id": "sha256:…", "size_bytes": 1234, "mode": "0644",
-  "editable": true, "edit_blocked_reason": null,
+  "editable": true, "edit_blocked_reason": null, "edit_blocked_detail": null,
   "limits": {"max_bytes": 1048576, "max_path_bytes": 1024, "content_id_algorithm": "sha256"}
 }
 ```
@@ -204,8 +335,9 @@ transaction below, exactly as in `commands.rs`.
 Write transaction (under the application gate; no root guard is taken because
 the write is file-local and the guard is only *probed*):
 
-1. Resolve the scope root; classify eligibility; refuse `target_ineligible`
-   with reason before touching the filesystem.
+1. Resolve the scope root; take the eligibility snapshot (active, admitted,
+   writer coverage, root busy) and classify; refuse `target_ineligible` with
+   reason and detail before touching the filesystem.
 2. Walk the path with `O_NOFOLLOW`; apply the path rules; open the parent
    directory descriptor and the leaf (or observe `ENOENT`).
 3. Compare: `absent` expected and leaf present → `text_stale`
@@ -239,7 +371,8 @@ Result kind `text_write`:
 ```json
 {"kind": "text_write", "scope": {...}, "path": "…",
  "outcome": "written" | "unchanged" | null,
- "reason": null | "<text_not_editable or stale reason>",
+ "reason": null | "<text_not_editable, target_ineligible, or stale reason>",
+ "detail": null | "<bounded diagnostic; coverage detail for managed_process_live>",
  "content_id_before": "sha256:…" | null,
  "content_id_after": "sha256:…" | null,
  "current_content_id": "sha256:…" | null,
@@ -258,10 +391,12 @@ against *external* writers. A write by an editor or agent that lands between
 them is overwritten. The published guarantee is therefore: (a) a write never
 succeeds against content the client did not read, as of the compare; (b)
 Conflux's own writers are excluded by eligibility (an active or admitted
-change, a live managed process group bound to a path under the root, a held
-root guard, a base merge or resolve in progress) rather than by the compare; (c)
-external, uncooperative editors are *not* excluded, and the usage guide says
-so. Nothing is locked with `flock`, because no external editor honours it.
+change, managed writer coverage that is not `Clear` for the root, a held root
+guard, a base merge or resolve in progress) as of the eligibility snapshot in
+step 1, rather than by the compare, and a writer the owner admits between that
+snapshot and the rename falls into the same window as (c); (c) external,
+uncooperative editors are *not* excluded, and the usage guide says so. Nothing
+is locked with `flock`, because no external editor honours it.
 
 ### Capabilities, OpenAPI, errors
 
@@ -290,7 +425,11 @@ unchanged. `cflx client` decodes the new block through its existing
 ### Constitution check
 
 No durable state is introduced; eligibility is recomputed from the reducer
-snapshot and process-local facts on every request. The only file Conflux
+snapshot and process-local facts on every request. The managed writer ledger
+is one of those process-local facts: it lives for exactly one owner process,
+is never written to disk, and is not consulted for resume, acceptance, or
+archive routing; killing the owner discards it, and the next owner's coverage
+is whatever its own spawns and scopes register. The only file Conflux
 creates inside a target is the temporary file that the operator's own write
 consumes by rename; it is never retained by design, never ignored, and never
 excluded from cleanliness checks (a failed write removes it before returning).
@@ -321,6 +460,25 @@ state, and a remote save into them is not an operator deliverable.
   operator is local. Remote edit of executable or hook paths is out.
 - Holding the root guard for the write: it would make every save contend with
   merges for no safety gain; the guard is probed for eligibility only.
+- A boolean `owns_managed_process_under(root) -> bool` on the termination
+  port: `false` would be read as "no writer" by the classifier while the only
+  thing the current-run adapter can actually prove is "no writer *in the
+  current scope*". A previous run's retained identities, an unscoped shell
+  spawn, and a headless owner with no port all collapse into the same `false`.
+  The tri-state keeps "nothing is bound" and "I cannot tell" apart, and maps
+  both of the unsafe answers to a refusal.
+- Dropping a retired scope when the next run starts, or after the quiescence
+  budget expires: the identities are exactly the ones nobody proved dead, and
+  the editor is the one consumer that must not forget them.
+- Sweeping, killing, or resetting retained entries to make a root editable:
+  the editor has no kill rights and gains none; `force_stop_change` keeps its
+  exact target and its exact scope.
+- A durable registry of spawned writers across owner restarts: forbidden by
+  the constitution's first law, and a restarted owner cannot prove anything
+  about processes it did not launch anyway.
+- A string-prefix comparison of `cwd` against the root: `/w/alpha2` starts
+  with the string `/w/alpha`; only component-wise `Path::starts_with` on two
+  canonical paths answers containment.
 
 ## Verification design (future implementation, not executed at proposal time)
 
@@ -372,13 +530,55 @@ linked worktree). Required cases:
   served; the digest of every file under the project root and under `alpha`
   is unchanged.
 - `remote_text_edit_writer_exclusion_refuses_active_targets`: with the reducer
-  holding `ApplyStarted` for the owning change, and separately with a managed
-  termination port reporting a live process group bound to the worktree path
-  *with no change ID*, and separately with the service root guard held via
+  holding `ApplyStarted` for the owning change, and separately with a fake
+  termination port answering `Busy` for the worktree path (a lease *with no
+  change ID*), and separately with the service root guard held via
   `acquire_root_for_test`, and separately with `is_resolving` set on the main
   worktree row, both the read's `editable: false` reason and the command's
-  `target_ineligible` reason agree; a port reporting a live group bound to a
-  sibling path leaves the target editable.
+  `target_ineligible` reason agree; a port answering `Clear` for the target
+  while `Busy` for a sibling path leaves the target editable.
+- `remote_text_edit_retained_scope_from_previous_run_blocks_edits`: a real
+  `ManagedWriterLedger`-backed port over a `TuiRunSupervisor` whose run A scope
+  holds an entry registered with `cwd = <alpha worktree>` and driven to
+  `UnconfirmedRetained` through the existing `register_unproven_for_test`
+  seam; run B is then launched through `install_run_for_test` with a fresh,
+  empty scope. The read of a file in alpha reports `editable: false`,
+  `managed_process_live`, and a detail naming the retained identity; the write
+  is `target_ineligible` with no bytes changed; the sibling worktree stays
+  editable; after the retained identity is released with confirmed quiescence
+  (the test's own `release_confirmed`), the same read is `editable: true`.
+  Nothing was killed and `force_stop_change` eligibility is unchanged
+  throughout.
+- `remote_text_edit_unbound_lifecycle_activity_refuses`: a port with no ledger
+  attached (`LiveRunManagedProcesses` built without `with_writer_ledger`),
+  and separately a ledger holding an unreaped lease, answer `Unknown` for the
+  worktree, for the main root, and for a change directory; every read is
+  `editable: false` with `managed_process_live` and a detail saying coverage is
+  unknown, every write is `target_ineligible`, and the change-keyed
+  `managed_process_live` published on the snapshot is unchanged (`false`)
+  because coverage does not feed `force_stop_change`.
+- `remote_text_edit_unscoped_spawn_paths_are_covered` (unit, in
+  `src/ai_command_runner.rs`): a runner with `run_command_scope == None` and a
+  ledger attached runs `execute_streaming("sleep 30", Some(wt))` and, in a
+  second case, `execute_streaming_with_retry("sleep 30", Some(wt), None, None)`
+  — the exact call the configured `worktree_command` session makes; while the
+  child is alive the ledger answers `Busy` for `wt` and `Clear` for a sibling
+  directory; the test terminates the child and, after the reap is observed
+  through the handle, the ledger answers `Clear`. Liveness is proven by the
+  reap event, not by elapsed time; a generous timeout is the hang guard only.
+- `remote_text_edit_session_owned_writer_blocks_target`: a ledger entry with
+  `change_id: None` and `operation: None` bound to the worktree path (the
+  session shape) refuses the worktree row and the owning change's worktree
+  alike, while the change directory under the project root stays editable; a
+  lease with no `cwd` (owner cwd = project root) refuses the main worktree row
+  and every change directory and leaves a worktree outside the project root
+  editable.
+- `remote_text_edit_cwd_canonicalization_decides_binding`: a lease registered
+  through a symlink alias of alpha's worktree answers `Busy` for alpha and
+  `Clear` for its sibling `alpha2` (the string-prefix trap) and for the
+  project root; a lease whose `cwd` was removed before registration (a
+  dangling path) records `Unknown` and refuses every root; a root reached
+  through a symlink alias compares equal to the registered real path.
 - `remote_text_edit_writer_exclusion_refuses_admitted_targets`: with the
   reducer holding the owning change as `queued` and separately as `blocked`
   (and separately `queue_intent = queued` on a `not queued` row), the read's
@@ -418,13 +618,15 @@ linked worktree). Required cases:
 ### Non-declared regression runs the implementer must still report
 
 `cargo test --features web-monitoring --test client_cli_tests`,
-`cargo test --lib --features web-monitoring remote_worktree`, and
-`cargo test --lib --features web-monitoring force_stop_change` must pass
-unchanged; the worktree capability `operations` assertion in
+`cargo test --lib --features web-monitoring remote_worktree`,
+`cargo test --lib --features web-monitoring force_stop_change`, and
+`cargo test --lib run_command_scope` must pass unchanged; the worktree
+capability `operations` assertion in
 `remote_worktree_capabilities_report_the_operations_and_recovery_boundary`
 is updated for the added `"text"` operation, and test doubles implementing
-`ManagedProcessTermination` gain the added path-bound method; those are the
-only expected edits to existing tests.
+`ManagedProcessTermination` gain the added `writer_coverage_under` method
+(the existing doubles answer `Clear` so their force-stop cases keep their
+meaning); those are the only expected edits to existing tests.
 
 ## Independent review launch contract (for the implementation worker)
 
