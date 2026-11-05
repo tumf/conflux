@@ -161,14 +161,17 @@ and the configured retry would relaunch attempt 2 under the same `session_id`
 while the resource already read `stopped`. The command settles after the
 cleanup report with result `worktree_session_stop { session_id, terminated, state_after }`;
 a session already finished settles `no_op` with `terminated: false`. Owner
-shutdown (graceful stop, TUI quit, `run` completion) calls the registry
+shutdown (process exit, TUI quit, owner listener shutdown) calls the registry
 scope's `shutdown(10 s)` before listeners close, which cancels every running
 session through the same runner path and refuses any further attempt; a
 session the barrier reports as unconfirmed is logged with its PGID and the
 process still exits (nothing durable depends on it). Only descendants that
 remain in the session's process group are covered: a descendant that called
 `setsid` or daemonized has left the group and is outside the stop and
-shutdown guarantee, exactly as for the TUI.
+shutdown guarantee, exactly as for the TUI. Scheduler `stop`,
+`stop_and_dequeue`, and `force_stop` do not stop these independent worktree
+sessions or close their registry scope; session stop and owner process
+shutdown are separate operations.
 
 ### Session resource
 
