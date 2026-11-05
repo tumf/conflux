@@ -82,21 +82,30 @@ Add one bounded text surface to `/api/v2`, owned entirely by cflx:
   reasoned `no_op` that writes nothing.
 - Editable scope is explicit: regular UTF-8 files up to 1 MiB without NUL
   bytes, reached without traversing any symlink, never `.git` (file or
-  directory) at any depth, never anything under top-level `.wt/`, and never a
-  file with any execute bit. Everything else under the root is editable text.
-- Writer exclusion is published eligibility, not a hope: a worktree write is
-  refused while the owner holds a live managed process group for the change
-  that owns the worktree, while that change is in an active display status,
-  or while the repository root mutation guard is held; a change-scope write is
-  refused while the change is in an active status or the root is holding an
-  unresolved merge or resolve. The read resource reports `editable` and
+  directory) at any depth, never anything under top-level `.wt/` or the
+  top-level `.conflux-inflight`, never through a directory below the root
+  that carries its own `.git` entry (a nested worktree, submodule, or embedded
+  repository — the root's own `.git` is expected and not examined), and never
+  a file with any execute bit. Everything else under the root is editable
+  text.
+- Writer exclusion is published eligibility, not a hope. A target is refused
+  while its change (for a worktree, the change that owns it) is in an active
+  display status, while it is admitted (`queue_intent` queued, or display
+  status `queued` / `blocked`, the same boundary `refresh_proposal` draws),
+  while the owner holds a live managed process group whose working directory
+  is the target root or below it — whatever change ID that group carries, or
+  none — or while the repository root mutation guard is held, a base merge is
+  in progress, or a resolve is running. The same inputs apply to the main
+  worktree row. The read resource reports `editable` and
   `edit_blocked_reason` from the same classifier the command uses.
 - A stale write is refused with the typed code `text_stale` and a result that
   carries the current `content_id`; nothing is written and the owner never
   asks the client to discard anything, so the Web client can keep its buffer
   and re-read. Saving never commits, stages, or pushes; Git dirty state follows
   from the file write alone, and the worktree observation is refreshed after a
-  successful write so `dirty` reflects it on the next read.
+  successful write so `dirty` reflects it on the next read. That refresh is an
+  ordinary observation: when it changes `dirty`, the state revision advances,
+  so a client re-reads `state_revision` after a save instead of assuming it.
 
 Capabilities gain a `text_edit` block, `actions` are untouched, the generated
 OpenAPI document publishes the two routes, two command variants, the
@@ -123,14 +132,23 @@ OpenAPI document publishes the two routes, two command variants, the
    (absolute path, `..`, empty or `.` component, backslash, over 1024 bytes,
    non-UTF-8) is `validation_failed`; a path that traverses a symlink at any
    component, names a non-regular file, names `.git` as a file or a directory,
-   lies under top-level `.wt/`, has any execute bit, exceeds 1 MiB, or is not
-   valid UTF-8 / contains NUL is `text_not_editable` with a stable `reason`.
-   A symlink substituted after a successful read is still refused at write
-   time because the write path re-walks every component with `O_NOFOLLOW`.
-5. Writer exclusion holds: the worktree of a change in an active status or
-   with a live managed process, and any target while the root guard is held,
-   refuse with `target_ineligible` and a stable reason, and the read resource
-   already reported `editable: false` with the same reason.
+   lies under top-level `.wt/` or is the top-level `.conflux-inflight`,
+   passes through a directory below the root that carries a `.git` entry of
+   any type, has any execute bit, exceeds 1 MiB, or is not valid UTF-8 /
+   contains NUL is `text_not_editable` with a stable `reason`. A symlink
+   substituted after a successful read is still refused at write time because
+   the write path re-walks every component with `O_NOFOLLOW`. From the main
+   worktree's ID, a file inside another change's worktree placed under the
+   project root is `nested_repository` on read and on write, so the main root
+   is never a bypass of that worktree's own eligibility.
+5. Writer exclusion holds: a target whose change is in an active status or is
+   admitted (`queued` / `blocked`), a target root under which the owner holds
+   a live managed process group — including one that carries no change ID —
+   and any target while the root guard is held, a base merge is in progress,
+   or a resolve is running, refuse with `target_ineligible` and a stable
+   reason (`change_active`, `change_admitted`, `managed_process_live`,
+   `root_busy`), and the read resource already reported `editable: false`
+   with the same reason.
 6. Only the addressed file changes. A real-Git regression proves that after a
    write the only differing path between the two observations of the
    worktree is the written file, no other worktree or the project root is
@@ -158,13 +176,19 @@ execution.
 Implementation touches `src/web/remote_control_api/` (new `text_edit.rs`
 module, `dto.rs`, `reads.rs`, `mod.rs` routes, `executor.rs` dispatch,
 `worktrees.rs` capability wiring), `src/web/openapi.rs`, `src/web/state.rs`
-for the eligibility facts the classifier needs, their focused tests, and the
-usage guide. `delete_worktree`, `merge_worktree`, `create_worktree`,
-`refresh_proposal`, every read resource, authentication, revision fencing,
+for the eligibility facts the classifier needs, the `ManagedProcessTermination`
+port in `src/orchestration/operator_command.rs` (one added path-bound query)
+and its registry in `src/ai_command_runner.rs` (recording the spawn working
+directory on the existing entry), their focused tests, and the usage guide.
+`delete_worktree`, `merge_worktree`, `create_worktree`, `refresh_proposal`,
+`force_stop_change`, every read resource, authentication, revision fencing,
 idempotency, and the TUI `e` key are unchanged. No new dependency: hashing
 uses the existing `sha2` crate. No Conflux-owned file is left in a target
-worktree: the only transient artifact is the same-directory temporary file
-that the rename consumes, and it is removed on every failure path.
+worktree by design: the only transient artifact is the same-directory
+temporary file that the rename consumes, it is removed on every failure path
+the process survives, and a residue left by a crash between create and rename
+is reported as ordinary untracked dirt — never ignored, never excluded from a
+cleanliness check — for the operator to remove by hand.
 
 The tracked `.pre-commit-config.yaml` scopes Rust checks by staged paths; the
 declared focused gates stay explicit and no broad build is added as a task.

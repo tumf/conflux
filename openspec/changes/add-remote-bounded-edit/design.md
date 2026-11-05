@@ -31,6 +31,27 @@
   (`src/vcs/git/commands/worktree.rs:1003-1045`).
 - A linked worktree's `.git` is a regular file holding a `gitdir:` pointer;
   the main worktree's `.git` is a directory.
+- The main worktree is itself a v2 worktree row (`is_main: true`,
+  `src/web/remote_control_api/worktrees.rs:284-328`), and managed worktrees
+  can live *below* the project root (`repo_root.join(".worktrees")` in
+  `src/orchestration/rejection.rs:687`; the default placement is
+  configuration-dependent). A path walked from the main root can therefore
+  reach another change's worktree, and a submodule or embedded repository can
+  sit below any root.
+- `.conflux-inflight` at the project root is read as a dependency-gate input
+  (`src/openspec_cmd/dependency_status.rs:162-166`); it is a Conflux-owned
+  path like `.wt/`.
+- `ACTIVE_STATUSES` (`src/orchestration/operator_command.rs:64-71`) does not
+  contain `queued` or `blocked`; admitted work is dispatched by the scheduler
+  without passing the command application gate. `refresh_proposal` refuses
+  admitted rows as `target_admitted`
+  (`src/web/remote_control_api/proposal_refresh.rs:61`).
+- The managed-process registry (`ScopeEntry`, `src/ai_command_runner.rs:123`)
+  records `change_id: Option<String>` and the owned PGIDs, but not the
+  working directory it was spawned with (`cwd`, `src/ai_command_runner.rs:897`
+  and `:1860`), and `ManagedProcessTermination`
+  (`src/orchestration/operator_command.rs:1704`) answers ownership by change
+  ID only.
 
 ## Contract
 
@@ -60,8 +81,9 @@ this order and re-evaluated on every write:
 | reason | condition |
 |---|---|
 | `git_metadata` | any component equals `.git` (ASCII case-insensitive) |
-| `conflux_hook_path` | first component equals `.wt` |
+| `conflux_owned_path` | first component equals `.wt`, or the path is exactly the top-level `.conflux-inflight` |
 | `unsafe_path` | an `openat` fails with `ELOOP`/`ENOTDIR` (a symlink or non-directory on the walk) or the leaf open fails with `ELOOP` |
+| `nested_repository` | a *traversed* directory component (never the root itself) contains an entry named `.git` of any type — file, directory, or symlink — probed with `fstatat(dirfd, ".git", AT_SYMLINK_NOFOLLOW)` immediately after that component is opened |
 | `not_regular_file` | the leaf `fstat` is not `S_IFREG` |
 | `executable` | the leaf mode has any of `0o111` |
 | `too_large` | the leaf size exceeds 1,048,576 bytes |
@@ -74,6 +96,16 @@ A leaf whose open fails with `ENOENT` is *absent*: a read answers
 `not_found` (no directory creation is offered). A component that exists but is
 not a directory is `unsafe_path`.
 
+`nested_repository` is what keeps the main worktree's ID from reaching another
+change's worktree, a submodule, or an embedded repository through an ordinary
+relative path: every root's *own* `.git` (the main worktree's directory, a
+linked worktree's file) is expected and is not examined, but the moment the
+walk opens a descendant directory that carries its own `.git` entry the walk
+stops, on read and on write alike, before the leaf is opened. Addressing a
+nested worktree's file is refused with this reason even when the nested
+worktree's owning change would itself be editable; the only way to edit it is
+through its own opaque worktree ID, where its own eligibility applies.
+
 ### Content identity
 
 `content_id` is the string `sha256:` followed by 64 lowercase hex digits of
@@ -85,21 +117,45 @@ before the replace step. Test vector: the bytes `hello\n` identify as
 ### Eligibility (writer exclusion)
 
 `classify_text_eligibility` is one pure function used by both the read
-resource and the command. Inputs: scope, the change's display status (for a
-worktree, the status of the change whose `worktree` relation equals the bound
-path, if any), `managed_process_live` for that change, whether the root guard
-is currently held, `base_merge_in_progress` and `is_resolving`.
+resource and the command. Inputs: scope, the change's display status and
+`queue_intent` (for a worktree, those of the change whose `worktree` relation
+equals the bound path, if any), whether the owner holds a live managed process
+group *bound to a path under the target root*, whether the root guard is
+currently held, `base_merge_in_progress` and `is_resolving`. Reasons are
+evaluated in table order and the first match is published:
 
 | reason (`target_ineligible`) | change scope | worktree scope |
 |---|---|---|
 | `change_active` | `is_active_status(display_status)` | the owning change's status is active |
-| `managed_process_live` | — | the owning change holds a live managed process group |
-| `root_busy` | root guard held, base merge in progress, or `is_resolving` | root guard held or base merge in progress |
+| `change_admitted` | `queue_intent == queued` or display status `queued` / `blocked` | the owning change is admitted the same way |
+| `managed_process_live` | a live managed process group's working directory is the change directory or below it | a live managed process group's working directory is the worktree directory or below it |
+| `root_busy` | root guard held, base merge in progress, or `is_resolving` | root guard held, base merge in progress, or `is_resolving` |
+
+`change_admitted` follows `refresh_proposal`'s `target_admitted`: a `queued`
+or `blocked` row is one the scheduler may dispatch at any moment without
+passing the command application gate, so a save that landed between admission
+and dispatch would race the agent's first write. The TUI editor has no such
+gate only because its operator is local.
+
+`managed_process_live` is path-bound, not change-bound. The termination port
+gains `async fn owns_managed_process_under(&self, root: &Path) -> bool`,
+answered from the same registry the kill walks, and the registry records the
+`cwd` each managed command was spawned with on its `ScopeEntry`. A live group
+whose working directory is the target root or a descendant of it blocks the
+edit whatever its `change_id` is — including an entry with no change ID at
+all, which is how a future configured session or any other non-change-keyed
+managed process is covered without a dependency on it. A live group spawned
+with no `cwd` runs in the owner's own working directory, the project root,
+and therefore blocks the main worktree row and every change directory. The
+existing change-keyed `owns_managed_process` and `actions.force_stop_change`
+are unchanged.
 
 `WorktreeService` gains `pub fn root_guard_is_held(&self) -> bool`
 (a `try_lock` probe released immediately). The read response publishes
 `editable` and `edit_blocked_reason` from the same classifier; a `worktree`
-row with no owning change is editable (it is operator work, as in the TUI).
+row with no owning change — the main worktree row included — is editable only
+while no live managed process group is bound to a path under it and the root
+is not busy by the same inputs the change scope uses.
 
 ### Read resource
 
@@ -169,8 +225,14 @@ the write is file-local and the guard is only *probed*):
    `content_id_after`, `bytes_written`, and `mode`.
 6. For `worktree` scope, trigger the ordinary worktree observation refresh so
    `dirty` and the `Refreshed` worktree event follow; publish one state event
-   `text_written` with payload `{scope, path, content_id_after}` (the snapshot
-   is unchanged, so the revision does not move; the sequence does).
+   `text_written` with payload `{scope, path, content_id_after}`. The write
+   itself changes no snapshot member, so the event moves the sequence and not
+   the revision — but the observation refresh it triggers is an ordinary
+   observation, and when it changes `dirty` (a clean worktree that is now
+   dirty) the revision advances exactly as it would for any other refresh. A
+   client MUST therefore re-read `state_revision` before its next fenced
+   command rather than assume the pre-write value; the usage guide says that a
+   save can require a reload.
 
 Result kind `text_write`:
 
@@ -195,8 +257,9 @@ The compare in step 3 and the rename in step 4 are not one atomic operation
 against *external* writers. A write by an editor or agent that lands between
 them is overwritten. The published guarantee is therefore: (a) a write never
 succeeds against content the client did not read, as of the compare; (b)
-Conflux's own writers are excluded by eligibility (an active change, a live
-managed process group, a held root guard) rather than by the compare; (c)
+Conflux's own writers are excluded by eligibility (an active or admitted
+change, a live managed process group bound to a path under the root, a held
+root guard, a base merge or resolve in progress) rather than by the compare; (c)
 external, uncooperative editors are *not* excluded, and the usage guide says
 so. Nothing is locked with `flock`, because no external editor honours it.
 
@@ -211,10 +274,10 @@ so. Nothing is locked with `flock`, because no external editor honours it.
  "commands": ["write_change_text", "write_worktree_text"],
  "max_bytes": 1048576, "max_path_bytes": 1024,
  "content_id_algorithm": "sha256",
- "excluded": [".git", ".wt/", "executable"],
- "reasons": ["git_metadata", "conflux_hook_path", "unsafe_path", "not_regular_file",
-             "executable", "too_large", "not_text", "root_missing",
-             "change_active", "managed_process_live", "root_busy"]}
+ "excluded": [".git", ".wt/", ".conflux-inflight", "nested-repository", "executable"],
+ "reasons": ["git_metadata", "conflux_owned_path", "unsafe_path", "nested_repository",
+             "not_regular_file", "executable", "too_large", "not_text", "root_missing",
+             "change_active", "change_admitted", "managed_process_live", "root_busy"]}
 ```
 
 `ErrorCode` gains `TextStale` and `TextNotEditable` (both HTTP 409, wire names
@@ -229,9 +292,17 @@ unchanged. `cflx client` decodes the new block through its existing
 No durable state is introduced; eligibility is recomputed from the reducer
 snapshot and process-local facts on every request. The only file Conflux
 creates inside a target is the temporary file that the operator's own write
-consumes by rename; it is never retained, never ignored, and never excluded
-from cleanliness checks (a failed write removes it before returning). The
-written file is the operator's deliverable, not Conflux runtime state.
+consumes by rename; it is never retained by design, never ignored, and never
+excluded from cleanliness checks (a failed write removes it before returning).
+A process killed between step 4's create and its `renameat` can leave
+`.<leaf>.cflx-tmp-<hex>` behind: that residue is reported by Git and by every
+Conflux cleanliness check as ordinary untracked dirt, no sweeper removes it,
+and the usage guide names the pattern so the operator can delete it by hand.
+Refusing to hide it is the constitution's own rule, not a gap in this design.
+The written file is the operator's deliverable, not Conflux runtime state.
+`.conflux-inflight` and `.wt/` are excluded from remote edit for the same
+reason in reverse: they are inputs Conflux executes or reads as control
+state, and a remote save into them is not an operator deliverable.
 
 ## Rejected alternatives
 
@@ -287,15 +358,33 @@ linked worktree). Required cases:
 - `remote_text_edit_refuses_every_containment_violation`: table over lexical
   violations (422) and `text_not_editable` reasons: `.git` file in the linked
   worktree, `.git` directory in the main worktree, `.wt/teardown`,
-  `.wt/setup` in change scope, a symlink directory component, a symlink leaf,
-  a leaf replaced by a symlink *after* a successful read, an executable file,
-  a 1 MiB + 1 byte file, a file with a NUL byte, invalid UTF-8 bytes on read.
-  Each case asserts no bytes changed anywhere under the root.
+  `.wt/setup` in change scope, top-level `.conflux-inflight` on the main
+  worktree row (`conflux_owned_path`) while `sub/.conflux-inflight` stays
+  editable, a symlink directory component, a symlink leaf, a leaf replaced by
+  a symlink *after* a successful read, an executable file, a 1 MiB + 1 byte
+  file, a file with a NUL byte, invalid UTF-8 bytes on read. Each case asserts
+  no bytes changed anywhere under the root.
+- `remote_text_edit_refuses_nested_worktree_through_main_root`: a linked
+  worktree placed under the project root (`.worktrees/alpha`) and a directory
+  holding a `.git` *symlink*; from the main worktree's ID, a read and a write
+  of `.worktrees/alpha/src/lib.rs` and of `embedded/file.txt` are both
+  `nested_repository`, while the same file read through `alpha`'s own ID is
+  served; the digest of every file under the project root and under `alpha`
+  is unchanged.
 - `remote_text_edit_writer_exclusion_refuses_active_targets`: with the reducer
   holding `ApplyStarted` for the owning change, and separately with a managed
-  termination port reporting a live process group, and separately with the
-  service root guard held via `acquire_root_for_test`, both the read's
-  `editable: false` reason and the command's `target_ineligible` reason agree.
+  termination port reporting a live process group bound to the worktree path
+  *with no change ID*, and separately with the service root guard held via
+  `acquire_root_for_test`, and separately with `is_resolving` set on the main
+  worktree row, both the read's `editable: false` reason and the command's
+  `target_ineligible` reason agree; a port reporting a live group bound to a
+  sibling path leaves the target editable.
+- `remote_text_edit_writer_exclusion_refuses_admitted_targets`: with the
+  reducer holding the owning change as `queued` and separately as `blocked`
+  (and separately `queue_intent = queued` on a `not queued` row), the read's
+  `editable: false` and the command's `target_ineligible` both carry
+  `change_admitted`, for the change directory and for the owned worktree;
+  nothing is written.
 - `remote_text_edit_change_scope_edits_only_the_change_directory`: write
   `openspec/changes/alpha/tasks.md` in the project root; a path outside the
   change directory via `..` is 422; a second change's directory and the
@@ -328,12 +417,14 @@ linked worktree). Required cases:
 
 ### Non-declared regression runs the implementer must still report
 
-`cargo test --features web-monitoring --test client_cli_tests` and
-`cargo test --lib --features web-monitoring remote_worktree` must pass
+`cargo test --features web-monitoring --test client_cli_tests`,
+`cargo test --lib --features web-monitoring remote_worktree`, and
+`cargo test --lib --features web-monitoring force_stop_change` must pass
 unchanged; the worktree capability `operations` assertion in
 `remote_worktree_capabilities_report_the_operations_and_recovery_boundary`
-is updated for the added `"text"` operation and is the only expected edit
-to existing tests.
+is updated for the added `"text"` operation, and test doubles implementing
+`ManagedProcessTermination` gain the added path-bound method; those are the
+only expected edits to existing tests.
 
 ## Independent review launch contract (for the implementation worker)
 

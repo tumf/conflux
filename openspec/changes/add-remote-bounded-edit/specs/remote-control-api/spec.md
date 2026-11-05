@@ -22,15 +22,23 @@ contains `\`, a NUL, or an empty, `.`, or `..` component. Every directory
 component and the leaf MUST be opened with `O_NOFOLLOW` from the root
 descriptor on every read and every write. The owner MUST refuse with
 `text_not_editable` and a stable reason — `git_metadata` (any `.git`
-component, file or directory), `conflux_hook_path` (top-level `.wt/`),
-`unsafe_path` (a symlink or non-directory on the walk or a symlink leaf),
-`not_regular_file`, `executable` (any execute bit), `too_large` (over
-1,048,576 bytes), `not_text` (invalid UTF-8 or NUL), `root_missing` — and
-with `target_ineligible` and reason `change_active`, `managed_process_live`,
-or `root_busy` when the owning change is in an active display status, holds a
-live managed process group, or the repository root mutation guard or an
-unresolved base merge or resolve is in progress. The read response MUST
-publish `editable` and `edit_blocked_reason` from the same classifier.
+component, file or directory), `conflux_owned_path` (top-level `.wt/` or the
+top-level `.conflux-inflight`), `unsafe_path` (a symlink or non-directory on
+the walk or a symlink leaf), `nested_repository` (a traversed directory below
+the root that contains a `.git` entry of any type; the root's own `.git` is
+not examined), `not_regular_file`, `executable` (any execute bit),
+`too_large` (over 1,048,576 bytes), `not_text` (invalid UTF-8 or NUL),
+`root_missing` — and with `target_ineligible` and reason `change_active`,
+`change_admitted`, `managed_process_live`, or `root_busy` when the owning
+change is in an active display status, is admitted (`queue_intent` queued or
+display status `queued` / `blocked`), when the owner holds a live managed
+process group whose working directory is the target root or below it
+regardless of the change ID that group carries, or when the repository root
+mutation guard is held or a base merge or resolve is in progress — the last
+applying to the main worktree row and every change directory alike. The read
+response MUST publish `editable` and `edit_blocked_reason` from the same
+classifier. A nested worktree MUST be editable only through its own opaque
+worktree ID, never through a path from another root.
 
 `content_id` MUST be `sha256:` followed by the lowercase hex SHA-256 of the
 exact file bytes. A write MUST compare the current bytes to `expected`
@@ -45,7 +53,11 @@ with `outcome`, `content_id_before`, `content_id_after`, `current_content_id`,
 `bytes_written`, `mode`, and `effects.file_written`. A refused record MUST
 carry the same result. A successful worktree write MUST trigger the ordinary
 worktree observation refresh so `dirty` follows, and MUST NOT stage, commit,
-or push.
+or push. The write itself MUST NOT advance the state revision, but the
+observation refresh it triggers MAY, and the contract MUST tell clients to
+re-read `state_revision` after a save. A temporary file left by a process
+crash between create and rename MUST be reported as ordinary untracked dirt
+and MUST NOT be ignored or excluded from any cleanliness check.
 
 The contract MUST state that the compare and the rename are not atomic
 against external writers: Conflux's own writers are excluded by eligibility,
@@ -92,10 +104,26 @@ gain no verb.
 
 #### Scenario: Active writers exclude remote edits
 
-- **GIVEN** change `alpha` is `applying` or holds a live managed process group, or the root guard is held
+- **GIVEN** change `alpha` is `applying`, or the owner holds a live managed process group whose working directory is under `alpha`'s worktree (with or without a change ID), or the root guard is held, or a resolve is running
 - **WHEN** a client reads and then writes a file in `alpha`'s worktree
 - **THEN** the read reports `editable: false` with the matching reason
 - **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a live managed process group bound to a sibling path leaves the target editable
+
+#### Scenario: Admitted targets exclude remote edits
+
+- **GIVEN** change `alpha` is `queued` or `blocked`, or its `queue_intent` is queued
+- **WHEN** a client reads and then writes a file in `alpha`'s change directory or in its worktree
+- **THEN** the read reports `editable: false` with reason `change_admitted`
+- **AND** the write fails `target_ineligible` with `change_admitted` and writes nothing
+
+#### Scenario: Nested repository is not reachable through another root
+
+- **GIVEN** change `alpha`'s worktree lies under the project root, and a directory under the main worktree carries its own `.git` entry
+- **WHEN** a client addresses a file inside either through the main worktree's opaque ID
+- **THEN** the read and the write are refused with `text_not_editable` and reason `nested_repository`
+- **AND** the same file is served through `alpha`'s own worktree ID
+- **AND** no bytes under the project root or under `alpha`'s worktree change
 
 #### Scenario: Absent expectation creates exactly once
 
