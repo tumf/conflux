@@ -32,6 +32,18 @@
 - Removal is `worktree_remove_forced` → `git worktree remove <path> --force`
   (`src/vcs/git/commands/worktree.rs:673-677`), which deletes the whole
   directory including ignored paths that `dirty` does not see.
+- `git status` never lists a `.git` entry, an empty directory, or an entry
+  that is neither a regular file, a directory, nor a symlink, in any
+  untracked or ignored mode. Observed on Git 2.53 in a scratch repository:
+  with `--untracked-files=all --ignored=traditional` a gitfile at
+  `target/wt/.git`, a FIFO at `target/deep/fifo`, and an ignored directory
+  holding only an empty subdirectory produce no record, while a nested
+  repository at `target/nested` is reported as the directory record
+  `! target/nested/`. With `--untracked-files=normal --ignored=traditional`
+  an all-untracked directory is one `? dir/` record and an all-ignored
+  directory is one `! dir/` record, neither descended into. The oracle
+  therefore walks collapsed directory records itself (below) instead of
+  trusting Git's expansion to enumerate the deleted set.
 - `DeleteOptions` doc comments (`service.rs:332-350`) currently say
   `skip_teardown` is "never reachable from `/api/v2`" and that only the local
   TUI may set the two discard permissions; this change makes those sentences
@@ -92,8 +104,10 @@ content observation:
   ignored paths and that loss needs the same explicit permission as known
   uncommitted work. `dirty` itself keeps its `--ignored=no` meaning.
 
-`entries` is the number of non-ignored status records; `ignored_entries` is
-the number of ignored records; `commits` is
+`entries` is the number of paths in the discardable identity;
+`ignored_entries` is the number of paths in the ignored identity (ignored
+status records plus every entry walked beneath an ignored directory record,
+directories included); `commits` is
 `git rev-list --count merge_base..head`. `teardown_script_present` is `true`
 exactly when the runner would execute `.wt/teardown`: the path resolves,
 through the same follow-symlink `exists`/`is_file`/`metadata` checks
@@ -104,60 +118,126 @@ An unknown or retired ID is `worktree_not_found`.
 
 ### Discardable content identity
 
-`src/worktree_ops/consent.rs::observe_discardable_content(worktree) -> Result<ContentObservation>`
+`src/worktree_ops/consent.rs::observe_discardable_content(worktree, limits: &ConsentLimits) -> Result<ContentObservation>`
 where `ContentObservation` is `Observed { discardable_content_id, ignored_content_id, has_ignored_content, entries, ignored_entries }`
-or a typed non-observation `Unobservable`, `Unbounded`, `NestedRepository`:
+or a typed non-observation `Unobservable`, `Unbounded`, `NestedRepository`.
+The non-observation variants carry no identity field at all, so a partial
+or substitute identity cannot exist in the type. `ConsentLimits
+{ max_records, max_hashed_bytes }` has one production value,
+`ConsentLimits::PRODUCTION = { 500_000, 256 MiB }`, used by the preview and
+the service alike; `WorktreeService` holds its limits and a test
+constructor injects smaller ones, so a limit case needs no multi-hundred-
+megabyte fixture.
 
-1. Run `git --no-optional-locks status --porcelain=v2 -z --untracked-files=all --ignored=traditional`
-   via a new `CONSENT_STATUS_ARGS` in `status_policy.rs` (added to the
-   inventory test). `--untracked-files=all` with `--ignored=traditional`
-   makes Git list every individual file inside untracked and ignored
-   directories, so the record set *is* the exact on-disk file set that
-   `git worktree remove --force` will delete beyond `HEAD`. Any status
+Both identities bind **bytes**. Metadata (existence, size, mtime, mode) is
+bound in addition, never instead: a same-size rewrite of a file with its
+mtime and mode restored leaves every metadata field intact and changes the
+identity only because the bytes are hashed. That is the property the
+previously agreed `content_changed` refusal promises, and it holds for
+ignored content exactly as for tracked and untracked content.
+
+1. **Status.** Run `git --no-optional-locks status --porcelain=v2 -z
+   --untracked-files=normal --ignored=traditional` via a new
+   `CONSENT_STATUS_ARGS` in `status_policy.rs` (added to the inventory
+   test). In this mode Git reports a directory whose entries are all
+   untracked as one `? dir/` record, a directory whose entries are all
+   ignored as one `! dir/` record, and a nested repository as a directory
+   record, without descending into any of them. `--untracked-files=all` is
+   deliberately not used: Git's expansion hides `.git` entries, empty
+   directories, and special files (source evidence above), so an expanded
+   listing is not the set `git worktree remove --force` deletes. Any status
    failure or unparsable record → `Unobservable`, never an empty identity.
-2. **Observable file set.** Each record is one of ordinary `1`, rename/copy
-   `2`, unmerged `u`, untracked `?`, or ignored `!`. The verbatim record
-   fields (XY, submodule state, modes `mH mI mW`, index/HEAD OIDs, score,
-   path and original path) are collected for the non-ignored kinds; `!`
-   records contribute the path only.
-3. **Bound.** More than `MAX_CONSENT_RECORDS = 500_000` records, or more
-   than `MAX_CONSENT_HASHED_BYTES = 256 MiB` of file bytes read in step 4,
-   → `Unbounded`. There is no partial hash of a large file: a single file
-   larger than the remaining byte budget is `Unbounded` too.
-4. **Non-ignored on-disk identity.** For each non-ignored path whose
-   worktree side differs (second XY character not `.`, or `?`, or `u`):
-   `lstat` with no follow. Symlink → `l:sha256(readlink target)`, never
-   followed. Missing → `d`. Regular file → open with
-   `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, then `fstat` the open
-   descriptor: still a regular file → `f:sha256(bytes)` read to EOF;
-   anything else (the path was swapped for a FIFO, device, socket, or
-   directory between `lstat` and `open`) → `o:<type from fstat>` without
-   reading. An `open` that fails with `ELOOP` (a link raced in) → `o:symlink`;
-   `ENXIO` (a socket) → `o:socket`; any other error → `Unobservable`. The
-   non-blocking open is what prevents a FIFO from parking the owner under the
-   root guard; the post-open `fstat` is what closes the `lstat`→`open` race.
-   Anything `lstat` reports that is neither regular, symlink, nor missing →
-   `o:<type>` directly, with one exception: a **directory** record. With
-   `--untracked-files=all` Git expands directories into files, so a
-   directory record is a nested repository (an untracked repository or a
-   populated submodule, which Git never descends into) and so is any record
-   whose submodule field starts with `S`. Either → `NestedRepository`: the
-   content below it cannot be enumerated or bounded from this worktree's
-   status, so the confirmed command fails closed instead of discarding it.
-5. **Ignored on-disk identity.** For each `!` record: `lstat` with no
-   follow, no open, no bytes read; contribute
-   `i:<file type>:<size>:<mtime_ns>:<mode>` (symlink → `i:l:sha256(target)`,
-   missing → `i:d`). Ignored trees are build output that is routinely
-   gigabytes, so the ignored identity binds every ignored path's existence,
-   size, modification time, and mode rather than its bytes; any write,
-   creation, or deletion of an ignored path changes it, and the record cap
-   in step 3 still bounds the walk. A `!` record that is a directory is a
-   nested repository exactly as in step 4.
-6. Sort records by path, join each record's fields with `\x1f` and records
-   with `\x1e`, SHA-256 the bytes. `discardable_content_id` is
-   `sha256:<hex>` over the non-ignored records of steps 2 and 4;
-   `ignored_content_id` is `sha256:<hex>` over the `!` records of step 5;
-   `has_ignored_content` is whether any `!` record exists.
+2. **Record kinds.** Each record is ordinary `1`, rename/copy `2`,
+   unmerged `u`, untracked `?`, or ignored `!`. The verbatim fields (XY,
+   submodule state, modes `mH mI mW`, index/HEAD OIDs, score, path and
+   original path) are collected for the non-ignored kinds; `!` records
+   contribute the path. A record whose submodule field starts with `S` (a
+   status-reported submodule) → `NestedRepository`.
+3. **Every open is fd-relative and no-follow.** The worktree root is opened
+   once with `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` and every
+   path from then on is resolved one component at a time from that
+   descriptor with `openat(dirfd, component,
+   O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)` for directories,
+   confirmed by `fstat`; the leaf is examined with `fstatat(dirfd, name,
+   AT_SYMLINK_NOFOLLOW)`. Nothing is `chdir`ed and no absolute path is
+   re-resolved, so a component swapped for a symlink after the preview
+   cannot redirect the oracle, and no symlink is ever traversed. These are
+   `libc` calls already available to the crate; no new dependency.
+4. **Leaf identity**, the same for every kind of record and for every walked
+   entry (`<p>` is the record prefix: nothing for discardable paths, `i:`
+   for ignored ones):
+   - regular file → `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)`,
+     then `fstat` the open descriptor: still a regular file →
+     `<p>f:<mode>:<size>:<mtime_ns>:sha256(bytes)` read to EOF; anything
+     else (swapped for a FIFO, device, socket, or directory between
+     `fstatat` and `open`) → `<p>o:<type from fstat>` without reading. An
+     `open` that fails with `ELOOP` → `<p>o:symlink`; `ENXIO` →
+     `<p>o:socket`. The non-blocking open is what prevents a FIFO from
+     parking the owner under the root guard; the post-open `fstat` closes
+     the `fstatat`→`open` race;
+   - symlink → `<p>l:sha256(readlinkat target)`: the target string's bytes,
+     never followed;
+   - directory → `<p>dir:<mode>` and the walk of step 5;
+   - FIFO, socket, device, or any other type → `<p>o:<type>`, never opened;
+   - missing (a status-reported path raced away) → `<p>d`;
+   - any other error (`EACCES`, `EMFILE`, `EIO`, …) → `Unobservable`.
+5. **Directory records are walked, never trusted and never refused on
+   sight.** A `?` or `!` record whose path ends in `/`, and every directory
+   met beneath it, is enumerated with `fdopendir` on the descriptor from
+   step 3 and each entry is classified by step 4 with `fstatat(dirfd, name,
+   AT_SYMLINK_NOFOLLOW)`. An entry named `.git` — directory or file, valid
+   gitfile or not — at any depth → `NestedRepository`: the content below it
+   cannot be enumerated from this worktree's status and is not discarded.
+   A directory is therefore not a nested repository because it is a
+   directory; `! target/` is walked and bound, and only an actual `.git`
+   descendant (or the `S` submodule record of step 2) refuses. Every walked
+   directory is its own record, so an empty subdirectory is bound exactly
+   (its creation or removal changes the identity). A symlink to a directory
+   is a symlink record; the walk does not enter it, so content behind it is
+   neither bound nor read. Directory descriptors are closed on ascent; the
+   record cap below bounds the walk, and descriptor exhaustion is
+   `Unobservable` like any other walk error.
+6. **Membership: each path in exactly one identity.** A path belongs to the
+   ignored identity when status reported it as `!` or it was walked beneath
+   a `!` directory record; every other record and every entry walked beneath
+   a `?` directory record belongs to the discardable identity. Git reports
+   an ignored entry inside an all-untracked directory as both `? dir/` and
+   `! dir/file` (or `! dir/sub/`); that path, with its subtree for a
+   directory, is ignored content, is skipped by the enclosing `dir/` walk,
+   and is read once through its own record. No path is read twice and no
+   path is excluded.
+7. **Bound: one combined budget.** `records` counts status records plus
+   every walked entry (directories, files, symlinks, specials) across
+   tracked, untracked, and ignored content together; more than
+   `max_records` → `Unbounded`. `hashed_bytes` counts regular-file bytes
+   and symlink target bytes, each path once, across the same combined set;
+   more than `max_hashed_bytes` → `Unbounded`. Both are checked before each
+   read, a single file larger than the remaining byte budget is `Unbounded`
+   with no partial hash, and `Unbounded` stops the walk. `Unbounded` is
+   final for that observation: the oracle never substitutes a metadata-only
+   identity, never hashes a prefix, never drops ignored content to fit, and
+   never reports `observed` over a subset. Staying available is not a goal
+   the oracle trades safety for. A worktree past the budget — typically a
+   large `target/` or other build output — is not deletable through the
+   confirmed command: the operator cleans that output in place, runs the
+   project's own clean or `.wt/teardown` locally, or deletes through the
+   TUI, which is the existing local operation, and previews again. This
+   change adds no remote authority over content the oracle could not bind.
+8. **Hash.** Sort records by path, join each record's fields with `\x1f`
+   and records with `\x1e`, SHA-256 the bytes. `discardable_content_id` is
+   `sha256:<hex>` over the discardable set and `ignored_content_id` is
+   `sha256:<hex>` over the ignored set of step 6; `has_ignored_content` is
+   whether the ignored set is non-empty.
+9. **What no mode can list, stated exactly.** A directory that holds no
+   regular file or symlink at any depth (an empty directory, or one holding
+   only FIFOs, sockets, or devices) and a lone special file produce no
+   status record in any untracked or ignored mode. They are bound as
+   records only when they lie beneath a walked directory record; elsewhere
+   they are neither disclosed nor bound, and they hold no file bytes. Every
+   regular file and symlink that `git worktree remove --force` deletes
+   beyond `HEAD` is either a status record or beneath a walked directory
+   record, with the one existing exception of a populated submodule that
+   status does not report (guarantee boundary below).
 
 A clean worktree (no records) has the identity of the empty record set for
 both IDs, not `null`. The preview publishes `content_observation` as
@@ -301,22 +381,32 @@ operations, and the usage guide says so.
 
 What the identities cover, stated so the usage guide can repeat it:
 
-- Tracked modifications, staged changes, unmerged paths, and untracked files
-  are bound by bytes (or symlink target). Ignored paths are bound by
-  existence, size, mtime, and mode, and are disclosed as
-  `has_ignored_content` / `ignored_entries`; they are deleted by
-  `git worktree remove --force` and therefore require `discard_known_dirty`
-  even when `dirty` is `false`. `dirty` keeps its `--ignored=no` meaning;
-  the ignored fact is a separate, additional one.
-- Content under a nested repository or a populated submodule that status
-  reports is never bound; the confirmed command fails closed with
-  `nested_repository`. A populated submodule that status does not report is
-  outside the oracle; Git's own `worktree remove` guard refuses such a
-  worktree, which the service surfaces as `internal_error` with the worktree
-  retained, exactly as `delete_worktree` does today.
-- Past the record or byte limits the observation is `unbounded` and the
-  confirmed command refuses; the ordinary `delete_worktree` path is not
-  weakened or changed by any of this.
+- Tracked modifications, staged changes, unmerged paths, untracked files,
+  and ignored files are all bound by their bytes (or symlink target string),
+  with type, size, mtime, and mode bound in addition. Metadata is never the
+  proof: a same-size rewrite with mtime and mode restored changes the
+  identity. Ignored content is disclosed as `has_ignored_content` /
+  `ignored_entries`; it is deleted by `git worktree remove --force` and
+  therefore requires `discard_known_dirty` even when `dirty` is `false`.
+  `dirty` keeps its `--ignored=no` meaning; the ignored fact is a separate,
+  additional one.
+- Collapsed directories (`? dir/`, `! dir/`) are walked by the oracle, so
+  files at any depth, empty subdirectories, special files, and symlinks
+  beneath them are bound. Empty directories and lone special files that lie
+  under no walked record are listed by no status mode, hold no bytes, and
+  are not bound; the design states this rather than claiming otherwise.
+- Content under an actual nested repository (a `.git` descendant) or a
+  status-reported submodule is never bound; the confirmed command fails
+  closed with `nested_repository`. A populated submodule that status does
+  not report is outside the oracle; Git's own `worktree remove` guard
+  refuses such a worktree, which the service surfaces as `internal_error`
+  with the worktree retained, exactly as `delete_worktree` does today.
+- Past the combined record or byte budget (tracked, untracked, and ignored
+  together, each path once) the observation is `unbounded` and the confirmed
+  command refuses whatever permissions were given; no metadata-only or
+  partial identity is substituted to keep the command available. Large
+  build output is reduced locally, not deleted remotely. The ordinary
+  `delete_worktree` path is not weakened or changed by any of this.
 
 ### Constitution check
 
@@ -337,11 +427,25 @@ resume decision reads any of this.
   the facts is auditable and stateless.
 - `git stash` or a backup branch before discard: the TUI makes no such
   promise, and "discard" must mean discard.
-- Hashing ignored bytes: ignored trees are build output, routinely
-  gigabytes, so a byte identity would push every built worktree past any
-  honest byte limit and make the confirmed command unusable exactly where
-  it is needed. Existence, size, mtime, and mode per path still change on
-  any write and keep the walk bounded by the record cap.
+- Binding ignored paths by metadata only (existence, size, mtime, mode): a
+  same-size rewrite with the timestamp restored leaves every one of those
+  fields intact, so the previously agreed `content_changed` refusal would
+  become a false guarantee for ignored content. Bytes are hashed instead;
+  metadata stays bound in addition.
+- Falling back to a metadata identity, a prefix hash, or an ignored-content
+  exclusion when the byte budget is exceeded: each keeps the command
+  available by weakening what consent proves. `unbounded` is the truthful
+  answer, and reducing a large build tree is a local operation that already
+  exists.
+- Trusting `--untracked-files=all` to enumerate collapsed directories: Git's
+  expansion omits `.git` entries, empty directories, and special files, so
+  it neither detects a nested repository hidden inside `target/` nor binds
+  the whole deleted set. The oracle walks directory records itself with
+  fd-relative no-follow calls.
+- Refusing every directory record as a nested repository: with collapsed
+  directory records that would make every worktree with a `target/`
+  undeletable through this command. Only an actual `.git` descendant or a
+  status-reported submodule is a nested repository.
 - Hiding the ignored-path loss in documentation only: `git worktree remove
   --force` deletes those paths, so an undisclosed, unconsented loss would
   contradict the discard requirement this change exists to satisfy.
@@ -380,13 +484,51 @@ cases use the existing `FakeBackend` in `src/worktree_ops/service/tests.rs`.
   (`consent.rs` tests): adding, modifying, and deleting an ignored file
   changes `ignored_content_id` and `has_ignored_content`, leaves
   `discardable_content_id` unchanged, and leaves `DirtyState` `Clean`;
-  an ignored path inside an ignored directory is an individual record.
+  an ignored file inside an all-untracked directory (reported as both
+  `? dir/` and `! dir/file`) is in the ignored identity only and is read
+  once.
+- `remote_confirmed_delete_same_size_bytes_mutated_with_mtime_restored_changes_identity`
+  (`consent.rs` tests, real Git): an ignored `target/a.o` holding `AAAA`
+  is observed; it is rewritten to `AAAB` (same size) and its mtime and mode
+  are restored with `File::set_times` and `set_permissions`; `lstat`
+  confirms size, mtime, and mode equal the originals; `ignored_content_id`
+  differs, `discardable_content_id` is unchanged, `has_ignored_content`
+  stays `true`, and `DirtyState` stays `Clean`. The same rewrite of tracked
+  `README` (`A` → `B`, mtime restored; Git still reports the record because
+  ctime moves) changes `discardable_content_id`. This is the test that a
+  metadata-only identity cannot pass.
+- `remote_confirmed_delete_ignored_directory_walk_binds_descendant_drift`
+  (`consent.rs` tests, real Git): `target/` is confirmed to be the single
+  collapsed record `! target/`; the observation is `Observed`, not
+  `NestedRepository`; each of the following changes `ignored_content_id`
+  while `discardable_content_id` and `DirtyState` `Clean` are unchanged: a
+  same-size mtime-restored rewrite of `target/deep/deeper/b.o`, a new file
+  three levels deep, a removed file, a new empty subdirectory, a removed
+  empty subdirectory, a file replaced by a symlink, and a symlink whose
+  target string changes. A symlink inside `target/` pointing at a sibling
+  directory with files is bound by its target string only: modifying a
+  file behind it leaves the identity unchanged and the walk terminates.
+  `git init target/nested` and, separately, a gitfile written to
+  `target/wt/.git` each yield `NestedRepository`.
+- `remote_confirmed_delete_bound_exceeded_fails_closed` (`consent.rs`
+  tests with injected `ConsentLimits`, plus the service and API cases
+  below): on a Git-clean worktree the record cap exceeded by walked ignored
+  entries alone, the byte cap exceeded by ignored bytes alone, a single
+  ignored file larger than the remaining budget, and a tracked modification
+  plus ignored bytes that each fit alone but exceed the combined budget
+  together each yield `Unbounded`; the variant carries no identity, so no
+  metadata-only or partial identity can be asserted into existence; the
+  walk stops at the bound. `ConsentLimits::PRODUCTION` is asserted equal to
+  `500_000` records and `256 MiB`. In `service/tests.rs` an `Unbounded`
+  observation with all three permissions refuses `worktree_dirty_unknown`
+  reason `content_unbounded` with no `Teardown`/`RemoveWorktree` call.
 - `remote_confirmed_delete_oracle_is_nonblocking_and_bounded`
   (`consent.rs` tests): a tracked path replaced by a FIFO with no writer
   yields `o:fifo` without hanging (asserted by completion, not by a
-  wall-clock threshold); a nested untracked repository and a modified
-  submodule yield `NestedRepository`; exceeding the record cap and the byte
-  cap each yield `Unbounded`, never a partial identity.
+  wall-clock threshold); a FIFO inside a walked ignored directory yields
+  `i:o:fifo` without being opened; a nested untracked repository and a
+  modified submodule yield `NestedRepository`; a tracked path whose parent
+  component is swapped for a symlink after the status call is not followed.
 - `remote_confirmed_delete_ignored_content_requires_dirty_discard`
   (`service/tests.rs`): `has_ignored_content: true`, `dirty: false`, no
   `discard_known_dirty` → `worktree_dirty` reason `ignored_content`, no
@@ -433,8 +575,21 @@ worktree per case and a `.wt/teardown` script that writes a marker:
   file modified after the preview is `delete_consent_stale`
   `content_changed`; with fresh consent and the permission the worktree is
   removed.
+- `remote_confirmed_delete_ignored_directory_drift_is_stale`: a Git-clean
+  worktree with `target/deep/b.o`; preview; same-size rewrite with mtime
+  restored; `discard_known_dirty: true` submission → `delete_consent_stale`
+  `content_changed`, worktree intact, `refusal.observed.ignored_content_id`
+  differs from the consented one.
+- `remote_confirmed_delete_unbounded_observation_fails_closed`: a
+  `WorktreeService` built with small injected `ConsentLimits` and a
+  Git-clean worktree whose ignored files exceed them → preview
+  `content_observation: unbounded`, `null` identities, every option
+  `content_unbounded`; the command with all three permissions `true` →
+  `worktree_dirty_unknown` reason `content_unbounded`, `teardown_ran:
+  false`, worktree and ID intact, no marker written.
 - `remote_confirmed_delete_nested_repository_fails_closed`: an untracked
-  nested repository → preview `content_observation: nested_repository`, every
+  nested repository, and separately a nested repository inside the ignored
+  `target/` → preview `content_observation: nested_repository`, every
   option ineligible, the command `target_ineligible` reason
   `nested_repository` with nothing torn down or removed.
 - `remote_confirmed_delete_old_owner_capabilities_decode_as_unavailable`

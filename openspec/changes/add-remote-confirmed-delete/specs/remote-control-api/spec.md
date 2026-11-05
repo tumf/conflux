@@ -18,25 +18,40 @@ eligibility with a typed `blocked_reason` for `ordinary`, `skip_teardown`,
 accept verbatim.
 
 Both identities MUST come from one bounded read-only oracle over the sorted
-records of `git status --porcelain=v2 -z --untracked-files=all
---ignored=traditional`, which is the exact on-disk file set that
-`git worktree remove --force` deletes beyond `HEAD`. `discardable_content_id`
-MUST be `sha256:` over the staged, unstaged, unmerged, and untracked records
-combined with the no-follow on-disk bytes (or symlink target, or deletion
-marker) of every path with a worktree-side difference and MUST change
-whenever any such byte changes. `ignored_content_id` MUST be `sha256:` over
-every ignored path's existence, file type, size, mtime, and mode, read with
-`lstat` only, and MUST change whenever an ignored path is added, modified,
-or removed, while `dirty` keeps its `--ignored=no` meaning. Files MUST be
+records of `git status --porcelain=v2 -z --untracked-files=normal
+--ignored=traditional` combined with the oracle's own fd-relative walk of
+every directory record Git collapses (`? dir/` and `! dir/`), so that the
+bound set is the on-disk content `git worktree remove --force` deletes
+beyond `HEAD`. `discardable_content_id` MUST be `sha256:` over the staged,
+unstaged, unmerged, and untracked records combined with the no-follow
+on-disk bytes (or symlink target string, or deletion marker) of every path
+with a worktree-side difference and of every entry walked beneath an
+untracked directory, and MUST change whenever any such byte changes.
+`ignored_content_id` MUST be `sha256:` over every ignored path's file type,
+size, mtime, mode, and the no-follow bytes of the file itself (or symlink
+target string), including every file, symlink, special file, and empty
+subdirectory walked beneath a collapsed ignored directory, and MUST change
+whenever an ignored path is added, modified, or removed at any depth,
+including a same-size byte change with mtime and mode restored; metadata
+MUST be bound in addition to bytes, never instead of them. `dirty` keeps its
+`--ignored=no` meaning. Every path MUST be resolved component by component
+from an open worktree root descriptor with `O_NOFOLLOW`, files MUST be
 opened `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` and re-checked with `fstat` so that
-a FIFO or a path swapped after `lstat` is recorded by type without being
-read or followed. The oracle MUST have documented finite record and byte
-limits beyond which the observation is `unbounded` with no partial identity,
-MUST report a directory record or a status-reported submodule as
-`nested_repository`, MUST publish both identities and `has_ignored_content`
-as `null` with the typed `content_observation` whenever it is not
-`observed`, and MUST be computed through the read-only status policy
-without writing, staging, running hooks, or excluding any path.
+a FIFO or a path swapped after `fstatat` is recorded by type without being
+read or followed, and the walk MUST NOT traverse a symlink. The oracle MUST
+have one documented combined budget over tracked, untracked, and ignored
+content with each path counted once (500,000 records including walked
+entries, 256 MiB of hashed bytes) beyond which the observation is
+`unbounded` with no partial, prefix, or metadata-only identity and no
+exclusion of ignored content, MUST report an actual `.git` descendant at any
+depth or a status-reported submodule as `nested_repository` while a
+directory record itself is walked rather than refused, MUST publish both
+identities and `has_ignored_content` as `null` with the typed
+`content_observation` whenever it is not `observed`, and MUST be computed
+through the read-only status policy without writing, staging, running
+hooks, or excluding any path. A worktree whose observation is `unbounded`
+MUST NOT be deletable through this command; reducing its content remains a
+local operation.
 
 V2 MUST extend the closed command set with `delete_worktree_confirmed`
 (target opaque `worktree_id`) whose typed params are the three independent
@@ -94,14 +109,16 @@ command variant, the preview route, the result kind, and the error code.
 - **THEN** the preview publishes `dirty: false`, `has_ignored_content: true`, `ignored_entries`, and `ordinary` blocked with `ignored_content`
 - **AND** the command refuses `worktree_dirty` with reason `ignored_content` and removes nothing
 - **AND** modifying the ignored file after the preview makes a `discard_known_dirty: true` submission `delete_consent_stale` with `content_changed`
+- **AND** rewriting an ignored file to different bytes of the same size with its mtime and mode restored, or changing a file three levels beneath a collapsed ignored directory, is likewise `delete_consent_stale` with `content_changed`
 - **AND** fresh consent with `discard_known_dirty: true` removes the worktree
 
 #### Scenario: Oracle limits and nested repositories fail closed
 
-- **GIVEN** a worktree containing an untracked nested repository, or one whose status records exceed the documented limits
+- **GIVEN** a worktree containing an actual nested repository (untracked, or inside an ignored directory), or one whose combined records or hashed bytes exceed the documented budget, including when ignored build output alone exceeds it
 - **WHEN** an authenticated client reads its `delete-preview` and submits `delete_worktree_confirmed` with every permission
 - **THEN** the preview publishes `content_observation` as `nested_repository` or `unbounded` with `null` identities and every option ineligible
 - **AND** the command refuses `target_ineligible` (reason `nested_repository`) or `worktree_dirty_unknown` (reason `content_unbounded`)
+- **AND** no metadata-only or partial identity is published in place of the refusal, and a plain ignored directory without a `.git` descendant is walked rather than refused
 - **AND** nothing is torn down or removed and `delete_worktree` behaves as before
 
 #### Scenario: Skip-teardown removes without running the script

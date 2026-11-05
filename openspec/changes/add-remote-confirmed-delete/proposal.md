@@ -11,7 +11,7 @@ references:
   - docs/guides/USAGE.md
 verifications:
   - id: remote-confirmed-delete-service
-    requirement: Shared worktree service binds explicit skip-teardown, dirty-discard, and ahead-discard consent to branch, HEAD, identity, observed facts, discardable content identity, and ignored content identity through a bounded non-blocking oracle, and refuses on any drift, unknown or unbounded fact, nested repository, undeclared ignored content, main, or busy root
+    requirement: Shared worktree service binds explicit skip-teardown, dirty-discard, and ahead-discard consent to branch, HEAD, identity, observed facts, discardable content identity, and byte-hashed ignored content identity through a bounded non-blocking fd-relative oracle that walks collapsed directories, and refuses on any drift, unknown or unbounded fact, actual nested repository, undeclared ignored content, main, or busy root without ever substituting a metadata-only identity
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -78,7 +78,15 @@ itself: `git worktree remove --force` deletes the whole directory, including
 ignored paths that the `--ignored=no` dirty observation never sees, so a
 worktree that Git calls clean can still lose on-disk content. The preview
 must disclose that content and consent must bind it; it must not be hidden
-in documentation.
+in documentation. The binding must be to the bytes: size, mtime, and mode
+alone cannot prove content unchanged, because a same-size rewrite with the
+timestamp restored leaves all three intact, and the already agreed
+`content_changed` refusal must not become a false guarantee for ignored
+content. A further Git fact shapes the oracle: `git status` never lists
+`.git` entries, empty directories, or special files, and
+`--untracked-files=all` expands a collapsed `target/` into files while
+hiding exactly those entries, so the oracle must enumerate collapsed
+directories itself rather than trust Git's expansion.
 
 ## Proposed Solution
 
@@ -98,18 +106,35 @@ byte-for-byte as it is:
   fields `branch`, `head`, `dirty`, `has_commits_ahead`,
   `has_ignored_content`, `merge_base`, `discardable_content_id`, and
   `ignored_content_id`. Both identities come from one bounded, read-only
-  oracle over `git status --porcelain=v2 -z --untracked-files=all
-  --ignored=traditional`, whose record set is the exact file set
-  `git worktree remove --force` deletes beyond `HEAD`:
-  `discardable_content_id` is `sha256:` over the staged, unstaged, unmerged,
-  and untracked records plus the no-follow on-disk bytes of every differing
-  path; `ignored_content_id` is `sha256:` over every ignored path's
-  existence, size, mtime, and mode. Files are opened
+  oracle over `git status --porcelain=v2 -z --untracked-files=normal
+  --ignored=traditional` plus the oracle's own walk of every directory
+  record Git collapses (`? dir/`, `! dir/`), so the bound set is the
+  on-disk content `git worktree remove --force` deletes beyond `HEAD`.
+  Both identities bind bytes: `discardable_content_id` is `sha256:` over
+  the staged, unstaged, unmerged, and untracked records plus the no-follow
+  on-disk bytes of every differing path and of everything walked beneath an
+  untracked directory; `ignored_content_id` is `sha256:` over every ignored
+  path's file type, size, mtime, mode, **and the bytes of the file itself**
+  (a symlink: its target string, never followed), including every entry
+  walked beneath a collapsed ignored directory and every empty
+  subdirectory there. Metadata is bound in addition to bytes, never
+  instead: a same-size rewrite of an ignored file with its mtime and mode
+  restored changes `ignored_content_id`. Every open is fd-relative with
   `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` and re-checked with `fstat`, so a FIFO
-  or a swapped path can neither hang the owner nor be followed. Past
-  documented record and byte limits the observation is `unbounded`; a
-  nested repository or a status-reported submodule is `nested_repository`;
-  both fail the confirmed command closed with a typed reason.
+  or a swapped path can neither hang the owner nor be followed and the walk
+  never traverses a symlink. One combined budget covers tracked, untracked,
+  and ignored content, each path counted once: more than 500,000 records
+  (status records plus walked entries) or more than 256 MiB of hashed bytes
+  makes the observation `unbounded`, and the oracle never falls back to a
+  metadata-only or partial identity, and never drops ignored content, to
+  stay available. A directory record is not a nested repository by itself:
+  `nested_repository` is reported only for an actual `.git` descendant at
+  any depth or a status-reported submodule. Both outcomes fail the confirmed
+  command closed with a typed reason. A worktree whose build output exceeds
+  the budget is not deletable through this command; the operator cleans
+  that output locally, runs the project's clean or `.wt/teardown` locally,
+  or uses the existing local TUI deletion, then previews again. This change
+  adds no remote authority over content the oracle could not bind.
 - `delete_worktree_confirmed` (target opaque `worktree_id`) takes typed
   `params`: three independent booleans `skip_teardown`,
   `discard_known_dirty`, `discard_commits_ahead`, and the echoed `consent`.
@@ -150,11 +175,15 @@ byte-for-byte as it is:
    what the command would decide, `observed_at` outside `consent`, and a
    `consent` object that echoes verbatim without `validation_failed`, whose
    `discardable_content_id` changes when any staged, unstaged, or untracked
-   byte changes, whose `ignored_content_id` and `has_ignored_content` change
-   when any ignored path is added, modified, or removed while `dirty` stays
-   `false`, and whose identities are `null` with a typed
-   `content_observation` when the oracle cannot observe, exceeds its limits,
-   or meets a nested repository.
+   byte changes, whose `ignored_content_id` changes when any ignored path is
+   added, modified, or removed while `dirty` stays `false` — including a
+   same-size byte change with mtime and mode restored, and a change,
+   addition, removal, new empty subdirectory, or symlink-target change
+   anywhere beneath a collapsed ignored directory such as `target/` — and
+   whose identities are `null` with a typed `content_observation` when the
+   oracle cannot observe, exceeds its combined limits (a budget exceeded by
+   ignored content alone included; no metadata-only identity is
+   substituted), or meets an actual nested repository.
 3. Against a real Git fixture: skip-teardown removes without running
    `.wt/teardown` (marker absent) while ordinary runs it (marker present);
    dirty discard removes a modified worktree and its clean branch; ahead
@@ -175,9 +204,11 @@ byte-for-byte as it is:
    `worktree_dirty_unknown`, an unobservable ahead state is
    `target_ineligible`, the main worktree is `target_ineligible`, a held
    root guard or base merge in progress is `root_busy`; an unobservable or
-   unbounded content observation is `worktree_dirty_unknown` and a nested
-   repository is `target_ineligible` with reason `nested_repository`,
-   whatever permissions were given; known ignored content without
+   unbounded content observation is `worktree_dirty_unknown` and an actual
+   nested repository (an untracked one, or one inside an ignored
+   directory) is `target_ineligible` with reason `nested_repository`,
+   whatever permissions were given, while a plain ignored `target/` is not
+   refused for being a directory; known ignored content without
    `discard_known_dirty` is `worktree_dirty` with reason `ignored_content`;
    a permission the observed facts do not need is accepted but changes
    nothing, and a needed permission that is absent refuses exactly as the
@@ -224,9 +255,12 @@ checks before and after the existing ones. The `DeleteOptions` doc comments
 that say `skip_teardown` is never reachable from `/api/v2` and that only the
 TUI may set the discard permissions are rewritten to name the consented
 remote path, because they would otherwise be false. No new dependency:
-hashing uses `sha2`, file opening uses `std::os::unix` flags. No
-Conflux-owned file is written into any worktree, and the oracle excludes no
-path.
+hashing uses `sha2`, and the fd-relative `openat`, `fstatat`, `readlinkat`,
+and `fdopendir` calls use the existing `libc` dependency. No Conflux-owned
+file is written into any worktree, and the oracle excludes no path. The
+limits are a `ConsentLimits` value owned by the service with one production
+constant, so tests inject small limits instead of multi-hundred-megabyte
+fixtures.
 
 The tracked `.pre-commit-config.yaml` scopes Rust checks by staged paths; the
 declared focused gates stay explicit and no broad build is added as a task.
@@ -236,7 +270,9 @@ declared focused gates stay explicit and no broad build is added as a task.
 Not included: changing the TUI confirmations to bind content identity
 (future work), deleting the main worktree, any stash, backup, commit, or
 push before discard, a Web confirmation UI, Server relay code,
-`cflx client`/MCP verbs, and any change to `delete_worktree`. The Server
+`cflx client`/MCP verbs, any change to `delete_worktree`, and any remote
+way to delete or reduce a worktree whose content observation is
+`unbounded`: reducing large build output stays a local operation. The Server
 owns the two-step confirmation presentation and must echo the preview's
 `consent` object unchanged. Running owners are not restarted by this change.
 The `remote-worktree-operations` delta restates the closed command
