@@ -52,7 +52,10 @@ leader is reaped and the cleanup report is read, with `terminated` and
 `state_after`. The runner MUST be bound to a `RunCommandScope` owned by the
 session registry, and owner shutdown MUST close that scope under a bounded
 deadline so every running session is terminated and reaped and no further
-attempt can spawn. The guarantee covers the processes that remain in the
+attempt can spawn. Scheduler `stop`, `stop_and_dequeue`, and `force_stop`
+MUST NOT terminate these independent sessions or close their registry scope;
+session stop and owner process shutdown are separate operations.
+The guarantee covers the processes that remain in the
 session's process group; a descendant that left it (`setsid`,
 daemonization) is explicitly outside the stop and shutdown guarantee. The shared worktree service MUST refuse deleting a worktree whose
 session is running, for the TUI and the API alike. Sessions MUST be retained
