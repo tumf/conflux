@@ -29,7 +29,7 @@ V2 MUST expose `GET /api/v2/worktrees`, `GET /api/v2/worktrees/{worktree_id}`, a
 
 ### Requirement: Managed remote worktree deletion
 
-Remote `delete_worktree` MUST resolve the current opaque ID, require empty params, pass existing eligibility guards, and complete managed teardown before removing the resource. Failure MUST retain the resource and its identity binding. `delete_worktree` MUST NOT expose skip-teardown, force, unsafe recovery, path, or branch controls. Skip-teardown, known-dirty discard, and commits-ahead discard MUST be reachable remotely only through the separate `delete_worktree_confirmed` command defined by `remote-control-api`, bound to explicit consent over branch, HEAD, Git identity, observed dirty and ahead facts, merge base, and discardable content identity, re-verified under the root mutation guard before teardown and again before removal.
+Remote `delete_worktree` MUST resolve the current opaque ID, require empty params, pass existing eligibility guards, and complete managed teardown before removing the resource. Failure MUST retain the resource and its identity binding. `delete_worktree` MUST NOT expose skip-teardown, force, unsafe recovery, path, or branch controls. Skip-teardown, known-dirty discard, and commits-ahead discard MUST be reachable remotely only through the separate `delete_worktree_confirmed` command defined by `remote-control-api`, bound to explicit consent over branch, HEAD, Git identity, observed dirty and ahead facts, the separate known-ignored-content fact, merge base, discardable content identity, and ignored content identity, re-verified under the root mutation guard before teardown and again before removal. Because forced removal deletes ignored paths, known ignored content MUST require the same `discard_known_dirty` permission as known uncommitted work even when the worktree is Git-clean, and content the oracle cannot bound (a nested repository or a status-reported submodule, or records past its documented limits) MUST fail the confirmed command closed rather than be discarded.
 
 #### Scenario: Successful delete retires identity after teardown
 
@@ -46,6 +46,7 @@ Remote `delete_worktree` MUST resolve the current opaque ID, require empty param
 **Then**: The shared service re-verifies every consented fact under the root guard
 **And**: The worktree is removed only when nothing drifted
 **And**: `delete_worktree` for the same worktree still refuses `worktree_dirty`
+**And**: A Git-clean worktree with ignored content is removed by `delete_worktree_confirmed` only with `discard_known_dirty: true`
 
 ### Requirement: Restricted worktree capability surface
 
