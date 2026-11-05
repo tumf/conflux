@@ -179,8 +179,18 @@ per observation (the same sample as `latest_activity`):
 | admitted work start that moves Ready → `running`; `ProcessingStarted`; `OperatorCommandApplied { ResolveReserved }` | nothing | `mod.rs:56-64`, `operator_commands.rs:97-105` |
 | `Stopped`, every delivery | `freeze_at` | `processing.rs:185-187` |
 | `AllCompleted`, every delivery, regardless of `all_completed_may_overwrite_mode` | `freeze_at` | `completion.rs:28-29, 43-44` |
-| `ResolveCompleted`; `MergeCompleted` while `is_resolving` or any row is `resolve pending`; `ResolveFailed`; `HookFailed { hook_type: "on_merged" }` | `freeze_at` iff `app_mode == "running"` and, after applying the event's own row rewrite (`merged` for the two completions, `merge wait` for the two failures unless already `merged`) over the reducer display statuses of `dispatch.state`, no row is `queued`, `blocked`, `applying`, `accepting`, `archiving`, `resolving`, or `resolve pending` | `try_transition_to_select`, `processing.rs:139-162`, via `completion.rs:154-170`, `errors.rs:69, 98` |
+| `ResolveCompleted`; `MergeCompleted` while `is_resolving` or any row is `resolve pending`; `HookFailed { hook_type: "on_merged" }` | `freeze_at` iff `app_mode == "running"` and, after applying the event's own row rewrite (`merged` for completions, `merge wait` for hook failure unless already `merged`) over the reducer display statuses of `dispatch.state`, no row is `queued`, `blocked`, `applying`, `accepting`, `archiving`, `resolving`, or `resolve pending` | `try_transition_to_select`, `processing.rs:139-162`, via `completion.rs:154-170`, `errors.rs:98` |
+| `ResolveFailed` | If the target row's pre-event reducer-derived `display_status` (the previous dispatch snapshot's `queue_status`) is already `merged`, do nothing: the TUI returns early. Otherwise rewrite the row to `merge wait` and evaluate the same running/no-processing predicate above. | `errors.rs:50-70` |
 | `PersistentSchedulerIdle`, `StopRequested`, `StopCancelled`, `Error` | nothing | `completion.rs:61-69`, `output.rs:210-216` |
+
+Parity of the run-clock projection assumes the existing TUI `execution_mode`
+and web `app_mode` agree for the observed sequence. Existing mode divergence
+(e.g. delayed `ProcessingStarted` after terminal mode, or TUI-only
+`adopt_core_mode`) is outside this metadata change; universal parity for
+those divergent sequences is not claimed, and TUI behavior is not changed.
+The resolve settlement parity test MUST include a late `ResolveFailed` for
+an already-merged row while another row becomes non-processing: neither
+frontend freezes on that event.
 
 The resolve-side row is the one place the web predicate reads TUI-local
 inputs (the handler's own row rewrite and the resolve ledger). The TUI's

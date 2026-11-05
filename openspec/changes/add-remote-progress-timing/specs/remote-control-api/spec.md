@@ -30,10 +30,14 @@ a fatal process `Error`; frozen, with `ended_at` set and `elapsed_ms` the
 monotonic duration since the open in whole milliseconds, by every process
 `Stopped` delivery, by every `AllCompleted` delivery whether or not it may
 overwrite the mode, and by a resolve-side settlement that finds no
-processing row while running; re-frozen at the later instant by a repeated
+processing row while running, except that `ResolveFailed` for an already
+`merged` target MUST be a no-op just as the TUI early-return path is;
+re-frozen at the later instant by a repeated
 terminal delivery, exactly when the TUI re-freezes; and retained until the
 next opening Start. All three members MUST be `null` before the first Start
-in the process.
+in the process. Run-clock parity is scoped to event sequences in which the
+existing web and TUI modes agree; existing mode-divergence cases are not
+redefined or claimed to have universal parity by this metadata extension.
 
 `ChangeTiming` MUST keep its existing per-run meaning: `elapsed_ms` is the
 duration of the finished run and is not cumulative. Accumulated time and

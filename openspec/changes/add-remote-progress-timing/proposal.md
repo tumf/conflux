@@ -161,7 +161,9 @@ can show "unpublished" against an older owner.
    TUI re-freezes; and the value is retained until the next opening Start.
    Parity tests drive the same event sequences at injected instants through
    `AppState` and the web store and assert equal started and elapsed values
-   at every step.
+   at every step for sequences where the existing frontend modes agree;
+   existing mode divergence is outside this metadata extension. A late
+   `ResolveFailed` for an already-merged row is a no-op in both frontends.
 4. Revision discipline: two reads with no event in between return the same
    stored snapshot and the same `state_revision`; a repeated identical status
    event does not change `net_active`; `accumulated_ms` changes only at a
