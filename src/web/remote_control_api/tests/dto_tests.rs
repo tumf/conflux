@@ -32,11 +32,28 @@ fn closed_command_set_matches_the_advertised_list() {
                 r#"{{"type":"delete_worktree_confirmed","target":{{"worktree_id":"a"}},"params":{{"skip_teardown":false,"discard_known_dirty":false,"discard_commits_ahead":false,"consent":{{"branch":"a","head":"{}","dirty":false,"has_commits_ahead":false,"has_ignored_content":false,"merge_base":null,"discardable_content_id":null,"ignored_content_id":null}}}}}}"#,
                 "a".repeat(40)
             ),
+            "run_worktree_command" => format!(
+                r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{}"}},"params":{{}}}}"#,
+                "a".repeat(32)
+            ),
+            "create_session_worktree" => {
+                r#"{"type":"create_session_worktree","params":{}}"#.to_string()
+            }
+            "stop_worktree_session" => format!(
+                r#"{{"type":"stop_worktree_session","target":{{"session_id":"{}"}},"params":{{}}}}"#,
+                "b".repeat(32)
+            ),
             "refresh_proposal" => format!(
                 r#"{{"type":"refresh_proposal","change_id":"a","source_ref":"develop","expected_source":"{}","expected_head":"{}"}}"#,
                 "a".repeat(40),
                 "b".repeat(40)
             ),
+            "write_change_text" => {
+                r#"{"type":"write_change_text","target":{"change_id":"a"},"params":{"path":"tasks.md","expected":{"kind":"absent"},"content":"x"}}"#.to_string()
+            }
+            "write_worktree_text" => {
+                r#"{"type":"write_worktree_text","target":{"worktree_id":"a"},"params":{"path":"src/lib.rs","expected":{"kind":"absent"},"content":"x"}}"#.to_string()
+            }
             _ => format!(r#"{{"type":"{name}","change_id":"a"}}"#),
         };
         let parsed: CommandSpec =
@@ -510,6 +527,320 @@ mod legacy_owner_shape {
                 "the rejection must name `{member}`: {error}"
             );
         }
+    }
+}
+
+// ============================================================================
+// Bounded text edit
+// ============================================================================
+
+fn text_command(params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "write_worktree_text",
+        "target": {"worktree_id": "0123456789abcdef0123456789abcdef"},
+        "params": params,
+    })
+}
+
+#[test]
+fn remote_text_edit_commands_are_closed_and_validated() {
+    use crate::web::remote_control_api::dto::{TextExpectation, TextWriteParams};
+
+    let id = format!("sha256:{}", "a".repeat(64));
+    let parsed: CommandSpec = serde_json::from_value(text_command(serde_json::json!({
+        "path": "src/lib.rs",
+        "expected": {"kind": "content", "content_id": id},
+        "content": "fn main() {}\n",
+    })))
+    .expect("the frozen shape parses");
+    assert_eq!(parsed.type_name(), "write_worktree_text");
+    assert_eq!(
+        parsed.target(),
+        None,
+        "a worktree write addresses no change"
+    );
+    assert!(parsed.validate().is_ok());
+    match &parsed {
+        CommandSpec::WriteWorktreeText { params, .. } => assert_eq!(
+            params,
+            &TextWriteParams {
+                path: "src/lib.rs".to_string(),
+                expected: TextExpectation::Content {
+                    content_id: id.clone()
+                },
+                content: "fn main() {}\n".to_string(),
+            }
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+    let change: CommandSpec = serde_json::from_value(serde_json::json!({
+        "type": "write_change_text",
+        "target": {"change_id": "alpha"},
+        "params": {"path": "tasks.md", "expected": {"kind": "absent"}, "content": ""},
+    }))
+    .unwrap();
+    assert_eq!(change.target(), Some("alpha"));
+
+    // Closed: no smuggled member anywhere, no missing expectation, no
+    // unconditional write.
+    for params in [
+        serde_json::json!({"path": "a", "expected": {"kind": "absent"}, "content": "", "mode": "0755"}),
+        serde_json::json!({"path": "a", "content": ""}),
+        serde_json::json!({"path": "a", "expected": null, "content": ""}),
+        serde_json::json!({"path": "a", "expected": {"kind": "any"}, "content": ""}),
+        serde_json::json!({"path": "a", "expected": {"kind": "absent", "content_id": id}, "content": ""}),
+    ] {
+        assert!(
+            serde_json::from_value::<CommandSpec>(text_command(params.clone())).is_err(),
+            "{params}"
+        );
+    }
+    let mut smuggled_root = text_command(
+        serde_json::json!({"path": "a", "expected": {"kind": "absent"}, "content": ""}),
+    );
+    smuggled_root["target"]["path"] = serde_json::json!("/etc");
+    assert!(serde_json::from_value::<CommandSpec>(smuggled_root).is_err());
+
+    // Field validation serde cannot express.
+    let oversize = "a".repeat(1_048_577);
+    for params in [
+        serde_json::json!({"path": "a", "expected": {"kind": "content", "content_id": "sha256:abc"}, "content": ""}),
+        serde_json::json!({"path": "a", "expected": {"kind": "content", "content_id": format!("sha256:{}", "A".repeat(64))}, "content": ""}),
+        serde_json::json!({"path": "a", "expected": {"kind": "absent"}, "content": oversize}),
+        serde_json::json!({"path": "a", "expected": {"kind": "absent"}, "content": "a\u{0}b"}),
+        serde_json::json!({"path": "../a", "expected": {"kind": "absent"}, "content": ""}),
+        serde_json::json!({"path": "/a", "expected": {"kind": "absent"}, "content": ""}),
+        serde_json::json!({"path": "", "expected": {"kind": "absent"}, "content": ""}),
+    ] {
+        let spec: CommandSpec = serde_json::from_value(text_command(params.clone())).unwrap();
+        assert!(spec.validate().is_err(), "{params}");
+    }
+    let exactly_max = "a".repeat(1_048_576);
+    let spec: CommandSpec = serde_json::from_value(text_command(serde_json::json!({
+        "path": "a", "expected": {"kind": "absent"}, "content": exactly_max,
+    })))
+    .unwrap();
+    assert!(
+        spec.validate().is_ok(),
+        "1 MiB exactly is within the ceiling"
+    );
+}
+
+#[test]
+fn remote_text_edit_error_codes_are_conflicts_with_stable_names() {
+    for (code, name) in [
+        (ErrorCode::TextStale, "text_stale"),
+        (ErrorCode::TextNotEditable, "text_not_editable"),
+    ] {
+        assert_eq!(code.http_status(), StatusCode::CONFLICT);
+        assert_eq!(code.as_str(), name);
+        assert!(ALL_ERROR_CODES.contains(&code));
+    }
+    assert!(SUPPORTED_COMMANDS.contains(&"write_change_text"));
+    assert!(SUPPORTED_COMMANDS.contains(&"write_worktree_text"));
+}
+
+#[test]
+fn remote_text_edit_old_owner_capabilities_decode_as_unavailable() {
+    use crate::web::remote_control_api::dto::{CapabilitiesResponse, StateResponse};
+
+    // An owner built before the surface: every member it always published, and
+    // no `text_edit`.
+    let mut capabilities = serde_json::json!({
+        "api_version": "v2",
+        "instance_id": "i-old",
+        "commands": ["start"],
+        "transports": [],
+        "error_codes": ["internal_error"],
+        "limits": {
+            "max_events": 1, "max_logs": 1, "max_commands": 1,
+            "max_idempotency_records": 1, "command_record_ttl_secs": 1,
+            "max_correlation_id_len": 64
+        },
+        "authentication_required": false,
+        "command_execution": {"available": true},
+        "worktrees": {
+            "operations": ["list"],
+            "merge_conflict_recovery": "local_or_tui_required",
+            "merge_conflict_preserves_state": true,
+            "delete_requires_teardown": true
+        },
+        "parallel": {"max_concurrent": 1, "vcs_backend": "git", "blocked_reasons": []}
+    });
+    let decoded: CapabilitiesResponse = serde_json::from_value(capabilities.clone())
+        .expect("an older owner's capabilities still decode");
+    assert!(
+        !decoded.text_edit.available,
+        "absent decodes as unavailable"
+    );
+    assert!(decoded.text_edit.commands.is_empty());
+
+    capabilities["text_edit"] =
+        serde_json::to_value(crate::web::remote_control_api::text_edit::capability(true)).unwrap();
+    let current: CapabilitiesResponse = serde_json::from_value(capabilities).unwrap();
+    assert!(current.text_edit.available);
+
+    // A state body without any text member still decodes: the surface adds no
+    // snapshot member at all.
+    let state = serde_json::json!({
+        "instance_id": "i-old",
+        "state_revision": 3,
+        "event_sequence": 4,
+        "snapshot": serde_json::to_value(
+            crate::web::remote_control_api::dto::InstanceSnapshot::empty()
+        ).unwrap(),
+    });
+    let decoded: StateResponse = serde_json::from_value(state).unwrap();
+    assert_eq!(decoded.state_revision, 3);
+}
+
+/// An owner built before configured-command sessions publishes no
+/// `worktree_sessions` block. This build must read it as "not available", and
+/// the three session commands are simply absent from its closed command set —
+/// which is why submitting one to it fails typed validation before any effect
+/// (see `unknown_command_type_fails_typed_validation`).
+#[test]
+fn remote_worktree_session_old_owner_capabilities_decode_as_unavailable() {
+    let legacy = serde_json::json!({
+        "api_version": "v2",
+        "instance_id": "i-legacy",
+        "commands": [
+            "start", "stop", "cancel_stop", "force_stop", "set_all_execution_marks",
+            "set_execution_mark", "set_queue_intent", "retry_change", "retry_errors",
+            "stop_and_dequeue", "force_stop_change", "resolve_merge",
+            "create_worktree", "delete_worktree", "merge_worktree", "refresh_proposal"
+        ],
+        "transports": [],
+        "error_codes": [],
+        "limits": {
+            "max_events": 1, "max_logs": 1, "max_commands": 1,
+            "max_idempotency_records": 1, "command_record_ttl_secs": 1,
+            "max_correlation_id_len": 64
+        },
+        "authentication_required": false,
+        "command_execution": { "available": true },
+        "worktrees": {
+            "operations": ["list", "detail", "create", "delete", "merge"],
+            "merge_conflict_recovery": "local_or_tui_required",
+            "merge_conflict_preserves_state": true,
+            "delete_requires_teardown": true
+        },
+        "parallel": { "max_concurrent": 1, "vcs_backend": "git", "blocked_reasons": [] }
+    });
+    let capabilities: crate::web::remote_control_api::dto::CapabilitiesResponse =
+        serde_json::from_value(legacy).expect("an older owner's capabilities decode");
+    assert!(!capabilities.worktree_sessions.available);
+    assert!(capabilities.worktree_sessions.commands.is_empty());
+    for command in [
+        "run_worktree_command",
+        "create_session_worktree",
+        "stop_worktree_session",
+    ] {
+        assert!(!capabilities.commands.iter().any(|c| c == command));
+    }
+
+    // An older execution-status body has no session counter either.
+    let status: crate::web::remote_control_api::dto::ProcessExecutionStatus =
+        serde_json::from_value(serde_json::json!({
+            "app_mode": "select",
+            "scheduler_running": false,
+            "has_active_work": false,
+            "active_activities": [],
+            "latest_log": null
+        }))
+        .expect("an older process status decodes");
+    assert_eq!(status.worktree_sessions_running, 0);
+}
+
+/// The session commands accept exactly their target and an empty `params`:
+/// no command text, argv, environment, path, or branch can be smuggled in, and
+/// a blank or malformed opaque ID is a validation failure, not a record.
+fn envelope(command: &str) -> String {
+    let body = command.strip_suffix('}').expect("a JSON object");
+    format!(r#"{body},"expected_revision":0,"idempotency_key":"k"}}"#)
+}
+
+#[test]
+fn remote_worktree_session_commands_are_closed() {
+    let id = "c".repeat(32);
+    for smuggled in [
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}","path":"/tmp"}},"params":{{}}}}"#
+        ),
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{"command":"rm -rf /"}}}}"#
+        ),
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{}},"argv":["sh"]}}"#
+        ),
+        r#"{"type":"create_session_worktree","params":{"env":{"A":"B"}}}"#.to_string(),
+        r#"{"type":"create_session_worktree","params":{},"branch":"main"}"#.to_string(),
+        format!(r#"{{"type":"create_session_worktree","target":{{"worktree_id":"{id}"}}}}"#),
+        format!(r#"{{"type":"stop_worktree_session","session_id":"{id}"}}"#),
+        format!(
+            r#"{{"type":"stop_worktree_session","target":{{"session_id":"{id}","change_id":"a"}}}}"#
+        ),
+    ] {
+        let request = envelope(&smuggled);
+        assert!(
+            serde_json::from_str::<CommandRequest>(&request).is_err(),
+            "must fail typed validation: {request}"
+        );
+    }
+
+    // Positive controls through the same envelope builder, so the refusals
+    // above are about the smuggled member and not about the construction.
+    for accepted in [
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{}}}}"#
+        ),
+        r#"{"type":"create_session_worktree","params":{}}"#.to_string(),
+        format!(
+            r#"{{"type":"stop_worktree_session","target":{{"session_id":"{id}"}},"params":{{}}}}"#
+        ),
+    ] {
+        let request = envelope(&accepted);
+        serde_json::from_str::<CommandRequest>(&request)
+            .unwrap_or_else(|e| panic!("must parse: {request}: {e}"));
+    }
+
+    for blank in ["", "   ", "ABCDEF", &"g".repeat(32), &"a".repeat(31)] {
+        let run = CommandSpec::RunWorktreeCommand {
+            target: crate::web::remote_control_api::dto::WorktreeTarget {
+                worktree_id: blank.to_string(),
+            },
+            params: Default::default(),
+        };
+        assert!(
+            run.validate().is_err(),
+            "worktree_id {blank:?} must be refused"
+        );
+        let stop = CommandSpec::StopWorktreeSession {
+            target: crate::web::remote_control_api::dto::SessionTarget {
+                session_id: blank.to_string(),
+            },
+            params: Default::default(),
+        };
+        assert!(
+            stop.validate().is_err(),
+            "session_id {blank:?} must be refused"
+        );
+    }
+
+    let parsed: CommandRequest = serde_json::from_str(
+        r#"{"type":"create_session_worktree","expected_revision":0,"idempotency_key":"k"}"#,
+    )
+    .expect("params defaults to empty");
+    assert_eq!(parsed.command.type_name(), "create_session_worktree");
+    assert!(parsed.command.validate().is_ok());
+
+    for code in [
+        ErrorCode::WorktreeSessionUnavailable,
+        ErrorCode::WorktreeSessionBusy,
+        ErrorCode::WorktreeSessionSetupFailed,
+    ] {
+        assert_eq!(code.http_status(), StatusCode::CONFLICT);
+        assert!(ALL_ERROR_CODES.contains(&code));
     }
 }
 

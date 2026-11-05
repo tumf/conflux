@@ -33,7 +33,7 @@ mod terminal;
 mod type_impls;
 pub mod types;
 mod utils;
-mod worktrees;
+pub(crate) mod worktrees;
 
 // Public API re-exports
 pub use runner::run_tui;

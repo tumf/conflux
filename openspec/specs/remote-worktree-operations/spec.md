@@ -1,8 +1,8 @@
 ### Requirement: Exact remote worktree resources and closed commands
 
-V2 MUST expose `GET /api/v2/worktrees`, `GET /api/v2/worktrees/{worktree_id}`, and `GET /api/v2/worktrees/{worktree_id}/delete-preview`. It MUST extend the closed command enum only with `create_worktree`, `delete_worktree`, `merge_worktree`, `merge_worktree_abort_on_conflict`, and `delete_worktree_confirmed`. Every worktree command MUST inherit v2 authentication, `expected_revision`, idempotency, capacity admission, correlation validation, and typed errors.
+V2 MUST expose `GET /api/v2/worktrees`, `GET /api/v2/worktrees/{worktree_id}`, `GET /api/v2/worktrees/{worktree_id}/delete-preview`, and the bounded text read `GET /api/v2/worktrees/{worktree_id}/text?path=<relative>`. It MUST extend the closed command enum only with `create_worktree`, `delete_worktree`, `merge_worktree`, `merge_worktree_abort_on_conflict`, `delete_worktree_confirmed`, `run_worktree_command`, `create_session_worktree`, `stop_worktree_session`, and `write_worktree_text`. Every worktree command MUST inherit v2 authentication, `expected_revision`, idempotency, capacity admission, correlation validation, and typed errors.
 
-`create_worktree` MUST accept only `target.change_id` and an empty `params` object. `delete_worktree`, `merge_worktree`, and `merge_worktree_abort_on_conflict` MUST accept only `target.worktree_id` and an empty `params` object. `delete_worktree_confirmed` MUST accept only `target.worktree_id` and the typed consent params defined by `remote-control-api`. Unknown target or parameter fields MUST fail schema validation.
+`create_worktree` MUST accept only `target.change_id` and an empty `params` object. `delete_worktree`, `merge_worktree`, `merge_worktree_abort_on_conflict`, and `run_worktree_command` MUST accept only `target.worktree_id` and an empty `params` object. `delete_worktree_confirmed` MUST accept only `target.worktree_id` and the typed consent params defined by `remote-control-api`. `create_session_worktree` MUST accept only an empty `params` object. `stop_worktree_session` MUST accept only `target.session_id` and an empty `params` object. `write_worktree_text` MUST accept only `target.worktree_id` and the typed `params` (`path`, `expected`, `content`) defined by `remote-control-api`. Unknown target or parameter fields MUST fail schema validation. The text read and write MUST stay inside the addressed worktree: a path that descends into a nested worktree, submodule, or embedded repository below it MUST be refused with `nested_repository`, and that nested worktree MUST be addressable only by its own opaque ID. The worktree MUST be reported non-editable and the write refused with `managed_process_live` while the owner's managed writer coverage for that worktree directory is `Busy` or `Unknown` as defined by `remote-control-api`; the owner MUST NOT kill, sweep, or reset anything to make the worktree editable.
 
 #### Scenario: Client reads one worktree by opaque ID
 
@@ -24,6 +24,22 @@ V2 MUST expose `GET /api/v2/worktrees`, `GET /api/v2/worktrees/{worktree_id}`, a
 **When**: It submits `delete_worktree` with `skip_teardown`, `discard_known_dirty`, or `discard_commits_ahead`
 **Then**: The server returns HTTP 422 with `validation_failed`
 **And**: Nothing is torn down or removed
+
+#### Scenario: Text read is addressed by opaque ID only
+
+**Given**: A worktree appears in the v2 list with an opaque ID
+**When**: An authenticated client reads `/api/v2/worktrees/{worktree_id}/text?path=README.md`
+**Then**: It receives the bounded text read for that worktree's file
+**And**: A retired ID returns `worktree_not_found` and no filesystem path is accepted in its place
+**And**: The main worktree's ID does not reach a file inside another change's worktree placed under the project root
+**And**: `editable: false` with `managed_process_live` is reported while a writer the owner launched is bound to the worktree or its coverage is unknown
+
+#### Scenario: Session commands carry no command text
+
+**Given**: A client can authenticate to v2
+**When**: It submits `run_worktree_command` or `create_session_worktree` with a `command`, `argv`, `env`, or `path` field
+**Then**: The server returns HTTP 422 with `validation_failed`
+**And**: No process is launched
 
 ### Requirement: Opaque worktree mutation identity
 
@@ -135,13 +151,15 @@ Remote `merge_worktree` MUST resolve the current opaque ID, require empty params
 
 ### Requirement: Restricted worktree capability surface
 
-V2 MUST expose only managed change-worktree list/detail/create/delete/base-merge behavior, the explicit abort-on-conflict merge, and the consent-bound confirmed deletion defined by `remote-control-api`. It MUST NOT expose arbitrary worktree commands, editor launch, temporary sessions, UI preference synchronization, unconsented teardown bypass, unconsented force deletion, client-selected base/branch/path, remote merge resolve, or unsafe recovery permissions beyond the three explicitly consented ones.
+V2 MUST expose only managed change-worktree list/detail/create/delete/base-merge behavior, the explicit abort-on-conflict merge, the consent-bound confirmed deletion defined by `remote-control-api`, the configured-command session surface defined by `remote-control-api` (launch of the configured `worktree_command` in an existing worktree, creation of a `ws-session-*` worktree with the same setup and cleanup as the TUI `+` key, stop, and session observation), and the bounded, opaque-ID-addressed text read/write defined by `remote-control-api`. It MUST NOT expose arbitrary worktree commands, argv or environment input, editor launch, UI preference synchronization, unconsented teardown bypass, unconsented force deletion, client-selected base/branch/path, remote merge resolve, unsafe recovery permissions beyond the three explicitly consented ones, directory listing, binary content, or file rename/delete.
 
 #### Scenario: Capabilities report recovery boundary
 
 **Given**: A client reads v2 capabilities
 **When**: It inspects worktree operations
-**Then**: Only list, detail, create, delete, merge, merge_abort, and delete_confirmed are advertised
+**Then**: Only list, detail, create, delete, merge, merge_abort, delete_confirmed, text, and session are advertised
 **And**: Merge-conflict recovery for `merge_worktree` is identified as local or TUI required
 **And**: `merge_conflict_preserves_state` is `true` and describes `merge_worktree`, while `merge_abort` names the verified-restoration command
 **And**: `delete_requires_teardown` is `true` and describes `delete_worktree`, while `confirmed_delete` names the consented bypass
+**And**: `text_edit` names the bounded limits and excluded paths
+**And**: `worktree_sessions` reports whether the configured command is available and its limits

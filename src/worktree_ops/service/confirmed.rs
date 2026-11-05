@@ -17,7 +17,7 @@ use tracing::warn;
 use super::{
     classify_delete_drift, classify_delete_eligibility, DeleteOptions, DirtyState, DirtyTarget,
     ExpectedTarget, SafetyFact, WorktreeFacts, WorktreeOpError, WorktreeOpOutcome,
-    WorktreeOperationEvent, WorktreeService,
+    WorktreeOperationEvent, WorktreeService, SESSION_RUNNING_REFUSAL,
 };
 use crate::worktree_ops::consent::{
     empty_content_id, ConfirmedDeleteReason, ConsentObservation, ContentObservation, DeleteConsent,
@@ -449,6 +449,19 @@ impl WorktreeService {
             not_reached,
         )
         .map_err(|refusal| refusal.with_observed(observed.clone()))?;
+        // A session's cwd is not something teardown or removal may pull out
+        // from under it, whatever permissions were consented.
+        if self
+            .session_probe
+            .as_ref()
+            .is_some_and(|probe| probe.session_running(&before.path))
+        {
+            return Err(ConfirmedDeleteRefusal::from_error(
+                WorktreeOpError::Ineligible(SESSION_RUNNING_REFUSAL.to_string()),
+                not_reached,
+            )
+            .with_observed(observed));
+        }
         // The ordinary eligibility still runs, unchanged, as the backstop.
         classify_delete_eligibility(&before, options).map_err(|error| {
             ConfirmedDeleteRefusal::from_error(error, not_reached).with_observed(observed.clone())

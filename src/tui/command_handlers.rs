@@ -253,23 +253,45 @@ fn build_worktree_backend(
 /// the repository mutation guard, so a second instance would be a second guard
 /// and two overlapping mutations could each believe they held it. The TUI and
 /// `/api/v2` are handed the same `Arc`.
+// Production wires the session-aware variant; tests build this one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_worktree_service(
     repo_root: &Path,
     config: &OrchestratorConfig,
     tx: &mpsc::Sender<OrchestratorEvent>,
 ) -> Arc<WorktreeService> {
+    Arc::new(build_worktree_service_value(repo_root, config, tx))
+}
+
+/// Build the shared worktree service with a session probe, so deleting a
+/// worktree a configured-command session runs in is refused for the TUI and
+/// `/api/v2` alike.
+pub(crate) fn build_worktree_service_with_sessions(
+    repo_root: &Path,
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    sessions: Arc<dyn crate::worktree_ops::service::SessionProbe>,
+) -> Arc<WorktreeService> {
+    Arc::new(build_worktree_service_value(repo_root, config, tx).with_session_probe(sessions))
+}
+
+fn build_worktree_service_value(
+    repo_root: &Path,
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+) -> WorktreeService {
     let workspace_base_dir = config
         .get_workspace_base_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(repo_root)));
-    Arc::new(WorktreeService::new(
+    WorktreeService::new(
         build_worktree_backend(repo_root, config, tx),
         Arc::new(TuiWorktreeEvents {
             tx: tx.clone(),
             repo_root: repo_root.to_path_buf(),
         }),
         workspace_base_dir,
-    ))
+    )
 }
 
 /// Operator-facing feedback from a command that settled off the event loop.

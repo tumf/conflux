@@ -18,6 +18,7 @@ pub mod consent;
 pub mod git_backend;
 pub mod inspection;
 pub mod service;
+pub mod session;
 
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};

@@ -1295,6 +1295,164 @@ Each projected change MUST carry an additive nullable `acceptance_provenance` ob
 - **THEN** all three are identical
 - **AND** restart publishes `null` without changing the next action
 
+### Requirement: Configured worktree command sessions API
+
+V2 MUST extend the closed command set with `run_worktree_command`
+(target opaque `worktree_id`, empty params), `create_session_worktree`
+(empty params), and `stop_worktree_session` (target opaque `session_id`,
+empty params), and MUST expose
+`GET /api/v2/worktree-sessions` and `GET /api/v2/worktree-sessions/{session_id}`.
+The command executed MUST be exactly the configured `worktree_command`
+template with `{workspace_dir}` and `{repo_root}` expanded server-side; no
+request MUST carry a command, argv, environment, path, branch, or base
+commit. Launch MUST use the same runner path as the TUI: `sh -c`, `stdin`
+from `/dev/null`, an owned process group, stagger admission, and the
+configured retry policy inside one session.
+
+`create_session_worktree` MUST create a worktree on a server-generated
+`ws-session-<random>` branch at base `HEAD` under the workspace base
+directory, MUST validate the cwd after creation, run `.wt/setup` from the
+project root, validate after setup and immediately before launch, and MUST
+remove the worktree through the same cleanup the TUI uses when setup fails
+(forced worktree removal with teardown skipped; the `ws-session-*` branch is
+retained exactly as the TUI leaves it), launching nothing and settling
+`worktree_session_setup_failed` with the typed cleanup outcome. The creation
+steps MUST run under the repository root mutation guard. The running-slot
+and worktree-busy reservation MUST be taken before any Git effect and
+released on every refusal, so a `capacity` refusal creates no worktree and
+no branch.
+
+Each session MUST have a process-local 128-bit `session_id`, a `kind`
+(`existing` or `session`), the opaque `worktree_id`, a repository-relative
+path, a closed `state` (`running`, `succeeded`, `failed`, `stopped`),
+`attempt`, start/finish instants, exit code or signal, setup and cleanup
+facts, and an output tail bounded at 65,536 bytes of `sanitize_detail`-ed
+lines with a dropped-byte count. Output MUST NOT enter the log ring, the
+event stream, or the snapshot. A replay of an identical idempotency key MUST
+return the original record and launch nothing; a new request for a worktree
+with a running session MUST be refused `worktree_session_busy`; more than 4
+concurrently running sessions MUST be refused `worktree_session_busy` with
+reason `capacity`. A launch command MUST be refused
+`worktree_session_unavailable` when `worktree_command` is not configured or
+the project is not a Git repository, and `command_executor_unbound` on a
+headless owner.
+
+`stop_worktree_session` MUST cancel the session through the runner's own
+handle (`StreamingChildHandle::terminate`), whose cancellation path sends
+SIGTERM to the session's process group, escalates to SIGKILL after 5
+seconds, verifies the group, and admits no further attempt; it MUST NOT
+signal the process group externally, because the configured retry policy
+would relaunch inside the same session, and MUST settle only after the
+leader is reaped and the cleanup report is read, with `terminated` and
+`state_after`. The runner MUST be bound to a `RunCommandScope` owned by the
+session registry, and owner shutdown MUST close that scope under a bounded
+deadline so every running session is terminated and reaped and no further
+attempt can spawn. Scheduler `stop`, `stop_and_dequeue`, and `force_stop`
+MUST NOT terminate these independent sessions or close their registry scope;
+session stop and owner process shutdown are separate operations.
+The guarantee covers the processes that remain in the
+session's process group; a descendant that left it (`setsid`,
+daemonization) is explicitly outside the stop and shutdown guarantee. The shared worktree service MUST refuse deleting a worktree whose
+session is running, for the TUI and the API alike. Sessions MUST be retained
+in memory only (running never evicted, at most 32 finished), MUST NOT be
+persisted, and MUST NOT influence scheduling, resume, acceptance, or archive.
+No owner-generated field (path, branch, result, error detail, events, the
+log ring, the snapshot, or the OpenAPI document) MUST disclose the template,
+the expanded command, environment values, absolute paths, or credentials.
+The output tail is the command's own stdout/stderr: it MUST be retained only
+after control-sequence stripping and size bounding, MUST NOT be redacted or
+claimed to be, MUST be readable only through the bearer-authenticated
+session resource, and MUST never appear as an event, log entry, or snapshot
+field. A configured command that prints its arguments, environment, or cwd
+discloses them to every authenticated reader; that disclosure is the
+operator's responsibility when configuring `worktree_command`, and the
+documentation MUST say so.
+
+Capabilities MUST advertise `worktree_sessions` (`available`, `commands`,
+`routes`, `max_running`, `max_retained`, `max_output_bytes`, `stdin`,
+`reasons`), decoding as unavailable when an older owner omits it; the
+generated OpenAPI document MUST include the three commands, both routes, the
+`worktree_session` and `worktree_session_stop` result kinds, the
+`worktree_session_started`/`worktree_session_finished` event types, and the
+error codes. Every existing route and command MUST remain unchanged on an
+older owner, and a new command submitted to it MUST fail typed validation
+before any effect. `cflx client` and `cflx client mcp` MUST gain no verb.
+
+#### Scenario: Configured command runs in the addressed worktree with null stdin
+
+- **GIVEN** `worktree_command` is configured and a worktree has an opaque ID
+- **WHEN** an authenticated client submits `run_worktree_command` for it
+- **THEN** one session starts with cwd equal to that worktree and both placeholders expanded
+- **AND** the child's stdin is `/dev/null`
+- **AND** the session resource publishes exit code, state, and the bounded output tail
+- **AND** one `worktree_session_finished` event is published
+
+#### Scenario: Session worktree is created the way the TUI creates it
+
+- **GIVEN** `.wt/setup` exists in the project root
+- **WHEN** a client submits `create_session_worktree`
+- **THEN** a `ws-session-*` branch and registered worktree exist at base `HEAD`
+- **AND** setup ran and the cwd was validated after create, after setup, and before launch
+- **AND** the result names the new opaque `worktree_id`
+
+#### Scenario: Setup failure cleans up and launches nothing
+
+- **GIVEN** `.wt/setup` exits non-zero
+- **WHEN** `create_session_worktree` runs
+- **THEN** the worktree is removed by forced removal without teardown and the `ws-session-*` branch is retained
+- **AND** no process is launched
+- **AND** the record fails `worktree_session_setup_failed` with `cleanup.removed: true`
+
+#### Scenario: Capacity refusal of creation leaves the repository untouched
+
+- **GIVEN** 4 sessions are running
+- **WHEN** a client submits `create_session_worktree`
+- **THEN** it is refused `worktree_session_busy` with reason `capacity` before any Git effect
+- **AND** no worktree or branch is created and the reservation is released
+
+#### Scenario: Resend and concurrency never duplicate a session
+
+- **GIVEN** a session is running for a worktree
+- **WHEN** the same idempotency key is replayed and a new key is submitted
+- **THEN** the replay returns the original record and launches nothing
+- **AND** the new key is refused `worktree_session_busy`
+- **AND** a configured retry inside the session increments `attempt` without a new `session_id`
+
+#### Scenario: Stop terminates the whole process group
+
+- **GIVEN** a running session whose command spawned a background child in the same process group, and a retry policy of at least one retry
+- **WHEN** `stop_worktree_session` is submitted
+- **THEN** both processes are gone after settlement and `terminated` is true
+- **AND** the session reads `stopped` with its signal, `attempt` stays 1, and no new process was started
+
+#### Scenario: Deletion is refused while a session runs
+
+- **GIVEN** a worktree with a running session
+- **WHEN** the API submits `delete_worktree` or the TUI confirms deletion
+- **THEN** the shared service refuses with a typed ineligible reason
+- **AND** nothing is torn down or removed
+
+#### Scenario: Output is bounded and owner metadata discloses no secret
+
+- **GIVEN** a template containing a credential and a command that prints 200 KiB with ANSI codes but never echoes its arguments, environment, or cwd
+- **WHEN** the session finishes
+- **THEN** the retained tail is at most 65,536 bytes with `truncated_bytes` counted and no escape bytes
+- **AND** no owner-generated field, event, log entry, snapshot field, or record contains the credential, the template, or an absolute path
+
+#### Scenario: Output tail is the command's own data
+
+- **GIVEN** a configured command that echoes the expanded `{repo_root}`
+- **WHEN** an authenticated client reads the session resource
+- **THEN** the absolute path appears in `output.lines` exactly as printed, control sequences stripped and not redacted
+- **AND** it appears in no owner-generated field, event, log entry, or snapshot field, and an unauthenticated read is refused
+
+#### Scenario: Older owner stays compatible
+
+- **GIVEN** an owner built before this surface
+- **WHEN** a client decodes its capabilities and submits `run_worktree_command`
+- **THEN** `worktree_sessions` decodes as unavailable
+- **AND** the command is `validation_failed` with no record and no effect
+
 ### Requirement: Archive completion and execution clocks are published per revision
 
 Each projected `ChangeResource` MUST publish `archive_complete`, `true`
@@ -1651,3 +1809,211 @@ command variant, the preview route, the result kind, and the error code.
 - **THEN** both are `validation_failed` with no delegation
 - **AND** `delete_requires_teardown` is published as `true` by both owners
 - **AND** `confirmed_delete` decodes as unavailable from the older owner
+
+### Requirement: Bounded remote text edit API
+
+V2 MUST expose `GET /api/v2/changes/{change_id}/text?path=<relative>` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=<relative>` as reads that
+create no command record, advance no revision, and are served on both
+listeners and by a headless `cflx run`. It MUST extend the closed command set
+with `write_change_text` (target `change_id`) and `write_worktree_text`
+(target opaque `worktree_id`), each taking exactly `params.path`,
+`params.expected` (`{"kind":"content","content_id":"sha256:<64 hex>"}` or
+`{"kind":"absent"}`), and `params.content`, with `deny_unknown_fields`,
+ordinary revision fencing, idempotency identity, and the application gate.
+There MUST be no unconditional write and no client-supplied root, absolute
+path, branch, or Git ref.
+
+The scope root MUST be server-derived: `openspec/changes/<change_id>` in the
+project repository for a tracked, non-archived change, or the registered
+directory bound to the opaque worktree ID. `path` MUST be at most 1024 UTF-8
+bytes and MUST be refused as `validation_failed` when it is empty, absolute,
+contains `\`, a NUL, or an empty, `.`, or `..` component. Every directory
+component and the leaf MUST be opened with `O_NOFOLLOW` from the root
+descriptor on every read and every write. The owner MUST refuse with
+`text_not_editable` and a stable reason — `git_metadata` (any `.git`
+component, file or directory), `conflux_owned_path` (top-level `.wt/` or the
+top-level `.conflux-inflight`), `unsafe_path` (a symlink or non-directory on
+the walk or a symlink leaf), `nested_repository` (a traversed directory below
+the root that contains a `.git` entry of any type; the root's own `.git` is
+not examined), `not_regular_file`, `executable` (any execute bit),
+`too_large` (over 1,048,576 bytes), `not_text` (invalid UTF-8 or NUL),
+`root_missing` — and with `target_ineligible` and reason `change_active`,
+`change_admitted`, `managed_process_live`, or `root_busy` when the owning
+change is in an active display status, is admitted (`queue_intent` queued or
+display status `queued` / `blocked`), when the owner's managed writer
+coverage for the target root is not `Clear`, or when the repository root
+mutation guard is held or a base merge or resolve is in progress — the last
+applying to the main worktree row and every change directory alike. The read
+response MUST publish `editable`, `edit_blocked_reason`, and a bounded
+diagnostic `edit_blocked_detail` from the same classifier. A nested worktree
+MUST be editable only through its own opaque worktree ID, never through a
+path from another root.
+
+Managed writer coverage MUST be a tri-state (`Clear`, `Busy`, `Unknown`)
+computed from one process-local ledger, never a boolean, and `Busy` and
+`Unknown` MUST both refuse as `managed_process_live`. The ledger MUST account
+for every owner-managed writer: every run command scope the owner has
+installed, retained until each of its identities is proven quiescent and
+never dropped because a later run replaced it, a shutdown took it, or a
+quiescence budget expired; every spawn that bypasses the scope, including
+the shell command path and the configured worktree session, held as a lease
+from before spawn until both direct-child reap and managed process-group /
+retained-descendant quiescence are positively confirmed (shell exit alone
+MUST NOT release coverage); and spawns with no
+working directory, bound to the owner's own canonical working directory.
+Each writer's working directory MUST be canonicalized at registration and
+compared to the canonical root by component-wise path containment, so a
+symlink alias binds the real path and a sibling whose name shares a prefix
+is not bound. A failed canonicalization, an unresolved completion/quiescence lease, or an owner with
+no ledger attached MUST be `Unknown`; the absence of a current scope, of a
+termination port, or of a ledger MUST NOT be read as `Clear`. `Clear` MUST be
+provable by an owner — a headless `cflx run` included — whose ledger exists
+and is empty. A running lease with known cwd MUST be `Busy` for the bound
+root and MUST NOT block unrelated siblings as `Unknown` solely because the
+child has not exited. Owner restart MUST NOT be presented as quiescence
+evidence or performed to bypass an unknown result. The coverage MUST be read once, as part of the eligibility
+snapshot at the start of a write, and the contract MUST state that a writer
+admitted after that snapshot and before the rename is in the same window as
+an external writer. Reaching `Clear` MUST NOT kill, sweep, or reset any
+process or ledger entry, and `force_stop_change`, `owns_managed_process`,
+and `kill_managed_process` MUST keep their current target and scope.
+
+`content_id` MUST be `sha256:` followed by the lowercase hex SHA-256 of the
+exact file bytes. A write MUST compare the current bytes to `expected`
+immediately before replacing them, MUST refuse `text_stale` with the current
+`content_id` (or `null` when absent) when they differ or when `absent` was
+expected and the file exists, MUST settle `no_op` with `outcome: unchanged`
+when the new bytes equal the current bytes, and otherwise MUST write through a
+same-directory temporary file, `fsync`, and `rename`, preserving the existing
+permission bits (`0644` subject to umask for a created file), removing the
+temporary file on every failure path, and reporting a `text_write` result
+with `outcome`, `content_id_before`, `content_id_after`, `current_content_id`,
+`bytes_written`, `mode`, and `effects.file_written`. A refused record MUST
+carry the same result. A successful worktree write MUST trigger the ordinary
+worktree observation refresh so `dirty` follows, and MUST NOT stage, commit,
+or push. The write itself MUST NOT advance the state revision, but the
+observation refresh it triggers MAY, and the contract MUST tell clients to
+re-read `state_revision` after a save. A temporary file left by a process
+crash between create and rename MUST be reported as ordinary untracked dirt
+and MUST NOT be ignored or excluded from any cleanliness check.
+
+The contract MUST state that the compare and the rename are not atomic
+against external writers: Conflux's own writers are excluded by eligibility,
+and uncooperative external editors are not excluded. Capabilities MUST
+advertise `text_edit` (`available`, `read_routes`, `commands`, `max_bytes`,
+`max_path_bytes`, `content_id_algorithm`, `excluded`, `reasons`), and the
+generated OpenAPI document MUST include both routes, both command variants,
+the result kind, and both error codes. The block MUST decode as unavailable
+when an older owner omits it, every existing route and command MUST remain
+unchanged on such an owner, and a new command submitted to it MUST fail
+typed validation before any effect. `cflx client` and `cflx client mcp` MUST
+gain no verb.
+
+#### Scenario: Read publishes identity and eligibility
+
+- **GIVEN** a live opaque worktree whose `src/lib.rs` is a regular `0644` file
+- **WHEN** an authenticated client reads `/api/v2/worktrees/{id}/text?path=src/lib.rs`
+- **THEN** it receives `content`, `content_id` equal to `sha256:` of the bytes, `size_bytes`, `mode: "0644"`, `editable: true`, and the limits
+- **AND** the state revision is unchanged and no command record exists
+
+#### Scenario: Matching write replaces atomically and dirties Git
+
+- **GIVEN** a prior read returned identity `C` for a `0600` file
+- **WHEN** `write_worktree_text` is submitted with `expected.content_id = C` and new content
+- **THEN** the file holds the new bytes with mode `0600`, the record settles `succeeded` with `outcome: written`
+- **AND** `git status --porcelain` lists only that path and no commit is created
+- **AND** no temporary file remains in the directory
+
+#### Scenario: Stale write refuses and preserves client text
+
+- **GIVEN** the file changed after the client read identity `C`
+- **WHEN** a write with `expected.content_id = C` is submitted
+- **THEN** the record fails with `text_stale` and `current_content_id` names the current bytes
+- **AND** the file bytes and directory listing are unchanged
+- **AND** no response asks the client to discard its buffer
+
+#### Scenario: Containment refuses symlinks and Git metadata in both forms
+
+- **GIVEN** a linked worktree whose `.git` is a file and a main worktree whose `.git` is a directory
+- **WHEN** a client addresses `.git`, a path through a symlinked directory, a symlink leaf, `.wt/teardown`, an executable, a file over 1 MiB, or a file with NUL bytes
+- **THEN** each is refused with `text_not_editable` and its stable reason
+- **AND** a leaf replaced by a symlink after a successful read is refused at write time
+- **AND** no bytes under either root change
+
+#### Scenario: Active writers exclude remote edits
+
+- **GIVEN** change `alpha` is `applying`, or the owner's writer coverage for `alpha`'s worktree is `Busy` (a registered writer with or without a change ID), or the root guard is held, or a resolve is running
+- **WHEN** a client reads and then writes a file in `alpha`'s worktree
+- **THEN** the read reports `editable: false` with the matching reason
+- **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a writer bound only to a sibling path leaves the target editable
+
+#### Scenario: Retained writers from a previous run exclude remote edits
+
+- **GIVEN** a previous run's scope holds an identity spawned under `alpha`'s worktree that was never proven quiescent, and a new run has since been started with a fresh scope
+- **WHEN** a client reads and then writes a file in `alpha`'s worktree
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail naming the retained identity
+- **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a sibling worktree stays editable, nothing is killed, and `actions.force_stop_change` is unchanged
+- **AND** once the identity is released with confirmed quiescence the same read reports `editable: true`
+
+#### Scenario: Unknown writer coverage fails closed
+
+- **GIVEN** an owner with no writer ledger attached to its termination port, or a ledger holding a lease whose child was never reaped, or a writer whose working directory could not be canonicalized
+- **WHEN** a client reads a file in any worktree, in the main worktree, or in a change directory
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail saying coverage is unknown
+- **AND** the write fails `target_ineligible` and writes nothing
+- **AND** the change-keyed `managed_process_live` on the state snapshot is unchanged
+
+#### Scenario: Unscoped and session writers are covered
+
+- **GIVEN** a child spawned through the shell command path or through the configured worktree session with `alpha`'s worktree as its working directory and no change ID
+- **WHEN** a client reads a file in `alpha`'s worktree while the child is alive, and again after direct-child reap and confirmed process-group quiescence
+- **THEN** the first read reports `editable: false` with `managed_process_live` and a sibling directory is `Clear`
+- **AND** the second read reports `editable: true`
+- **AND** shell exit with a surviving managed descendant does not clear coverage or allow a write
+
+#### Scenario: Canonical containment decides a binding
+
+- **GIVEN** a writer registered through a symlink alias of `alpha`'s worktree, and a sibling worktree whose name begins with `alpha`
+- **WHEN** a client reads a file in each
+- **THEN** `alpha` reports `editable: false` with `managed_process_live` and the sibling reports `editable: true`
+- **AND** a writer whose working directory no longer exists at registration refuses every root
+
+#### Scenario: Admitted targets exclude remote edits
+
+- **GIVEN** change `alpha` is `queued` or `blocked`, or its `queue_intent` is queued
+- **WHEN** a client reads and then writes a file in `alpha`'s change directory or in its worktree
+- **THEN** the read reports `editable: false` with reason `change_admitted`
+- **AND** the write fails `target_ineligible` with `change_admitted` and writes nothing
+
+#### Scenario: Nested repository is not reachable through another root
+
+- **GIVEN** change `alpha`'s worktree lies under the project root, and a directory under the main worktree carries its own `.git` entry
+- **WHEN** a client addresses a file inside either through the main worktree's opaque ID
+- **THEN** the read and the write are refused with `text_not_editable` and reason `nested_repository`
+- **AND** the same file is served through `alpha`'s own worktree ID
+- **AND** no bytes under the project root or under `alpha`'s worktree change
+
+#### Scenario: Absent expectation creates exactly once
+
+- **GIVEN** `notes.md` does not exist in the change directory
+- **WHEN** `write_change_text` is submitted with `expected.kind = absent`
+- **THEN** the file is created and the record reports `content_id_before: null`
+- **AND** a second `absent` write is `text_stale`
+
+#### Scenario: Older owner stays compatible
+
+- **GIVEN** an owner built before this surface
+- **WHEN** a client decodes its capabilities and submits `write_worktree_text`
+- **THEN** `text_edit` decodes as unavailable
+- **AND** the command is `validation_failed` with no record and no effect
+- **AND** every existing read and command keeps working
+
+#### Scenario: Contract completeness
+
+- **GIVEN** a client captures `cflx openapi`
+- **WHEN** it inspects the document
+- **THEN** both text routes, both write commands, the `text_write` result kind, `text_stale`, `text_not_editable`, and `capabilities.text_edit` are present
+- **AND** removing any of them from a copy fails the completeness check

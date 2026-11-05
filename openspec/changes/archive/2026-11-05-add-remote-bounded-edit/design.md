@@ -245,9 +245,12 @@ Decision for a root `R` (canonical, as the scope root already is):
   lease whose completion/group quiescence is unresolved (not an ordinary
   running lease with known cwd), or if no ledger is attached to the port at all (an owner
   wired without one answers `Unknown` for every root, never `Clear`);
-- else `Busy` if any entry's canonical `cwd` satisfies `cwd.starts_with(R)`
-  (component-wise `Path::starts_with`, so `/w/alpha2` is not under
-  `/w/alpha`), or is an `OwnerCwd` entry with the owner cwd under `R`;
+- else `Busy` if any entry's canonical `cwd` overlaps `R` in either direction
+  — `cwd.starts_with(R)` or `R.starts_with(cwd)` (component-wise
+  `Path::starts_with`, so `/w/alpha2` never binds to `/w/alpha`) — or is an
+  `OwnerCwd` entry whose owner cwd overlaps `R` the same way. A writer whose
+  `cwd` is an ancestor of `R` (for example the project root) can write into
+  `R`, which is what the session-shaped case below requires;
 - else `Clear`.
 
 `Clear` therefore means "every writer this owner can launch has been

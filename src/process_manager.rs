@@ -51,6 +51,10 @@ impl Drop for JobObjectGuard {
 pub struct ManagedChild {
     pub child: Child,
     pub handle: ProcessHandle,
+    /// Run once, after [`Self::wait`] observes the direct child reaped.
+    ///
+    /// Behind a mutex only so the child stays `Sync`; it is taken exactly once.
+    on_reaped: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Result of a termination attempt.
@@ -114,7 +118,22 @@ impl ManagedChild {
     /// Creates a new managed child from a tokio Child process
     pub fn new(mut child: Child) -> io::Result<Self> {
         let handle = Self::create_handle(&mut child)?;
-        Ok(Self { child, handle })
+        Ok(Self {
+            child,
+            handle,
+            on_reaped: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Run `hook` once the direct child has been reaped through [`Self::wait`].
+    ///
+    /// Dropping the child without that reap drops the hook unrun, which is how
+    /// a caller that never waited is told nothing was proven.
+    pub fn on_reaped(&mut self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .on_reaped
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 
     #[cfg(unix)]
@@ -173,7 +192,16 @@ impl ManagedChild {
 
     /// Waits for the child process to exit
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        let status = self.child.wait().await?;
+        let hook = self
+            .on_reaped
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(status)
     }
 
     /// Attempts to kill the child process (fallback to standard kill)
@@ -1050,6 +1078,29 @@ impl ProcessGroupControl for UnixProcessGroup {
             Err(e) => ProbeResult::Unknown(e.to_string()),
         }
     }
+}
+
+/// Non-destructive membership check of one process group.
+///
+/// `Some(true)` is positive proof the group is empty, `Some(false)` that a
+/// member is alive, and `None` that membership could not be determined. Signal
+/// 0 performs error checking only, so nothing is disturbed.
+#[cfg(unix)]
+pub fn process_group_is_empty(pgid: u32) -> Option<bool> {
+    if pgid == 0 {
+        return None;
+    }
+    match (UnixProcessGroup { pgid }).probe() {
+        ProbeResult::Empty => Some(true),
+        ProbeResult::MembersRemain => Some(false),
+        ProbeResult::Unknown(_) => None,
+    }
+}
+
+/// Non-Unix stub: there is no process group to probe, so nothing is proven.
+#[cfg(not(unix))]
+pub fn process_group_is_empty(_pgid: u32) -> Option<bool> {
+    None
 }
 
 /// Performs bounded process-group cleanup and returns typed quiescence evidence.

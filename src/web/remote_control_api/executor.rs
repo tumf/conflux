@@ -550,6 +550,8 @@ pub struct SharedServiceExecutor {
     /// The same worktree port the read routes use, so a client cannot be told a
     /// worktree exists by one half of the API and denied by the other.
     worktrees: Arc<dyn super::worktrees::WorktreeOperations>,
+    /// Configured-command worktree sessions.
+    sessions: Arc<dyn super::worktree_sessions::WorktreeSessionOperations>,
 }
 
 impl SharedServiceExecutor {
@@ -559,7 +561,17 @@ impl SharedServiceExecutor {
             application,
             web_state,
             worktrees: Arc::new(super::worktrees::UnboundWorktreeOperations),
+            sessions: Arc::new(super::worktree_sessions::UnboundWorktreeSessions),
         }
+    }
+
+    /// Attach the worktree-session port.
+    pub fn with_worktree_sessions(
+        mut self,
+        sessions: Arc<dyn super::worktree_sessions::WorktreeSessionOperations>,
+    ) -> Self {
+        self.sessions = sessions;
+        self
     }
 
     /// Attach the worktree operation port.
@@ -625,8 +637,45 @@ impl SharedServiceExecutor {
             | CommandSpec::DeleteWorktree { .. }
             | CommandSpec::DeleteWorktreeConfirmed { .. }
             | CommandSpec::MergeWorktree { .. }
-            | CommandSpec::MergeWorktreeAbortOnConflict { .. } => return None,
+            | CommandSpec::MergeWorktreeAbortOnConflict { .. }
+            | CommandSpec::WriteChangeText { .. }
+            | CommandSpec::WriteWorktreeText { .. }
+            | CommandSpec::RunWorktreeCommand { .. }
+            | CommandSpec::CreateSessionWorktree { .. }
+            | CommandSpec::StopWorktreeSession { .. } => return None,
         })
+    }
+
+    /// Run a bounded text write, if `command` is one.
+    ///
+    /// `None` for every other command. The caller decides what the gate does:
+    /// a text write runs while it is still held, so the eligibility snapshot
+    /// and the write it admits are serialized against every other command.
+    async fn text_write(
+        &self,
+        command: &CommandSpec,
+    ) -> Option<Result<ExecutionSummary, CommandFailure>> {
+        let (scope, params) = match command {
+            CommandSpec::WriteChangeText { target, params } => (
+                super::dto::TextScope::Change {
+                    change_id: target.change_id.clone(),
+                },
+                params,
+            ),
+            CommandSpec::WriteWorktreeText { target, params } => (
+                super::dto::TextScope::Worktree {
+                    worktree_id: target.worktree_id.clone(),
+                },
+                params,
+            ),
+            _ => return None,
+        };
+        let context = super::text_edit::TextEditContext {
+            projection: self.web_state.remote_control().projection(),
+            source: Some(self.web_state.clone()),
+            worktrees: self.worktrees.clone(),
+        };
+        Some(context.write(scope, params).await)
     }
 
     /// Run a worktree command and republish the monitoring snapshot.
@@ -635,6 +684,18 @@ impl SharedServiceExecutor {
     /// vocabulary, so this is the one path that still refreshes the projection
     /// itself before the record settles.
     async fn worktree(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        // Sessions publish their own presentation events and never touch the
+        // snapshot, so they do not republish the projection either.
+        match command {
+            CommandSpec::RunWorktreeCommand { target, .. } => {
+                return self.sessions.run(&target.worktree_id).await;
+            }
+            CommandSpec::CreateSessionWorktree { .. } => return self.sessions.create().await,
+            CommandSpec::StopWorktreeSession { target, .. } => {
+                return self.sessions.stop(&target.session_id).await;
+            }
+            _ => {}
+        }
         let outcome = match command {
             CommandSpec::CreateWorktree { target, .. } => {
                 self.worktrees.create(&target.change_id).await
@@ -732,6 +793,9 @@ pub fn summarize_application(
 #[async_trait]
 impl RemoteControlExecutor for SharedServiceExecutor {
     async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        if let Some(outcome) = self.text_write(command).await {
+            return outcome;
+        }
         match Self::intent(command) {
             Some(intent) => summarize_application(self.application.apply(intent).await),
             None => self.worktree(command).await,
@@ -748,14 +812,29 @@ impl RemoteControlExecutor for SharedServiceExecutor {
         command: &CommandSpec,
         gate: Option<GateGuard>,
     ) -> Result<ExecutionSummary, CommandFailure> {
+        // A text write settles under the gate it was admitted with, and only
+        // then releases it.
+        if let Some(outcome) = self.text_write(command).await {
+            drop(gate);
+            return outcome;
+        }
         match (Self::intent(command), gate) {
             (Some(intent), Some(gate)) => {
                 summarize_application(self.application.apply_held(intent, gate).await)
             }
             (Some(intent), None) => summarize_application(self.application.apply(intent).await),
+            // Launching in an existing worktree is short (one observation, one
+            // cwd validation, one spawn), so its eligibility is evaluated under
+            // the application gate, which is held until the launch settles.
+            (None, gate @ Some(_)) if matches!(command, CommandSpec::RunWorktreeCommand { .. }) => {
+                let settled = self.worktree(command).await;
+                drop(gate);
+                settled
+            }
             // A worktree operation is a repository mutation, not operator
             // lifecycle intent; the gate is released before it runs so a long
-            // merge cannot monopolize command admission.
+            // merge, a `.wt/setup`, or a stop's reap cannot monopolize command
+            // admission. Session single flight is the registry's own lock.
             (None, gate) => {
                 drop(gate);
                 self.worktree(command).await

@@ -123,6 +123,13 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             },
         },
         worktrees: WorktreeCapabilities::default(),
+        // Available only when the configured command could actually launch: a
+        // template, a Git repository, a bound session runtime, and a command
+        // executor. An older owner omits the block, which decodes the same way.
+        worktree_sessions: super::worktree_sessions::capability(
+            &state.worktree_sessions,
+            state.executor.is_command_capable().await,
+        ),
         proposal_refresh: dto::ProposalRefreshCapability {
             // A read over the projection and the repository, so it is served
             // whether or not a command executor is bound.
@@ -135,6 +142,9 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
                 .map(|reason| reason.as_str().to_string())
                 .collect(),
         },
+        // A read surface plus two fenced commands, served once the owner-side
+        // facts it resolves against are attached.
+        text_edit: super::text_edit::capability(state.text_edit.is_some()),
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,
             vcs_backend: parallel.vcs_backend,
@@ -379,6 +389,7 @@ pub async fn execution_status(State(state): State<RemoteControlState>) -> Respon
                 .process_log
                 .as_ref()
                 .map(LatestLogProjection::from_entry),
+            worktree_sessions_running: state.worktree_sessions.running() as u32,
         },
         changes,
     })

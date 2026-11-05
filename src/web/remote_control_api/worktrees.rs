@@ -39,7 +39,7 @@ use super::dto::{
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 7] = [
+pub const WORKTREE_OPERATIONS: [&str; 9] = [
     "list",
     "detail",
     "create",
@@ -47,6 +47,8 @@ pub const WORKTREE_OPERATIONS: [&str; 7] = [
     "merge",
     "merge_abort",
     "delete_confirmed",
+    "text",
+    "session",
 ];
 
 /// Command the `delete_confirmed` operation is submitted as.
@@ -654,6 +656,24 @@ pub trait WorktreeOperations: Send + Sync {
         worktree_id: &str,
         params: &ConfirmedDeleteParams,
     ) -> Result<ExecutionSummary, CommandFailure>;
+
+    /// The directory a live opaque ID is bound to, for the text surface.
+    ///
+    /// Registry-internal: the path is never serialized.
+    async fn text_root(&self, _worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Err(unbound())
+    }
+
+    /// Whether the repository root mutation guard is held right now.
+    ///
+    /// A port with no service behind it holds no guard.
+    async fn root_guard_is_held(&self) -> bool {
+        false
+    }
+
+    /// Refresh the worktree observation after a text write, so `dirty` and the
+    /// `Refreshed` worktree event follow from the file write alone.
+    async fn refresh_after_text_write(&self) {}
 }
 
 /// A complete worktree observation plus the repository it belongs to.
@@ -831,6 +851,40 @@ impl RemoteWorktreeOperations {
             },
             facts,
         ))
+    }
+
+    /// Resolve a live opaque ID against a fresh observation, returning the
+    /// internal key and the redacted resource it currently projects to.
+    pub(crate) async fn resolve_live(
+        &self,
+        worktree_id: &str,
+    ) -> Result<(WorktreeKey, WorktreeResource), CommandFailure> {
+        let (listing, _) = self.observe().await?;
+        let key = self.resolve(worktree_id)?;
+        let resource = listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.worktree_id == worktree_id)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    ErrorCode::WorktreeNotFound,
+                    format!("worktree '{worktree_id}' is not a current resource in this instance"),
+                )
+            })?;
+        Ok((key, resource))
+    }
+
+    /// The opaque ID a fresh observation allocates for `path`, if it is a
+    /// registered worktree.
+    pub(crate) async fn identify(&self, path: &Path) -> Option<String> {
+        let (listing, _) = self.observe().await.ok()?;
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let display = repository_relative_display(&self.repo_root, &canonical);
+        listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.path == display)
+            .map(|resource| resource.worktree_id)
     }
 
     /// Resolve an opaque ID, distinguishing "never existed" from "retired".
@@ -1088,5 +1142,18 @@ impl WorktreeOperations for RemoteWorktreeOperations {
                 )
             }
         }
+    }
+
+    async fn text_root(&self, worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Ok(self.resolve(worktree_id)?.path)
+    }
+
+    async fn root_guard_is_held(&self) -> bool {
+        self.service.root_guard_is_held()
+    }
+
+    async fn refresh_after_text_write(&self) {
+        let _ = self.observe().await;
+        self.service.announce_refreshed().await;
     }
 }

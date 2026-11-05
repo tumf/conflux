@@ -270,6 +270,104 @@ Notes for client authors:
   repository root, a workspace path used as a log locator, or a `file://` URL,
   and no endpoint accepts a host path or filename.
 
+### Configured-command worktree sessions
+
+The Worktrees view's `Enter` and `+` keys run the *configured*
+`worktree_command`. The same two actions are available over `/api/v2`, and they
+never take a command from the client:
+
+```bash
+# Run the configured command in an existing worktree (opaque ID from GET /worktrees).
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "run_worktree_command", "target": {"worktree_id": "<32 hex>"}, "params": {},
+  "expected_revision": 12, "idempotency_key": "session-1"
+}'
+
+# Create a ws-session-* worktree exactly as `+` does, then run the command there.
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "create_session_worktree", "params": {},
+  "expected_revision": 12, "idempotency_key": "session-2"
+}'
+
+curl -H "$AUTH" "$BASE/worktree-sessions"               # newest first
+curl -H "$AUTH" "$BASE/worktree-sessions/$SESSION_ID"   # one session with its output tail
+
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "stop_worktree_session", "target": {"session_id": "'$SESSION_ID'"}, "params": {},
+  "expected_revision": 12, "idempotency_key": "stop-1"
+}'
+```
+
+- **Configured command only.** The command is the configured `worktree_command`
+  template with `{workspace_dir}` and `{repo_root}` expanded by the owner. No
+  request field carries a command, argv, environment, path, branch, or base
+  commit; any such member is a 422 `validation_failed`. Without a configured
+  template, outside a Git repository, or while the owner is shutting down,
+  launches are refused `worktree_session_unavailable` before any Git or process
+  effect. A headless `cflx run` binds no command executor, so it answers
+  `command_executor_unbound`. `GET /capabilities` reports
+  `worktree_sessions.available` and the limits below.
+- **Same runner as the TUI.** `sh -c`, stdin from `/dev/null` (there is no
+  stdin relay and no PTY), its own process group, the stagger slot, and the
+  configured retry policy. Configured retries happen *inside* one session and
+  show up as `attempt`; they never create a second session.
+- **Single flight.** An exact replay of an idempotency key returns the original
+  record and launches nothing. A new request for a worktree whose session is
+  still running is `worktree_session_busy` with `reason=worktree_busy`. At most
+  4 sessions run at once; the fifth is `worktree_session_busy` with
+  `reason=capacity`, refused before any Git effect, so a refused
+  `create_session_worktree` creates no worktree and no branch.
+- **Provisioning matches `+`.** `create_session_worktree` creates a
+  `ws-session-<random>` branch at base `HEAD` under the workspace base directory,
+  validates the cwd after creation, runs `.wt/setup`, and validates again after
+  setup and immediately before launch. When `.wt/setup` fails, the worktree is
+  removed exactly as the TUI removes it — forced, teardown skipped — and the
+  `ws-session-*` branch is **retained**; nothing is launched, and the record
+  fails `worktree_session_setup_failed` with `result.cleanup` `removed` or
+  `retained` plus a reason. An invalid cwd at any validation is
+  `target_ineligible` with `reason=cwd_invalid` and launches nothing. The
+  result's `session_kind` is `existing` or `session`.
+- **Stop.** `stop_worktree_session` cancels through the runner's own handle:
+  SIGTERM to the session's process group, SIGKILL after 5 seconds, verified
+  group cleanup, and no further attempt even with retries configured. The
+  record settles only after the leader is reaped and the cleanup report is read,
+  with `result.terminated` and `result.state_after`; a session that had already
+  finished settles `no_op`. Descendants that left the process group (`setsid`,
+  daemonization) are outside this guarantee. Owner shutdown stops every running
+  session the same way under a 10-second deadline. Scheduler `stop`,
+  `stop_and_dequeue`, and `force_stop` never touch sessions.
+- **Deletion is refused while a session runs.** `delete_worktree` — and the
+  TUI's own deletion keys — refuse a worktree whose session is running with
+  `target_ineligible` ("a worktree session is running"). Merging is not gated.
+- **Retention.** Sessions are in memory only: running sessions are never
+  evicted, at most 32 finished ones are kept (oldest evicted first), nothing is
+  written to disk, and a restart forgets everything. Sessions never influence
+  scheduling, resume, acceptance, or archive.
+- **The output tail is the command's own data.** `output.lines` holds the
+  newest 64 KiB of stdout/stderr lines (`truncated_bytes` counts what was
+  dropped), passed through the same sanitizer as log lines: ANSI and control
+  sequences stripped, each line bounded at 8 KiB, **nothing redacted**. If the
+  configured command prints its arguments, its environment, or its cwd, every
+  bearer-authenticated reader of the session resource sees them. Choosing a
+  `worktree_command` that does not print secrets is the operator's
+  responsibility. The runner's own stderr notices (a `[Retry N/M]` line before
+  each configured retry, from which `attempt` is counted, and process-group
+  cleanup diagnostics) are interleaved in the same tail. A stopped session
+  reports `signal: "SIGTERM"`, the signal the cancellation path sends first;
+  its SIGKILL escalation is not reported separately. The tail is published
+  nowhere else: never as an event, a log
+  entry, or a snapshot field. Owner-generated members (`path`, `branch`,
+  results, error detail, events) never contain the template, the expanded
+  command, environment values, or an absolute path.
+- **Events.** `worktree_session_started` and `worktree_session_finished` carry
+  `{session_id, worktree_id, state, exit_code}`. They take an event sequence but
+  never advance `state_revision`. `GET /execution-status` reports
+  `process.worktree_sessions_running`.
+- **Older owners.** An owner built before this surface omits
+  `capabilities.worktree_sessions` (decode it as unavailable) and answers each
+  of the three commands with `validation_failed` before any effect. `cflx client`
+  and `cflx client mcp` have no session verb.
+
 #### Merging a worktree remotely
 
 Two separately advertised commands merge a worktree's branch into base. Both
@@ -446,6 +544,122 @@ surface omits the block, which a client decodes as `available: false`; it
 refuses `delete_worktree_confirmed` with `validation_failed` before any effect,
 serves `delete_worktree` and every other command unchanged, and still publishes
 `delete_requires_teardown: true`.
+
+#### Editing a text file remotely
+
+One bounded text surface lets a single operator read and save a file that
+belongs to a change or to a managed worktree, the way the TUI `e` key opens
+`$EDITOR` locally:
+
+```bash
+curl -H "$AUTH" "$BASE/changes/my-change/text?path=tasks.md"
+curl -H "$AUTH" "$BASE/worktrees/$WORKTREE_ID/text?path=src/lib.rs"
+
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "write_worktree_text",
+  "target": {"worktree_id": "'"$WORKTREE_ID"'"},
+  "params": {"path": "src/lib.rs",
+             "expected": {"kind": "content", "content_id": "sha256:…"},
+             "content": "…"},
+  "expected_revision": 41, "idempotency_key": "save-1"
+}'
+```
+
+- **Roots are server-derived.** `write_change_text` / the change read address
+  `openspec/changes/<change_id>` of the project for a tracked, non-archived
+  change; `write_worktree_text` / the worktree read address the directory an
+  opaque `worktree_id` is bound to. No root, absolute path, or ref is ever
+  accepted from the client.
+- **Limits.** A regular UTF-8 file of at most 1 MiB (1,048,576 bytes) without
+  NUL, addressed by a `/`-separated relative path of at most 1024 bytes. An
+  empty path, a leading `/`, `\`, an empty, `.` or `..` component, or a
+  trailing `/` is `validation_failed` (422) before anything is touched. A
+  missing intermediate directory is `not_found`; none is created.
+- **Excluded paths** are `text_not_editable` (409) with a stable `reason`:
+  `.git` as a file or a directory at any depth (`git_metadata`); anything under
+  top-level `.wt/` and the top-level `.conflux-inflight` (`conflux_owned_path`
+  — `sub/.conflux-inflight` is ordinary text); any symlink on the way, or a
+  non-directory used as one (`unsafe_path`); any directory below the root that
+  carries its own `.git` entry of any type — a nested worktree, a submodule, an
+  embedded repository (`nested_repository`); a non-regular file
+  (`not_regular_file`); a file with any execute bit (`executable`); more than
+  1 MiB (`too_large`); invalid UTF-8 or NUL (`not_text`); a root that is
+  missing or a symlink (`root_missing`). From the main worktree's ID, a file in
+  another change's worktree placed under the project root is
+  `nested_repository`: edit it through that worktree's own ID, where its own
+  eligibility applies.
+- **Content identity.** `content_id` is `sha256:` plus 64 lowercase hex digits
+  over the exact bytes. Every write names what it read —
+  `{"kind":"content","content_id":…}`, or `{"kind":"absent"}` to create a file
+  that must not exist yet. There is no unconditional write. A mismatch is
+  `text_stale`: nothing is written, and the record's
+  `result.current_content_id` carries what the file holds now (`null` when it
+  is absent), so a client keeps its buffer and re-reads. Identical content
+  settles `no_op` with `outcome: unchanged` and opens nothing for writing.
+- **The write itself** goes through a same-directory temporary file
+  `.<leaf>.cflx-tmp-<16 hex>`, `fsync`, and `rename`, keeping the existing
+  permission bits (a new file is `0644` subject to the umask). Every path
+  component is re-walked with `O_NOFOLLOW` on the write, so a symlink
+  substituted after a read is still refused. Any failure the process survives
+  removes the temporary file and reports `effects.file_written: false`. A
+  process killed between creating it and the rename can leave that
+  `.cflx-tmp-` file behind: it is reported by Git and by every Conflux
+  cleanliness check as ordinary untracked dirt, it is never ignored or swept,
+  and you delete it by hand.
+- **Saving never commits, stages, or pushes.** Git dirty state follows from the
+  file write alone. After a successful worktree write the ordinary worktree
+  observation is refreshed; when that changes what the owner observes, the
+  state revision advances like any other refresh. **A save can therefore
+  require a reload**: re-read `state_revision` before the next fenced command
+  instead of reusing the pre-save value.
+
+Writer exclusion is published, not hoped for. Every read reports `editable`,
+`edit_blocked_reason`, and a bounded, diagnostic-only `edit_blocked_detail`
+from the same classifier the command uses, and a write refused by it is
+`target_ineligible` with the same reason on its `result`. Reasons, in the order
+they are checked:
+
+| reason | refused while |
+|---|---|
+| `change_active` | the change — for a worktree, the change that owns it — is in an active status (`preparing`, `applying`, `accepting`, `rejecting`, `archiving`, `resolving`) |
+| `change_admitted` | it is admitted: queue intent `queued`, or display status `queued` or `blocked` — the scheduler may dispatch it at any moment, so a save would race the agent's first write |
+| `managed_process_live` | the owner's managed writer coverage for the root is not `Clear` |
+| `root_busy` | the repository root guard is held, a base merge is in progress, or a resolve is running |
+
+Through the main worktree's ID, a path inside `openspec/changes/<id>/` of a
+tracked change is judged by that change's own status, exactly as the change
+scope is, so the project root is not a way around `change_active` or
+`change_admitted`.
+
+`managed_process_live` has two meanings, and `edit_blocked_detail` tells them
+apart: *a managed writer is bound here* (a run-scoped command, an unscoped
+shell, or a configured `worktree_command` session runs in this directory, in
+one below it, or in one above it such as the project root), or *the owner
+cannot prove that none is* (an identity it never proved quiescent, a writer
+whose working directory could not be canonicalized, or no coverage source at
+all). A previous run's processes that were never proven quiescent keep their
+root blocked until existing lifecycle paths prove them quiescent; starting a
+new run does not forget them. An owner restart is neither quiescence evidence
+nor an authorized workaround — the coverage of a restarted owner says nothing
+about processes it did not launch. The editor never kills, signals, sweeps, or
+resets anything to make a root editable, and `force_stop_change` keeps its
+exact target and rights.
+
+What the compare-and-swap does **not** promise: the compare and the rename are
+not one atomic step against external writers. An editor or tool outside
+Conflux that writes between them is overwritten, and such external,
+uncooperative editors are not excluded — nothing is locked with `flock`,
+because no external editor honours it. The eligibility snapshot is taken once,
+at the start of a write; a scheduler dispatch or a new writer that appears
+after it and before the rename falls into the same window.
+
+Discover the surface through `capabilities.text_edit` (`available`,
+`read_routes`, `commands`, `max_bytes`, `max_path_bytes`,
+`content_id_algorithm`, `excluded`, `reasons`) and the `text` entry in
+`worktrees.operations`. An owner built before it omits the block, which a
+client decodes as `available: false`; such an owner refuses either command
+type with `validation_failed` before any effect and serves every other route
+and command unchanged. `cflx client` and `cflx client mcp` have no text verb.
 
 The full schema is generated at runtime rather than tracked in the repository.
 Export it with `cflx openapi > openapi.yaml`, or fetch it from a running
