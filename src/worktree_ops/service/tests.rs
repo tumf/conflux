@@ -622,10 +622,17 @@ fn remote_worktree_preserving_policy_attempts_a_predicted_conflict() {
 
     // The aborting frontend refuses up front; the preserving one must run the
     // merge so the conflict evidence it promises actually exists.
-    assert!(matches!(
-        classify_merge_eligibility(&facts, ConflictPolicy::AbortOnConflict),
-        Err(WorktreeOpError::Ineligible(_))
-    ));
+    // The aborting refusal is typed so it can carry the predicted files; its
+    // text is unchanged from the untyped refusal it replaced.
+    let refusal = classify_merge_eligibility(&facts, ConflictPolicy::AbortOnConflict)
+        .expect_err("a predicted conflict refuses an aborting merge");
+    assert_eq!(
+        refusal,
+        WorktreeOpError::PredictedConflict {
+            files: vec!["src/main.rs".to_string()]
+        }
+    );
+    assert_eq!(refusal.to_string(), "the worktree conflicts with base");
     assert!(classify_merge_eligibility(&facts, ConflictPolicy::PreserveConflict).is_ok());
 }
 
@@ -1851,6 +1858,165 @@ async fn remote_worktree_on_merged_failure_blocks_the_merged_transition() {
             .any(|event| matches!(event, WorktreeOperationEvent::MergeCompleted { .. })),
         "completion must not be announced when the hook blocked the transition"
     );
+}
+
+// ── Abort-on-conflict merge ──────────────────────────────────────────────────
+
+fn abort_report(
+    restored: crate::vcs::git::commands::Restoration,
+) -> crate::vcs::git::commands::AbortReport {
+    use crate::vcs::git::commands::Restoration;
+    let confirmed = restored == Restoration::Confirmed;
+    crate::vcs::git::commands::AbortReport {
+        premerge_head: "a".repeat(40),
+        exit_ok: confirmed,
+        head_after: (restored != Restoration::Unknown).then(|| "a".repeat(40)),
+        merge_head_present: Some(!confirmed),
+        clean_after: Some(confirmed),
+        restored,
+        detail: String::new(),
+    }
+}
+
+fn ran_on_merged(backend: &FakeBackend) -> bool {
+    backend
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::OnMerged { .. }))
+}
+
+#[tokio::test]
+async fn remote_merge_abort_predicted_conflict_refuses_before_merge() {
+    let mut facts = mergeable();
+    facts.conflict_files = vec!["src/lib.rs".to_string()];
+    let backend = FakeBackend::stable(vec![facts]);
+    let (service, sink) = service(backend.clone());
+
+    let refusal = service
+        .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+        .await
+        .expect_err("a predicted conflict is refused");
+
+    assert_eq!(
+        refusal,
+        WorktreeOpError::PredictedConflict {
+            files: vec!["src/lib.rs".to_string()]
+        }
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Merge { .. })),
+        "no Git mutation may run for a predicted conflict"
+    );
+    assert!(!ran_on_merged(&backend));
+    assert_eq!(
+        sink.events(),
+        vec![WorktreeOperationEvent::MergeFailed {
+            branch: "c1".to_string(),
+            error: "the worktree conflicts with base".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn remote_merge_abort_confirmed_restoration_is_a_typed_failure() {
+    use crate::vcs::git::commands::Restoration;
+    let backend = FakeBackend::stable(vec![mergeable()]);
+    *backend.merge.lock().unwrap() = Ok(MergeAttempt::ConflictAborted {
+        files: vec!["src/lib.rs".to_string()],
+        abort: abort_report(Restoration::Confirmed),
+    });
+    let (service, sink) = service(backend.clone());
+
+    let failure = service
+        .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+        .await
+        .expect_err("an aborted conflict fails the merge");
+
+    let WorktreeOpError::MergeConflictAborted { files, abort } = &failure else {
+        panic!("unexpected error: {failure:?}");
+    };
+    assert_eq!(files, &["src/lib.rs".to_string()]);
+    assert_eq!(abort.restored, Restoration::Confirmed);
+    let text = failure.to_string();
+    assert!(text.contains("Merge aborted; base restored to"), "{text}");
+    assert!(!ran_on_merged(&backend));
+    assert!(sink
+        .events()
+        .contains(&WorktreeOperationEvent::MergeFailed {
+            branch: "c1".to_string(),
+            error: text,
+        }));
+    assert!(!sink
+        .events()
+        .iter()
+        .any(|event| matches!(event, WorktreeOperationEvent::MergeCompleted { .. })));
+}
+
+#[tokio::test]
+async fn remote_merge_abort_failed_restoration_is_distinct() {
+    use crate::vcs::git::commands::Restoration;
+    for (restored, marker) in [
+        (Restoration::Failed, "abort FAILED"),
+        (Restoration::Unknown, "UNCONFIRMED"),
+    ] {
+        let backend = FakeBackend::stable(vec![mergeable()]);
+        *backend.merge.lock().unwrap() = Ok(MergeAttempt::ConflictAborted {
+            files: vec!["src/lib.rs".to_string()],
+            abort: abort_report(restored),
+        });
+        let (service, sink) = service(backend.clone());
+
+        let failure = service
+            .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+            .await
+            .expect_err("an unconfirmed abort fails the merge");
+
+        let WorktreeOpError::MergeConflictAborted { abort, .. } = &failure else {
+            panic!("unexpected error: {failure:?}");
+        };
+        assert_eq!(abort.restored, restored);
+        let text = failure.to_string();
+        assert!(text.contains(marker), "{text}");
+        assert!(!text.contains("Merge aborted"), "{text}");
+        assert!(!text.contains("preserved"), "{text}");
+        assert!(!ran_on_merged(&backend));
+        assert!(sink
+            .events()
+            .contains(&WorktreeOperationEvent::MergeFailed {
+                branch: "c1".to_string(),
+                error: text,
+            }));
+    }
+}
+
+#[tokio::test]
+async fn remote_merge_abort_preserve_policy_is_unchanged() {
+    // A predicted conflict is still attempted under the preserving policy, and
+    // the conflict still comes back as `MergeConflict` with no abort.
+    let mut facts = mergeable();
+    facts.conflict_files = vec!["src/lib.rs".to_string()];
+    let backend = FakeBackend::stable(vec![facts]);
+    *backend.merge.lock().unwrap() = Ok(MergeAttempt::Conflict {
+        files: vec!["src/lib.rs".to_string()],
+    });
+    let (service, _sink) = service(backend.clone());
+
+    let failure = service
+        .merge_worktree(
+            Path::new("/workspaces/c1"),
+            ConflictPolicy::PreserveConflict,
+        )
+        .await
+        .expect_err("conflict fails");
+    assert!(matches!(failure, WorktreeOpError::MergeConflict { .. }));
+    assert!(backend.calls().contains(&Call::Merge {
+        branch: "c1".to_string(),
+        policy: ConflictPolicy::PreserveConflict,
+    }));
+    assert!(!ran_on_merged(&backend));
 }
 
 // ── Root guard ───────────────────────────────────────────────────────────────

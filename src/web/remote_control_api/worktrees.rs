@@ -27,12 +27,36 @@ use crate::worktree_ops::service::{
     ExpectedTarget, WorktreeFacts, WorktreeOpError, WorktreeService, RECOVERY_LOCAL_OR_TUI,
 };
 
-use super::dto::{new_hex_id, ErrorCode};
+use super::dto::{
+    new_hex_id, CommandResult, ErrorCode, MergeAbortEvidence, MergeAbortOutcome, MergeAbortResult,
+};
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 6] =
-    ["list", "detail", "create", "delete", "merge", "session"];
+pub const WORKTREE_OPERATIONS: [&str; 7] = [
+    "list",
+    "detail",
+    "create",
+    "delete",
+    "merge",
+    "merge_abort",
+    "session",
+];
+
+/// Command the `merge_abort` operation is submitted as.
+pub const MERGE_ABORT_COMMAND: &str = "merge_worktree_abort_on_conflict";
+
+/// The three repository facts a confirmed restoration requires.
+pub const MERGE_ABORT_RESTORE_VERIFICATION: [&str; 3] =
+    ["head_equals_premerge", "no_merge_head", "root_clean"];
+
+/// Every stable reason an abort-on-conflict merge can settle with besides `merged`.
+pub const MERGE_ABORT_REASONS: [&str; 4] = [
+    "predicted_conflict",
+    "conflict_aborted",
+    "abort_failed",
+    "restore_unknown",
+];
 
 // ============================================================================
 // Opaque process-local identity
@@ -370,17 +394,58 @@ pub struct WorktreeResponse {
     pub worktree: WorktreeResource,
 }
 
+/// Whether the abort-on-conflict merge is served, and what it verifies.
+///
+/// `Default` is the *unavailable* answer, which is what `#[serde(default)]`
+/// decodes an older owner's omission as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortCapability {
+    /// True when `merge_worktree_abort_on_conflict` is accepted.
+    pub available: bool,
+    /// Command type the operation is submitted as.
+    pub command: String,
+    /// True when a conflict the fresh inspection predicts is refused before
+    /// any Git mutation.
+    pub predicted_conflict_refused: bool,
+    /// Repository facts a `confirmed` restoration requires, all of them.
+    pub restore_verification: Vec<String>,
+    /// Every stable non-success settlement reason.
+    pub reasons: Vec<String>,
+}
+
+impl MergeAbortCapability {
+    /// The capability this build serves.
+    pub fn served() -> Self {
+        Self {
+            available: true,
+            command: MERGE_ABORT_COMMAND.to_string(),
+            predicted_conflict_refused: true,
+            restore_verification: MERGE_ABORT_RESTORE_VERIFICATION
+                .iter()
+                .map(|v| v.to_string())
+                .collect(),
+            reasons: MERGE_ABORT_REASONS.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+}
+
 /// Worktree section of `GET /api/v2/capabilities`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorktreeCapabilities {
     /// Advertised operations. Nothing outside this list is reachable.
     pub operations: Vec<String>,
-    /// How a merge conflict is recovered from. Always `local_or_tui_required`.
+    /// How a `merge_worktree` conflict is recovered from. Always `local_or_tui_required`.
     pub merge_conflict_recovery: String,
-    /// True when a conflicting merge leaves the intermediate Git state in place.
+    /// True when a conflicting `merge_worktree` leaves the intermediate Git state in place; the separately advertised `merge_abort` command aborts instead.
     pub merge_conflict_preserves_state: bool,
     /// True when deletion always runs managed teardown with no bypass.
     pub delete_requires_teardown: bool,
+    /// The explicit abort-on-conflict merge.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field means "unavailable".
+    #[serde(default)]
+    pub merge_abort: MergeAbortCapability,
 }
 
 impl Default for WorktreeCapabilities {
@@ -390,6 +455,7 @@ impl Default for WorktreeCapabilities {
             merge_conflict_recovery: RECOVERY_LOCAL_OR_TUI.to_string(),
             merge_conflict_preserves_state: true,
             delete_requires_teardown: true,
+            merge_abort: MergeAbortCapability::served(),
         }
     }
 }
@@ -409,6 +475,12 @@ pub trait WorktreeOperations: Send + Sync {
     async fn delete(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure>;
     /// Merge a worktree addressed by its opaque ID into base.
     async fn merge(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure>;
+    /// Merge a worktree into base, refusing a predicted conflict and aborting
+    /// a real one with verified restoration.
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure>;
 }
 
 /// A complete worktree observation plus the repository it belongs to.
@@ -444,6 +516,12 @@ impl WorktreeOperations for UnboundWorktreeOperations {
     async fn merge(&self, _worktree_id: &str) -> Result<ExecutionSummary, CommandFailure> {
         Err(unbound())
     }
+    async fn merge_abort_on_conflict(
+        &self,
+        _worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        Err(unbound())
+    }
 }
 
 /// Map a shared-service refusal onto a v2 error code.
@@ -462,9 +540,57 @@ pub fn map_worktree_error(error: &WorktreeOpError) -> CommandFailure {
         }
         WorktreeOpError::RootBusy(_) => ErrorCode::RootBusy,
         WorktreeOpError::MergeConflict { .. } => ErrorCode::MergeConflict,
+        WorktreeOpError::PredictedConflict { .. } => ErrorCode::MergeConflictPredicted,
+        // Only a confirmed restoration is `merge_conflict_aborted`. A failed or
+        // unreadable verification is never reported as a successful abort.
+        WorktreeOpError::MergeConflictAborted { abort, .. } => match abort.restored {
+            crate::vcs::git::commands::Restoration::Confirmed => ErrorCode::MergeConflictAborted,
+            crate::vcs::git::commands::Restoration::Failed
+            | crate::vcs::git::commands::Restoration::Unknown => ErrorCode::MergeAbortFailed,
+        },
         WorktreeOpError::Internal(_) => ErrorCode::InternalError,
     };
     CommandFailure::new(code, error.to_string())
+}
+
+/// Typed `merge_abort` evidence for a refusal, when the refusal has any.
+///
+/// `None` for refusals before eligibility settled (root busy, not found,
+/// ineligible): those carry no merge-abort facts to report.
+pub fn merge_abort_failure_result(
+    worktree_id: &str,
+    branch: &str,
+    error: &WorktreeOpError,
+) -> Option<MergeAbortResult> {
+    use crate::vcs::git::commands::Restoration;
+    match error {
+        WorktreeOpError::PredictedConflict { files } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::PredictedConflict,
+            premerge_head: None,
+            conflict_files: files.clone(),
+            abort: None,
+            recovery: None,
+        }),
+        WorktreeOpError::MergeConflictAborted { files, abort } => {
+            let confirmed = abort.restored == Restoration::Confirmed;
+            Some(MergeAbortResult {
+                worktree_id: worktree_id.to_string(),
+                branch: branch.to_string(),
+                outcome: if confirmed {
+                    MergeAbortOutcome::ConflictAborted
+                } else {
+                    MergeAbortOutcome::AbortFailed
+                },
+                premerge_head: Some(abort.premerge_head.clone()),
+                conflict_files: files.clone(),
+                abort: Some(MergeAbortEvidence::from_report(abort)),
+                recovery: (!confirmed).then(|| RECOVERY_LOCAL_OR_TUI.to_string()),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Production port: the shared operation service plus this process's ID registry.
@@ -646,5 +772,51 @@ impl WorktreeOperations for RemoteWorktreeOperations {
 
         let _ = self.observe().await;
         Ok(ExecutionSummary::changed(outcome.detail))
+    }
+
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let result = self
+            .service
+            .merge_worktree(&key.path, ConflictPolicy::AbortOnConflict)
+            .await;
+
+        // Refresh after every outcome, so `root_busy` and conflict facts a
+        // failed abort left behind are what the next read reports.
+        let refreshed = self.observe().await.ok();
+        match result {
+            Ok(outcome) => Ok(
+                ExecutionSummary::changed(outcome.detail.clone()).with_result(
+                    CommandResult::MergeAbort(Box::new(MergeAbortResult {
+                        worktree_id: worktree_id.to_string(),
+                        branch: outcome.branch,
+                        outcome: MergeAbortOutcome::Merged,
+                        premerge_head: None,
+                        conflict_files: Vec::new(),
+                        abort: None,
+                        recovery: None,
+                    })),
+                ),
+            ),
+            Err(error) => {
+                let branch = refreshed
+                    .as_ref()
+                    .and_then(|(_, facts)| facts.iter().find(|f| f.path == key.path))
+                    .map(|f| f.branch.clone())
+                    .unwrap_or_default();
+                let failure = map_worktree_error(&error);
+                Err(
+                    match merge_abort_failure_result(worktree_id, &branch, &error) {
+                        Some(result) => {
+                            failure.with_result(CommandResult::MergeAbort(Box::new(result)))
+                        }
+                        None => failure,
+                    },
+                )
+            }
+        }
     }
 }

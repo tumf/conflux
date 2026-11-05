@@ -495,6 +495,20 @@ impl WorktreeOperations for RemoteControlRuntime {
             None => UnboundWorktreeOperations.merge(worktree_id).await,
         }
     }
+
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.merge_abort_on_conflict(worktree_id).await,
+            None => {
+                UnboundWorktreeOperations
+                    .merge_abort_on_conflict(worktree_id)
+                    .await
+            }
+        }
+    }
 }
 
 /// Shared state for the v2 router.

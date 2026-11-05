@@ -210,6 +210,8 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::ChangeActivity,
             crate::web::remote_control_api::dto::ChangeBlocker,
             crate::web::remote_control_api::dto::ChangeTiming,
+            crate::web::remote_control_api::dto::NetActiveTiming,
+            crate::web::remote_control_api::dto::RunClock,
             crate::web::remote_control_api::dto::ChangeWorktree,
             crate::web::remote_control_api::dto::ErrorCode,
             // Execution observability: the closed vocabularies and the resource
@@ -286,6 +288,13 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::SnapshotTotals,
             crate::web::remote_control_api::dto::StateResponse,
             crate::web::remote_control_api::dto::TransportDescriptor,
+            // Abort-on-conflict merge: a separate command whose result reports
+            // restoration verified from the repository, never assumed.
+            crate::web::remote_control_api::dto::MergeAbortEvidence,
+            crate::web::remote_control_api::dto::MergeAbortOutcome,
+            crate::web::remote_control_api::dto::MergeAbortRestoration,
+            crate::web::remote_control_api::dto::MergeAbortResult,
+            crate::web::remote_control_api::worktrees::MergeAbortCapability,
             crate::web::remote_control_api::worktrees::WorktreeCapabilities,
             crate::web::remote_control_api::worktrees::WorktreeConflict,
             crate::web::remote_control_api::worktrees::WorktreeEligibility,

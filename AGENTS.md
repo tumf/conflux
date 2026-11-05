@@ -545,6 +545,55 @@ any of it.
 - An older owner omits `capabilities.worktree_sessions` (decode as unavailable)
   and refuses the three commands as `validation_failed` before any effect.
 
+### Progress and timing facts
+
+`/api/v2/state` publishes three presentation-only facts, all process-local:
+nothing persists them, a restarted owner reports `false`/zero/empty, and no
+scheduling, resume, acceptance, or archive decision reads them.
+
+- `changes[].archive_complete` — the reducer's archive record, read in the same
+  hold as `display_status` and distinct from it. A post-archive row truthfully
+  shows `resolving`, `resolve pending`, `merge wait`, `merged`, or `pushed`; a
+  fresh-process resolve retry is `resolving` with `archive_complete: false`.
+  Never infer archive completion from the status, and never read it as merge or
+  push success.
+- `changes[].timing` stays *per run* (`elapsed_ms` is one finished run).
+  `changes[].net_active` is *cumulative*: `accumulated_ms` of closed active
+  intervals plus the open one from `active_since`, through the same shared
+  clock as the TUI row. It opens on a transition into an active status, closes
+  on any other status or on process `Stopped`, and never resets while the owner
+  runs.
+- `run_clock` (`started_at`, `ended_at`, `elapsed_ms`) is the TUI `Elapsed`
+  line, unchanged: opened by an accepted Start while the owner is not running;
+  left open by a persistent-idle park, persistent-idle re-admission,
+  `ResolveReserved`, and a fatal process error; frozen by every `Stopped`, every
+  `AllCompleted`, and a resolve settlement that leaves nothing processing; and
+  re-frozen at the later instant by a repeated terminal event.
+
+None of them is a live counter, so time passing never advances
+`state_revision`: compute "running for" as `accumulated_ms + (now -
+active_since)` and "run elapsed" as `now - started_at` while `ended_at` is
+`null`. An older owner omits all three; that decodes as `None` — "unpublished" —
+never as `false` or zero, and every `cflx client` verb keeps working against it.
+
+### Merging a worktree over `/api/v2`
+
+`merge_worktree` and `merge_worktree_abort_on_conflict` are separate commands
+on purpose. `merge_worktree` preserves a conflict (`merge_conflict`,
+`local_or_tui_required`, `MERGE_HEAD` retained, later mutations `root_busy`),
+and `merge_conflict_preserves_state: true` describes it alone. The abort
+variant refuses a predicted conflict as `merge_conflict_predicted` before any
+Git mutation, and aborts a real one once, then verifies restoration from the
+repository: `HEAD` equals `premerge_head`, no `MERGE_HEAD`, and a clean root.
+Only all three passing is `merge_conflict_aborted` (`restored: confirmed`); a
+failed or unreadable check is `merge_abort_failed` (`restored: failed` or
+`unknown`, `recovery: local_or_tui_required`), and the root stays `root_busy`
+while `MERGE_HEAD` remains. Read the typed `merge_abort` result, never the
+prose, and never treat an abort attempt as a restoration. Nothing retries the
+abort or compensates — not the owner and not a relaying server. An older
+owner omits `capabilities.worktrees.merge_abort` (decoded as unavailable) and
+refuses the command with `validation_failed`.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on

@@ -133,6 +133,11 @@ impl AppState {
     /// "Active" means any change is still in a processing queue status:
     /// Queued, Blocked, Applying, Accepting, Archiving, Resolving, or ResolveWait.
     pub(crate) fn try_transition_to_select(&mut self) {
+        self.try_transition_to_select_at(std::time::Instant::now());
+    }
+
+    /// [`AppState::try_transition_to_select`] at an injected instant.
+    pub(crate) fn try_transition_to_select_at(&mut self, now: std::time::Instant) {
         if !matches!(self.execution_mode, AppExecutionMode::Running) {
             return;
         }
@@ -155,9 +160,7 @@ impl AppState {
             self.execution_mode = AppExecutionMode::Select;
             self.current_change = None;
             self.stop_mode = StopMode::None;
-            if let Some(started) = self.orchestration_started_at {
-                self.orchestration_elapsed = Some(started.elapsed());
-            }
+            self.freeze_run_elapsed_at(now);
             self.add_log(LogEntry::success("All changes processed successfully"));
         }
     }
@@ -177,14 +180,17 @@ impl AppState {
     /// frontend already applied the stop) still reconciles mode state, but must
     /// not append a duplicate terminal message.
     pub(crate) fn handle_stopped(&mut self) {
+        self.handle_stopped_at(std::time::Instant::now());
+    }
+
+    /// [`AppState::handle_stopped`] at an injected instant.
+    pub(crate) fn handle_stopped_at(&mut self, now: std::time::Instant) {
         let already_stopped = matches!(self.execution_mode, AppExecutionMode::Stopped);
         self.reset_analysis_log_dedupe();
         self.execution_mode = AppExecutionMode::Stopped;
         self.current_change = None;
         self.stop_mode = StopMode::None;
-        if let Some(started) = self.orchestration_started_at {
-            self.orchestration_elapsed = Some(started.elapsed());
-        }
+        self.freeze_run_elapsed_at(now);
 
         // Close the active interval of every run that was still timing, through
         // the same centralized idempotent pause a status transition uses. The
@@ -195,7 +201,7 @@ impl AppState {
         // synchronization close the interval exactly once between them, in
         // either order.
         for change in &mut self.changes {
-            change.pause_active_interval();
+            change.pause_active_interval_at(now);
         }
         if !already_stopped {
             self.add_log(LogEntry::warn("Processing stopped"));

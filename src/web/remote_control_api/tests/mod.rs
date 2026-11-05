@@ -13,8 +13,10 @@ mod event_ownership_tests;
 mod execution_mark_event_tests;
 mod execution_status_tests;
 mod force_stop_change_tests;
+mod merge_abort_tests;
 mod operator_snapshot_tests;
 mod parallel_control_tests;
+mod progress_timing_tests;
 mod projection_tests;
 mod proposal_refresh_tests;
 mod read_tests;
@@ -118,6 +120,9 @@ impl RemoteControlExecutor for RecordingExecutor {
                 CommandSpec::MergeWorktree { target, .. } => {
                     return port.merge(&target.worktree_id).await
                 }
+                CommandSpec::MergeWorktreeAbortOnConflict { target, .. } => {
+                    return port.merge_abort_on_conflict(&target.worktree_id).await
+                }
                 _ => {}
             }
         }
@@ -216,6 +221,7 @@ pub(crate) fn snapshot_with(change_id: &str, display_status: &str) -> InstanceSn
             in_progress: 1,
             pending: 0,
         },
+        run_clock: None,
     }
 }
 
@@ -248,6 +254,8 @@ pub(crate) fn change_resource(change_id: &str, display_status: &str) -> ChangeRe
         latest_activity: None,
         worktree: None,
         acceptance_provenance: None,
+        archive_complete: None,
+        net_active: None,
     }
 }
 

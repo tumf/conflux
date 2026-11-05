@@ -591,6 +591,8 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                 latest_activity: change.latest_activity.clone(),
                 worktree: change.worktree.clone(),
                 acceptance_provenance: change.acceptance_provenance.clone(),
+                archive_complete: Some(change.archive_complete),
+                net_active: Some(change.net_active.clone()),
             }
         })
         .collect();
@@ -608,6 +610,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
             pending: source.pending_changes,
         },
         changes,
+        run_clock: Some(source.run_clock.clone()),
     }
 }
 

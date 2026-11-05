@@ -41,9 +41,10 @@ use conflux::web::remote_control_api::dto::{
     ChangeActivity, ChangeBlocker, ChangeExecutionState, ChangeExecutionStatus, ChangeResource,
     ChangeTiming, ChangeWorktree, CommandRecord, CommandResult, CommandState, ErrorCode,
     EventCategory, EventEnvelope, ExecutionPhase, ExecutionStatusResponse, InstanceSnapshot,
-    LatestLogProjection, ParallelEligibility, ParallelRuntimeState, ProcessExecutionStatus,
-    QueueIntent, SnapshotTotals, StateResponse, ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES,
-    ALL_EXECUTION_PHASES, ALL_TERMINAL_MODES, SUPPORTED_COMMANDS,
+    LatestLogProjection, NetActiveTiming, ParallelEligibility, ParallelRuntimeState,
+    ProcessExecutionStatus, QueueIntent, RunClock, SnapshotTotals, StateResponse,
+    ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES, ALL_EXECUTION_PHASES, ALL_TERMINAL_MODES,
+    SUPPORTED_COMMANDS,
 };
 use conflux::web::remote_control_api::worktrees::{
     WorktreeConflict, WorktreeEligibility, WorktreeResource, WorktreeResponse,
@@ -1094,6 +1095,189 @@ fn force_stop_change_contract_is_published_end_to_end() {
     }
 }
 
+/// Everything a client of the abort-on-conflict merge branches on.
+fn merge_abort_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let spec = schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["type"]["enum"][0] == "merge_worktree_abort_on_conflict"
+            })
+        })
+        .cloned();
+    match spec {
+        None => errors.push("the merge_worktree_abort_on_conflict command is not published".into()),
+        Some(spec) => {
+            let properties: BTreeSet<&str> = spec["properties"]
+                .as_object()
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if properties != BTreeSet::from(["type", "target", "params"]) {
+                errors.push(format!(
+                    "merge_worktree_abort_on_conflict must accept only target and params: {properties:?}"
+                ));
+            }
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants
+                .iter()
+                .any(|variant| variant.to_string().contains("\"merge_abort\""))
+        });
+    if !result_published {
+        errors.push("the merge_abort result kind is not published".into());
+    }
+    let result = &schemas(doc)["MergeAbortResult"];
+    let required: BTreeSet<&str> = result["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for member in [
+        "worktree_id",
+        "branch",
+        "outcome",
+        "premerge_head",
+        "conflict_files",
+        "abort",
+        "recovery",
+    ] {
+        if !required.contains(member) {
+            errors.push(format!("MergeAbortResult must require `{member}`"));
+        }
+    }
+    let evidence: BTreeSet<&str> = schemas(doc)["MergeAbortEvidence"]["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for member in [
+        "exit_ok",
+        "head_after",
+        "merge_head_present",
+        "clean_after",
+        "restored",
+        "detail",
+    ] {
+        if !evidence.contains(member) {
+            errors.push(format!("MergeAbortEvidence must require `{member}`"));
+        }
+    }
+    let restored = published_enum(doc, "MergeAbortRestoration");
+    if restored != BTreeSet::from(["confirmed", "failed", "unknown"].map(String::from)) {
+        errors.push(format!("MergeAbortRestoration vocabulary: {restored:?}"));
+    }
+
+    let codes = published_enum(doc, "ErrorCode");
+    for code in [
+        "merge_conflict",
+        "merge_conflict_predicted",
+        "merge_conflict_aborted",
+        "merge_abort_failed",
+    ] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    let worktrees = &schemas(doc)["WorktreeCapabilities"];
+    if worktrees["properties"]["merge_abort"].is_null() {
+        errors.push("capabilities.worktrees.merge_abort is not published".into());
+    }
+    let worktree_required: BTreeSet<&str> = worktrees["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !worktree_required.contains("merge_conflict_preserves_state") {
+        errors.push("merge_conflict_preserves_state must stay required".into());
+    }
+    if worktree_required.contains("merge_abort") {
+        errors.push("merge_abort must decode as absent from an older owner".into());
+    }
+    errors
+}
+
+#[test]
+fn remote_merge_abort_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        MergeAbortEvidence, MergeAbortOutcome, MergeAbortRestoration, MergeAbortResult,
+    };
+    use conflux::web::remote_control_api::worktrees::WorktreeCapabilities;
+
+    let doc = generated();
+    assert_eq!(merge_abort_contract_errors(&doc), Vec::<String>::new());
+
+    // What the server serializes is what the schema describes.
+    let record = CommandRecord {
+        command_type: "merge_worktree_abort_on_conflict".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::MergeAbortFailed),
+        result: Some(CommandResult::MergeAbort(Box::new(MergeAbortResult {
+            worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+            branch: "alpha".to_string(),
+            outcome: MergeAbortOutcome::AbortFailed,
+            premerge_head: Some("a".repeat(40)),
+            conflict_files: vec!["src/lib.rs".to_string()],
+            abort: Some(MergeAbortEvidence {
+                exit_ok: false,
+                head_after: Some("a".repeat(40)),
+                merge_head_present: Some(true),
+                clean_after: None,
+                restored: MergeAbortRestoration::Unknown,
+                detail: "fatal: injected".to_string(),
+            }),
+            recovery: Some("local_or_tui_required".to_string()),
+        }))),
+        ..command_record()
+    };
+    let capabilities = WorktreeCapabilities::default();
+    assert!(capabilities.merge_conflict_preserves_state);
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("WorktreeCapabilities", to_value(&capabilities)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        to_value(&capabilities)["merge_conflict_preserves_state"],
+        true
+    );
+    assert_eq!(to_value(&record)["result"]["kind"], "merge_abort");
+
+    // Negative controls: the predicate notices a dropped result kind and a
+    // dropped error code.
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("\"merge_abort\""));
+    assert_ne!(without_kind, doc);
+    assert!(merge_abort_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("merge_abort result kind")));
+
+    let mut without_code = doc.clone();
+    without_code["components"]["schemas"]["ErrorCode"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|code| code != "merge_abort_failed");
+    assert_ne!(without_code, doc);
+    assert!(merge_abort_contract_errors(&without_code)
+        .iter()
+        .any(|error| error.contains("merge_abort_failed")));
+}
+
 /// The server always publishes refresh eligibility even though the client
 /// decoder accepts its absence from owners built before refresh existed.
 #[test]
@@ -1126,6 +1310,178 @@ fn refresh_eligibility_remains_required_and_non_null_in_published_schema() {
         "refresh eligibility must not admit a null type"
     );
     assert!(property.get("anyOf").is_none() && property.get("oneOf").is_none());
+}
+
+/// Archive completion and both execution clocks, as a client meets them.
+///
+/// Each top-level member is required and non-null: this server always writes
+/// it, and only an older owner omits it. The nested members are required too —
+/// always serialized — with the instants and the frozen duration nullable.
+/// `ChangeTiming` keeps exactly its three per-run members.
+fn progress_timing_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let defs = schemas(doc);
+
+    for (schema, member, reference) in [
+        ("ChangeResource", "archive_complete", None),
+        ("ChangeResource", "net_active", Some("NetActiveTiming")),
+        ("InstanceSnapshot", "run_clock", Some("RunClock")),
+    ] {
+        let published = &defs[schema];
+        let required = published["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|name| name == member));
+        if !required {
+            errors.push(format!("{schema}.{member} must be published as required"));
+        }
+        let property = &published["properties"][member];
+        if property.is_null() {
+            errors.push(format!("{schema}.{member} is not published"));
+            continue;
+        }
+        let admits_null = property.get("nullable").is_some_and(|n| n == true)
+            || property["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "null"))
+            || property.get("anyOf").is_some()
+            || property.get("oneOf").is_some();
+        if admits_null {
+            errors.push(format!("{schema}.{member} must not be nullable"));
+        }
+        match reference {
+            Some(target) => {
+                if property["$ref"] != format!("#/components/schemas/{target}") {
+                    errors.push(format!("{schema}.{member} must reference {target}"));
+                }
+            }
+            None => {
+                if property["type"] != "boolean" {
+                    errors.push(format!("{schema}.{member} must be a boolean"));
+                }
+            }
+        }
+    }
+
+    for (schema, members, nullable) in [
+        (
+            "NetActiveTiming",
+            &["accumulated_ms", "active_since", "has_history"][..],
+            &["active_since"][..],
+        ),
+        (
+            "RunClock",
+            &["started_at", "ended_at", "elapsed_ms"][..],
+            &["started_at", "ended_at", "elapsed_ms"][..],
+        ),
+    ] {
+        let published = &defs[schema];
+        if published.is_null() {
+            errors.push(format!("{schema} is not published"));
+            continue;
+        }
+        let required: BTreeSet<&str> = published["required"]
+            .as_array()
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let properties: BTreeSet<&str> = published["properties"]
+            .as_object()
+            .map(|props| props.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let expected: BTreeSet<&str> = members.iter().copied().collect();
+        if properties != expected || required != expected {
+            errors.push(format!(
+                "{schema} must publish exactly {expected:?} as required (properties {properties:?}, required {required:?})"
+            ));
+        }
+        for member in members {
+            let admits_null = published["properties"][member]["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "null"));
+            if admits_null != nullable.contains(member) {
+                errors.push(format!(
+                    "{schema}.{member} nullability must be {}",
+                    nullable.contains(member)
+                ));
+            }
+        }
+    }
+
+    let timing = &defs["ChangeTiming"];
+    let timing_members: BTreeSet<&str> = timing["properties"]
+        .as_object()
+        .map(|props| props.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if timing_members != BTreeSet::from(["started_at", "completed_at", "elapsed_ms"]) {
+        errors.push(format!("ChangeTiming members changed: {timing_members:?}"));
+    }
+    if !timing["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("not cumulative"))
+    {
+        errors.push("ChangeTiming must say it is per run and not cumulative".to_string());
+    }
+    errors
+}
+
+#[test]
+fn remote_progress_timing_members_are_published_required_and_non_null() {
+    let doc = generated();
+    assert_eq!(progress_timing_errors(&doc), Vec::<String>::new());
+
+    // The DTO values constructed field by field validate against the document.
+    let payload = to_value(&state_response());
+    assert_eq!(payload["snapshot"]["changes"][0]["archive_complete"], true);
+    assert!(payload["snapshot"]["changes"][0]["net_active"].is_object());
+    assert!(payload["snapshot"]["run_clock"].is_object());
+    let mut errors = Vec::new();
+    validate(
+        &payload,
+        &schemas(&doc)["StateResponse"],
+        schemas(&doc),
+        "StateResponse",
+        &mut errors,
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+/// Negative control: a document that drops `net_active` fails both the
+/// publication check and payload validation, so the positive case is not
+/// passing vacuously.
+#[test]
+fn remote_progress_timing_omitting_a_member_fails_the_contract() {
+    let mut doc = generated();
+    let change = doc["components"]["schemas"]["ChangeResource"]
+        .as_object_mut()
+        .expect("ChangeResource schema");
+    change["required"]
+        .as_array_mut()
+        .expect("required list")
+        .retain(|member| member != "net_active");
+    change["properties"]
+        .as_object_mut()
+        .expect("properties")
+        .remove("net_active")
+        .expect("net_active was published");
+
+    let errors = progress_timing_errors(&doc);
+    assert!(
+        errors.iter().any(|error| error.contains("net_active")),
+        "{errors:?}"
+    );
+    let mut payload_errors = Vec::new();
+    validate(
+        &to_value(&state_response()),
+        &schemas(&doc)["StateResponse"],
+        schemas(&doc),
+        "StateResponse",
+        &mut payload_errors,
+    );
+    assert!(
+        payload_errors
+            .iter()
+            .any(|error| error.contains("`net_active` is serialized but unpublished")),
+        "{payload_errors:?}"
+    );
 }
 
 /// The retired Apply-limit token stays published, and stays a token.
@@ -1635,6 +1991,11 @@ fn state_response() -> StateResponse {
                 in_progress: 1,
                 pending: 0,
             },
+            run_clock: Some(RunClock {
+                started_at: Some("2026-08-04T00:00:00Z".to_string()),
+                ended_at: Some("2026-08-04T00:15:03Z".to_string()),
+                elapsed_ms: Some(903_000),
+            }),
         },
     }
 }
@@ -1726,6 +2087,12 @@ fn change_resource() -> ChangeResource {
                     ),
             },
         ),
+        archive_complete: Some(true),
+        net_active: Some(NetActiveTiming {
+            accumulated_ms: 125_000,
+            active_since: Some("2026-08-04T00:14:45.123Z".to_string()),
+            has_history: true,
+        }),
     }
 }
 

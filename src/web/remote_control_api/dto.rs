@@ -81,6 +81,17 @@ pub enum ErrorCode {
     WorktreeDirtyUnknown,
     /// The base merge conflicted and its intermediate state was preserved.
     MergeConflict,
+    /// `merge_worktree_abort_on_conflict` refused a conflict the fresh
+    /// targeted inspection predicted, before any Git mutation.
+    MergeConflictPredicted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict, ran
+    /// `git merge --abort`, and proved the root restored: `HEAD` is the
+    /// pre-merge commit, no `MERGE_HEAD` exists, and the root is clean.
+    MergeConflictAborted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict and restoration
+    /// was not proven: the abort failed or a verification could not be read.
+    /// Recovery is local or TUI; nothing claims state was preserved on purpose.
+    MergeAbortFailed,
     /// The addressed execution exists, but the presented instance/change
     /// binding is not the one it belongs to.
     ///
@@ -134,6 +145,9 @@ impl ErrorCode {
             | Self::WorktreeDirty
             | Self::WorktreeDirtyUnknown
             | Self::MergeConflict
+            | Self::MergeConflictPredicted
+            | Self::MergeConflictAborted
+            | Self::MergeAbortFailed
             | Self::ExecutionBindingMismatch
             | Self::RefreshRefused
             | Self::WorktreeSessionUnavailable
@@ -165,6 +179,9 @@ impl ErrorCode {
             Self::WorktreeDirty => "worktree_dirty",
             Self::WorktreeDirtyUnknown => "worktree_dirty_unknown",
             Self::MergeConflict => "merge_conflict",
+            Self::MergeConflictPredicted => "merge_conflict_predicted",
+            Self::MergeConflictAborted => "merge_conflict_aborted",
+            Self::MergeAbortFailed => "merge_abort_failed",
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
@@ -177,7 +194,7 @@ impl ErrorCode {
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 26] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -194,6 +211,9 @@ pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
     ErrorCode::WorktreeDirty,
     ErrorCode::WorktreeDirtyUnknown,
     ErrorCode::MergeConflict,
+    ErrorCode::MergeConflictPredicted,
+    ErrorCode::MergeConflictAborted,
+    ErrorCode::MergeAbortFailed,
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
@@ -363,6 +383,19 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Merge a worktree's branch into base, aborting on conflict.
+    ///
+    /// A separate command rather than a parameter on `merge_worktree`, so that
+    /// command's conflict-preserving contract holds for every call of it. A
+    /// predicted conflict is refused before any Git mutation; a real one is
+    /// aborted and the restoration is verified from the repository.
+    MergeWorktreeAbortOnConflict {
+        /// The worktree to merge.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
     /// Refresh one candidate's `proposal.md` from an explicit source commit.
     ///
     /// Takes the two full commit IDs a `refresh-preview` read returned. Exactly
@@ -474,6 +507,7 @@ impl CommandSpec {
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
+            Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
             Self::RefreshProposal { .. } => "refresh_proposal",
             Self::RunWorktreeCommand { .. } => "run_worktree_command",
             Self::CreateSessionWorktree { .. } => "create_session_worktree",
@@ -555,7 +589,9 @@ impl CommandSpec {
             // one change.
             Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
-            Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
+            Self::DeleteWorktree { .. }
+            | Self::MergeWorktree { .. }
+            | Self::MergeWorktreeAbortOnConflict { .. } => None,
             // Sessions are addressed by opaque worktree or session ID, never by change.
             Self::RunWorktreeCommand { .. }
             | Self::CreateSessionWorktree { .. }
@@ -565,7 +601,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 19] = [
+pub const SUPPORTED_COMMANDS: [&str; 20] = [
     "start",
     "stop",
     "cancel_stop",
@@ -582,6 +618,7 @@ pub const SUPPORTED_COMMANDS: [&str; 19] = [
     "delete_worktree",
     "merge_worktree",
     "refresh_proposal",
+    "merge_worktree_abort_on_conflict",
     "run_worktree_command",
     "create_session_worktree",
     "stop_worktree_session",
@@ -1265,6 +1302,9 @@ impl Default for ParallelEligibility {
 /// Only boundary instants are published. A live elapsed counter in the snapshot
 /// would make every projection look changed and advance the revision forever, so
 /// a client derives "running for" from `started_at` itself.
+///
+/// Per-run boundaries of the current or most recent run; `elapsed_ms` is that
+/// run's duration and is not cumulative — see `net_active`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeTiming {
     /// When the current or most recent run started (RFC 3339).
@@ -1272,6 +1312,56 @@ pub struct ChangeTiming {
     /// When it finished (RFC 3339); `null` while it is still running.
     pub completed_at: Option<String>,
     /// Duration of the finished run in milliseconds.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Cumulative net-active execution time of one change in this owner process.
+///
+/// Driven by the same shared clock the TUI row's net execution time uses: an
+/// interval opens on a transition into an active display status (`preparing`,
+/// `applying`, `accepting`, `rejecting`, `archiving`, `resolving`), stays open
+/// across repeated or successive active statuses, and closes exactly once on a
+/// transition to any other status or on process `Stopped`. Closed intervals
+/// accumulate and are never reset while the owner runs; a restarted owner
+/// starts from zero. Unlike `timing`, which is per run, this is cumulative.
+///
+/// No live counter is published: a client derives the current total as
+/// `accumulated_ms + (now - active_since)` while `active_since` is set, so the
+/// snapshot never changes merely because time passed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NetActiveTiming {
+    /// Sum of closed active intervals, in milliseconds.
+    pub accumulated_ms: u64,
+    /// When the open active interval started (RFC 3339); `null` while closed.
+    #[schema(required)]
+    pub active_since: Option<String>,
+    /// Whether this change was ever active in this owner process.
+    pub has_history: bool,
+}
+
+/// Run-level elapsed clock, the projection of the TUI `Elapsed` line.
+///
+/// Opened by an accepted Start while the owner is not running; left open by a
+/// persistent-idle park, persistent-idle re-admission, `ResolveReserved`, and a
+/// fatal process error; frozen by every `Stopped` and every `AllCompleted`
+/// delivery and by a resolve-side settlement that leaves nothing processing; a
+/// repeated terminal delivery re-freezes at the later instant. The value is
+/// retained until the next opening Start. All three members are `null` before
+/// the first Start in this process. Process-local presentation only.
+///
+/// While `ended_at` is `null` a client derives the live value as
+/// `now - started_at`; no server-side counter is ever published.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunClock {
+    /// When the current or most recent run was opened (RFC 3339).
+    #[schema(required)]
+    pub started_at: Option<String>,
+    /// When the run clock was last frozen (RFC 3339); `null` while open.
+    #[schema(required)]
+    pub ended_at: Option<String>,
+    /// Monotonic duration from the open to the latest freeze, in whole
+    /// milliseconds; `null` while open.
+    #[schema(required)]
     pub elapsed_ms: Option<u64>,
 }
 
@@ -1368,6 +1458,29 @@ pub struct ChangeResource {
     #[serde(default)]
     pub acceptance_provenance:
         Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
+    /// Whether the reducer recorded archive completion for this change in this
+    /// owner process.
+    ///
+    /// Read in the same reducer hold as `display_status` and distinct from it:
+    /// stays `true` while the row advances to `resolving`, `resolve pending`,
+    /// `merge wait`, `merged`, or `pushed`, and is `false` for a fresh-process
+    /// resolve retry with no archive on record. Not merge or push success.
+    /// Process-local; never a workflow input.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as `false`. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub archive_complete: Option<bool>,
+    /// Cumulative net-active execution time; see `NetActiveTiming`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as zero. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub net_active: Option<NetActiveTiming>,
 }
 
 /// Aggregate counts over the projected changes.
@@ -1419,6 +1532,13 @@ pub struct InstanceSnapshot {
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
     pub totals: SnapshotTotals,
+    /// Run-level elapsed clock; see `RunClock`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"). This server always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub run_clock: Option<RunClock>,
 }
 
 impl InstanceSnapshot {
@@ -1437,6 +1557,7 @@ impl InstanceSnapshot {
                 in_progress: 0,
                 pending: 0,
             },
+            run_clock: Some(RunClock::default()),
         }
     }
 }
@@ -2220,6 +2341,13 @@ pub enum CommandResult {
         /// Session state after settlement.
         state_after: String,
     },
+    /// Settlement evidence for `merge_worktree_abort_on_conflict`.
+    ///
+    /// Present on success and on every refusal after eligibility
+    /// (`merge_conflict_predicted`, `merge_conflict_aborted`,
+    /// `merge_abort_failed`), because a client must be able to tell a proven
+    /// restoration from an unproven one without parsing prose.
+    MergeAbort(Box<MergeAbortResult>),
 }
 
 /// What a session launch (or a refused provisioning) produced.
@@ -2349,6 +2477,105 @@ pub struct WorktreeSessionResponse {
     pub state_revision: u64,
     /// The requested session.
     pub session: WorktreeSessionResource,
+}
+
+/// How an abort-on-conflict merge settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortOutcome {
+    /// The merge completed.
+    Merged,
+    /// Refused before any Git mutation.
+    PredictedConflict,
+    /// Conflicted, aborted, and restoration was confirmed.
+    ConflictAborted,
+    /// Conflicted, and restoration was not confirmed.
+    AbortFailed,
+}
+
+/// How far the root was proven restored after `git merge --abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortRestoration {
+    /// `HEAD` is the pre-merge commit, no `MERGE_HEAD`, and the root is clean.
+    Confirmed,
+    /// Every verification was read and at least one failed.
+    Failed,
+    /// At least one verification could not be read.
+    Unknown,
+}
+
+impl From<crate::vcs::git::commands::Restoration> for MergeAbortRestoration {
+    fn from(value: crate::vcs::git::commands::Restoration) -> Self {
+        use crate::vcs::git::commands::Restoration;
+        match value {
+            Restoration::Confirmed => Self::Confirmed,
+            Restoration::Failed => Self::Failed,
+            Restoration::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// What `git merge --abort` did, re-read from the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortEvidence {
+    /// Exit status of `git merge --abort`.
+    pub exit_ok: bool,
+    /// `HEAD` after the abort; `null` when it could not be read.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub clean_after: Option<bool>,
+    /// The verdict derived from the facts above, never from the attempt alone.
+    pub restored: MergeAbortRestoration,
+    /// Bounded, sanitized tail of the abort's own output.
+    pub detail: String,
+}
+
+impl MergeAbortEvidence {
+    /// Project the VCS report onto the wire.
+    pub fn from_report(report: &crate::vcs::git::commands::AbortReport) -> Self {
+        Self {
+            exit_ok: report.exit_ok,
+            head_after: report.head_after.clone(),
+            merge_head_present: report.merge_head_present,
+            clean_after: report.clean_after,
+            restored: report.restored.into(),
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// The settled body of a `merge_worktree_abort_on_conflict` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortResult {
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// The merged branch; empty when it could not be observed.
+    pub branch: String,
+    /// How the command settled.
+    pub outcome: MergeAbortOutcome,
+    /// `HEAD` before `git merge` ran; `null` when no merge ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub premerge_head: Option<String>,
+    /// Repository-relative conflicting paths; empty after a clean merge.
+    pub conflict_files: Vec<String>,
+    /// The verified abort report; `null` when no abort ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub abort: Option<MergeAbortEvidence>,
+    /// `local_or_tui_required` when restoration was not confirmed; else `null`.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub recovery: Option<String>,
 }
 
 /// What a candidate proposal refresh actually did, re-read from Git.

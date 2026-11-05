@@ -25,7 +25,7 @@ fn closed_command_set_matches_the_advertised_list() {
             "create_worktree" => {
                 r#"{"type":"create_worktree","target":{"change_id":"a"},"params":{}}"#.to_string()
             }
-            "delete_worktree" | "merge_worktree" => {
+            "delete_worktree" | "merge_worktree" | "merge_worktree_abort_on_conflict" => {
                 format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
             }
             "run_worktree_command" => format!(
@@ -306,6 +306,8 @@ mod legacy_owner_shape {
             latest_activity: None,
             worktree: None,
             acceptance_provenance: None,
+            archive_complete: None,
+            net_active: None,
         };
         serde_json::to_value(row).expect("a projected row serializes")
     }
@@ -437,6 +439,60 @@ mod legacy_owner_shape {
         // The sibling additive surfaces decode the same way, by the same rule.
         assert!(!capabilities.execution_sinks.available);
         assert!(!capabilities.proposal_subscriptions.available);
+    }
+
+    #[test]
+    fn remote_merge_abort_old_owner_capabilities_decode_as_unavailable() {
+        // An owner that predates the abort-on-conflict merge: five worktree
+        // operations, no `merge_abort` block, no new command.
+        let mut capabilities = legacy_capabilities();
+        let worktrees = capabilities["worktrees"].as_object_mut().unwrap();
+        worktrees
+            .remove("merge_abort")
+            .expect("this build publishes `merge_abort`");
+        worktrees.insert(
+            "operations".to_string(),
+            serde_json::json!(["list", "detail", "create", "delete", "merge"]),
+        );
+
+        let decoded: CapabilitiesResponse = serde_json::from_value(capabilities)
+            .expect("an older owner's capabilities must still decode on this build");
+        assert!(!decoded.worktrees.merge_abort.available);
+        assert!(decoded.worktrees.merge_abort.command.is_empty());
+        assert!(!decoded
+            .commands
+            .iter()
+            .any(|command| command == "merge_worktree_abort_on_conflict"));
+        // The preserving contract reads the same on both owners.
+        assert!(decoded.worktrees.merge_conflict_preserves_state);
+        assert_eq!(
+            decoded.worktrees.merge_conflict_recovery,
+            "local_or_tui_required"
+        );
+
+        // This build always writes the block, available.
+        let current = crate::web::remote_control_api::worktrees::WorktreeCapabilities::default();
+        assert!(current.merge_abort.available);
+        assert_eq!(
+            current.merge_abort.command,
+            "merge_worktree_abort_on_conflict"
+        );
+        assert!(current.merge_abort.predicted_conflict_refused);
+        assert_eq!(
+            current.merge_abort.restore_verification,
+            ["head_equals_premerge", "no_merge_head", "root_clean"]
+        );
+        assert_eq!(
+            current.merge_abort.reasons,
+            [
+                "predicted_conflict",
+                "conflict_aborted",
+                "abort_failed",
+                "restore_unknown"
+            ]
+        );
+        assert!(current.merge_conflict_preserves_state);
+        assert!(current.operations.iter().any(|op| op == "merge_abort"));
     }
 
     #[test]
@@ -612,4 +668,54 @@ fn remote_worktree_session_commands_are_closed() {
         assert_eq!(code.http_status(), StatusCode::CONFLICT);
         assert!(ALL_ERROR_CODES.contains(&code));
     }
+}
+
+/// An owner that predates archive completion and the two clocks serves
+/// `/api/v2/state` without `archive_complete`, `net_active`, and `run_clock`.
+/// Each decodes as `None` — "unpublished" — never as `false` or zero, while a
+/// payload missing a pre-existing required member is still rejected.
+#[test]
+fn remote_progress_timing_old_owner_payload_decodes_as_unpublished() {
+    use crate::web::remote_control_api::dto::StateResponse;
+    use crate::web::remote_control_api::projection::project_snapshot;
+    use crate::web::state::{ChangeStatus, OrchestratorStateSnapshot};
+
+    let mut source = OrchestratorStateSnapshot::from_changes(&[]);
+    source.changes = vec![ChangeStatus {
+        id: "alpha".to_string(),
+        ..Default::default()
+    }];
+    let response = StateResponse {
+        instance_id: "instance-1".to_string(),
+        state_revision: 3,
+        event_sequence: 4,
+        snapshot: project_snapshot(&source),
+    };
+    let mut current = serde_json::to_value(&response).unwrap();
+    assert_eq!(current["snapshot"]["changes"][0]["archive_complete"], false);
+    assert!(current["snapshot"]["changes"][0]["net_active"].is_object());
+    assert!(current["snapshot"]["run_clock"].is_object());
+
+    let snapshot = current["snapshot"].as_object_mut().unwrap();
+    snapshot.remove("run_clock").expect("published");
+    let row = snapshot["changes"][0].as_object_mut().unwrap();
+    row.remove("archive_complete").expect("published");
+    row.remove("net_active").expect("published");
+    let legacy = current;
+
+    let decoded: StateResponse =
+        serde_json::from_value(legacy.clone()).expect("an older owner's state must decode");
+    assert_eq!(decoded.snapshot.run_clock, None);
+    assert_eq!(decoded.snapshot.changes[0].archive_complete, None);
+    assert_eq!(decoded.snapshot.changes[0].net_active, None);
+
+    let mut malformed = legacy;
+    malformed["snapshot"]["changes"][0]["actions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("force_stop_change")
+        .expect("published");
+    let error = serde_json::from_value::<StateResponse>(malformed)
+        .expect_err("a payload missing a pre-existing required member is malformed");
+    assert!(error.to_string().contains("force_stop_change"), "{error}");
 }
