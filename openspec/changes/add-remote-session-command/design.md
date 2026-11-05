@@ -38,12 +38,17 @@
 |---|---|---|
 | `run_worktree_command` | `target.worktree_id`, `params: {}` | launch the configured command in that worktree |
 | `create_session_worktree` | `params: {}` | create `ws-session-*` worktree from base `HEAD`, setup, launch |
-| `stop_worktree_session` | `session_id` | SIGTERM the session's process group, SIGKILL after 5 s, reap |
+| `stop_worktree_session` | `target.session_id`, `params: {}` | cancel through `StreamingChildHandle::terminate` (SIGTERM, SIGKILL after 5 s, verified cleanup, no retry), settle after reap |
+
+`stop_worktree_session` is `{"type": "stop_worktree_session", "target": {"session_id": "<32 hex>"}, "params": {}}`:
+a new `SessionTarget { session_id }` struct with `deny_unknown_fields` and the
+existing `EmptyParams`, the same shape as the worktree commands. There is no
+flat `session_id` member and no `change_id`.
 
 All three carry `deny_unknown_fields`, revision fencing, idempotency identity,
 the application gate, and `command_executor_unbound` on a headless owner.
-Validation refuses a blank `session_id` or a non-32-hex `worktree_id` as
-`validation_failed`.
+Validation refuses a blank or non-32-hex `target.session_id` or
+`target.worktree_id` as `validation_failed`.
 
 ### Availability and eligibility
 
@@ -58,13 +63,22 @@ launch command on an owner where it is false is refused
 |---|---|
 | `worktree_not_found` | the opaque ID is unknown or retired |
 | `worktree_session_busy` (`reason: worktree_busy`) | a session with `state: running` is bound to that worktree path |
-| `worktree_session_busy` (`reason: capacity`) | 4 sessions are already running |
+| `worktree_session_busy` (`reason: capacity`) | 4 running sessions or outstanding reservations already exist (checked before any Git or process effect) |
 | `target_ineligible` (`reason: cwd_invalid`) | `validate_worktree_command_cwd(repo_root, path)` fails |
 | `root_busy` | a managed deletion is in flight for that path (`WorktreeDeleting` presentation is TUI-only; the service root guard is probed instead) |
 
-`create_session_worktree` takes the `WorktreeService` root guard for the
-creation steps (so it is `root_busy` while a merge or deletion runs) and
-releases it before launch. The session worktree is *not* a change worktree:
+`create_session_worktree` reserves its running slot *before* step 1: under
+the same registry lock that enforces `worktree_busy`, the registry counts
+running sessions plus outstanding reservations and refuses
+`worktree_session_busy` (`reason: capacity`) when 4 are already taken, before
+any Git effect. The reservation is released on every refusal (`capacity`
+itself, `worktree_session_unavailable`, `root_busy`, setup failure, invalid
+cwd) and is converted into the running session only at launch; a `capacity`
+refusal therefore creates no worktree, no branch, and no failed record with a
+`worktree_session` result. `run_worktree_command` reserves the same way
+before its cwd validation. `create_session_worktree` then takes the
+`WorktreeService` root guard for the creation steps (so it is `root_busy`
+while a merge or deletion runs) and releases it before launch. The session worktree is *not* a change worktree:
 `change_is_eligible` is not consulted, no change relation is published, and
 periodic inspection treats it as `not_inspected` exactly as a TUI `+` worktree.
 
@@ -84,7 +98,13 @@ implementation calls the same `crate::vcs::git::commands` functions the TUI's
 5. `validate_worktree_command_cwd` (`phase: after_create`)
 6. `run_worktree_setup(repo_root, path)`; on `Err` →
    `worktree_remove_after_setup_failure(repo_root, path)` → refuse
-   `worktree_session_setup_failed` with `cleanup: removed | retained { reason }`
+   `worktree_session_setup_failed` with `cleanup: removed | retained { reason }`.
+   The TUI's cleanup is `worktree_remove_with_options { skip_teardown: true }`
+   (`src/tui/key_handlers.rs:105-117`), which is `git worktree remove --force`
+   with teardown skipped (`src/vcs/git/commands/worktree.rs:649-676`); it does
+   *not* delete the `ws-session-*` branch, and neither does the provisioner.
+   `cleanup.removed: true` states that the worktree directory and registration
+   are gone; the branch is retained exactly as after a TUI `+` setup failure.
 7. `validate_worktree_command_cwd` (`phase: after_setup`)
 8. `validate_worktree_command_cwd` (`phase: before_launch`)
 9. `expand_worktree_command(template, path, repo_root)` → launch
@@ -103,8 +123,14 @@ provisioner.
 ### Launch and supervision
 
 The session runner is the production `AiCommandRunner` clone the TUI uses,
-with the run command scope of the owner process (so owner shutdown closes
-spawn admission). Launch: `execute_streaming_with_retry(&expanded, Some(&path), Some("worktree_session"), None)`.
+bound (`set_run_command_scope`) to a `RunCommandScope` that
+`WorktreeSessionRegistry` creates and owns. There is no owner-process-wide
+scope: existing scopes are per run (`src/parallel_run_service.rs`,
+`src/tui/runner.rs`), so the registry holds its own, and owner shutdown
+calls `scope.shutdown(Duration::from_secs(10))`, which closes spawn admission
+(no further attempt can reach `Command::spawn`), cancels every runner task,
+and returns the `RunCommandScopeCleanup` barrier result. Launch:
+`execute_streaming_with_retry(&expanded, Some(&path), Some("worktree_session"), None)`.
 The returned `StreamingChildHandle` and `Receiver<OutputLine>` are owned by a
 spawned supervisor task per session that:
 
@@ -113,20 +139,36 @@ spawned supervisor task per session that:
   counts `truncated_bytes` for what it dropped; a line is never split;
 - records `attempt` from the runner's retry notifications (one session, many
   attempts; the session ID never changes);
-- on child exit records `exit_code` or `signal`, `finished_at`, and the
-  terminal `state` (`succeeded` for exit 0, `failed` otherwise, `stopped`
-  when a stop or shutdown terminated it), then publishes one
-  `worktree_session_finished` state event;
+- on runner completion awaits `wait()`, `termination()`, and
+  `process_group_cleanup()`, records `exit_code` or `signal`, `finished_at`,
+  and the terminal `state` (`stopped` when `CommandTermination::Cancelled`,
+  otherwise `succeeded` for exit 0 and `failed` for everything else,
+  including the runner's inactivity and runtime-limit terminations), then
+  publishes one `worktree_session_finished` state event;
 - never writes to any file.
 
-`stop_worktree_session`: mark `stop_requested`, SIGTERM the process group,
-wait up to 5 s, then `cleanup_process_group_verified` (SIGKILL and reap). The
-command settles after reap with result `worktree_session_stop { session_id, terminated, state_after }`;
+`stop_worktree_session`: mark `stop_requested`, call
+`StreamingChildHandle::terminate()`, then await `wait()` and
+`process_group_cleanup()`. The SIGTERM → 5 s → SIGKILL escalation and the
+verified process-group cleanup are the runner's own cancellation procedure
+(`terminate_with_timeout(Duration::from_secs(5))` followed by
+`verify_owned_process_group`, `src/ai_command_runner.rs:1260-1300`), which
+publishes `CommandTermination::Cancelled` and returns without re-entering the
+retry loop. The registry never signals the process group itself: an external
+`killpg` would be observed by the runner as a non-zero exit, which
+`CommandQueue::should_retry` classifies as a crash (`src/command_queue.rs:282-287`),
+and the configured retry would relaunch attempt 2 under the same `session_id`
+while the resource already read `stopped`. The command settles after the
+cleanup report with result `worktree_session_stop { session_id, terminated, state_after }`;
 a session already finished settles `no_op` with `terminated: false`. Owner
-shutdown (graceful stop, TUI quit, `run` completion) performs the same
-sequence for every running session under one 10 s deadline before listeners
-close; a session that cannot be proven reaped is logged with its PGID and the
-process still exits (nothing durable depends on it).
+shutdown (graceful stop, TUI quit, `run` completion) calls the registry
+scope's `shutdown(10 s)` before listeners close, which cancels every running
+session through the same runner path and refuses any further attempt; a
+session the barrier reports as unconfirmed is logged with its PGID and the
+process still exits (nothing durable depends on it). Only descendants that
+remain in the session's process group are covered: a descendant that called
+`setsid` or daemonized has left the group and is outside the stop and
+shutdown guarantee, exactly as for the TUI.
 
 ### Session resource
 
@@ -143,8 +185,17 @@ process still exits (nothing durable depends on it).
 
 `GET /api/v2/worktree-sessions` returns `{instance_id, state_revision, sessions: [...]}`
 newest first; detail returns one or `not_found`. Both are bearer-gated and
-served on both listeners. Never serialized: the template, the expanded
-command, environment, absolute paths, the PGID. `ProcessExecutionStatus`
+served on both listeners. Never serialized in any owner-generated field
+(`path`, `branch`, results, error detail, events, the log ring, the
+snapshot, OpenAPI): the template, the expanded command, environment,
+absolute paths, the PGID. `output.lines` is different in kind: it is the
+command's own stdout/stderr, retained after `sanitize_detail` (ANSI/control
+stripping and the 8 KiB per-line bound, no redaction) and the 64 KiB ring
+bound. A configured command that prints its arguments, environment, or cwd
+discloses them to every bearer-authenticated reader of the session resource;
+that is the operator's responsibility when configuring `worktree_command`,
+and the same limitation the TUI terminal already has. The tail is published
+nowhere else. `ProcessExecutionStatus`
 gains `worktree_sessions_running: u32` (computed on read, `#[serde(default)]`).
 
 ### Result kinds, errors, events, capability
@@ -218,7 +269,9 @@ registered in `tests/mod.rs`, wired with a real router, `WebState`, a real
   the script writes `pwd`, `$1`, `$2`, and `read x; echo stdin:$?` to a file
   and stdout; assert cwd equals the worktree, placeholders expanded, stdin
   read fails (null), exit code and output tail published, one
-  `worktree_session_finished` event, record settled at launch.
+  `worktree_session_finished` event, record settled at launch. This is a
+  raw-output fixture: the absolute cwd it prints lands in `output.lines`
+  and nowhere else (not in `path`, the event, the log ring, or the record).
 - `remote_worktree_session_create_provisions_setup_and_launches`: with a
   `.wt/setup` in the project root that writes a marker, assert the new
   branch `ws-session-*`, the registered path under the base dir, the marker,
@@ -226,25 +279,51 @@ registered in `tests/mod.rs`, wired with a real router, `WebState`, a real
   `worktree_id` in the result and in `/api/v2/worktrees`, and
   `inspection: not_inspected`.
 - `remote_worktree_session_setup_failure_cleans_up_and_launches_nothing`:
-  failing setup → worktree removed, branch removed, no process, failed record
-  with `cleanup.removed: true`; a cleanup that itself fails reports
-  `retained` and the reason.
+  failing setup → worktree directory and registration removed, the
+  `ws-session-*` branch retained (as the TUI's forced removal without
+  teardown leaves it), no process, failed record with
+  `cleanup.removed: true`; a cleanup that itself fails reports `retained`
+  and the reason.
 - `remote_worktree_session_invalid_cwd_before_launch_is_refused`: remove the
   worktree between setup and launch via the fake seam; no process starts.
 - `remote_worktree_session_replay_and_concurrency_launch_once`: replayed key
   → same record, launch counter 1; new key while running →
   `worktree_session_busy`; 4 running + 1 → `capacity`; a retrying script
   (fail first attempt) → `attempt: 2`, one `session_id`.
-- `remote_worktree_session_stop_kills_the_process_group_and_reaps`: script
-  `sleep 300 & sleep 300` → stop → both gone (PGID probe through `kill -0`
-  on the recorded PIDs), `terminated: true`, state `stopped`, signal set.
-- `remote_worktree_session_shutdown_terminates_running_sessions`: runtime
-  shutdown with one running session → reaped within the deadline.
+- `remote_worktree_session_create_capacity_refusal_creates_nothing`: with 4
+  sessions running, `create_session_worktree` → `worktree_session_busy`
+  (`reason: capacity`), no new worktree or `ws-session-*` branch
+  (`git worktree list --porcelain` and `git branch --list` unchanged), no
+  provisioner call recorded, and the reservation released so that one
+  session finishing lets the next create succeed.
+- `remote_worktree_session_stop_kills_the_process_group_and_reaps`: config
+  with `command_queue_max_retries >= 1`; script `sleep 300 & sleep 300`
+  (both stay in the session's process group; this is not a detached-child
+  proof and none is claimed) → stop → both gone (`kill -0` probe on the
+  recorded PIDs), `terminated: true`, state `stopped`, signal set,
+  `attempt == 1`, and no new PID observed after settlement (the configured
+  retry did not relaunch).
+- `remote_worktree_session_shutdown_terminates_running_sessions`: same
+  retry config, one running session → registry scope `shutdown(10 s)`
+  returns quiescent, the session reads `stopped`, `attempt == 1`, no new
+  PID, and a launch submitted after shutdown is refused without a spawn.
 - `remote_worktree_session_output_is_bounded_and_sanitized`: 200 KiB of
   output with ANSI → tail ≤ 64 KiB, `truncated_bytes > 0`, no escape bytes.
-- `remote_worktree_session_discloses_no_command_path_or_secret`: template
-  containing `--token SECRET` → no response, event, or record contains
-  `SECRET`, the template, or an absolute path.
+- `remote_worktree_session_discloses_no_command_path_or_secret`: metadata
+  fixture — template `sh <script> --token SECRET {workspace_dir} {repo_root}`
+  with a script that prints a fixed literal and never echoes its arguments,
+  environment, or cwd → no owner-generated field (session `path`/`branch`,
+  the command record and result, `worktree_session_*` events, `/api/v2/logs`,
+  `/api/v2/state`, the OpenAPI document) contains `SECRET`, the template,
+  or an absolute path; the runner's spawn log carries only pid, op, and
+  attempt (`src/ai_command_runner.rs:1133-1139`). Bearer authentication on
+  the session routes is asserted unchanged (unauthenticated read → 401).
+- `remote_worktree_session_output_tail_is_the_commands_own_data`: raw-output
+  fixture — the same template with a script that echoes `$2` (the absolute
+  repo root) → the absolute path appears verbatim in `output.lines` of the
+  bearer-gated session resource and nowhere else; the test documents that
+  `sanitize_detail` strips control sequences and does not redact. No test
+  claims redaction of arbitrary secrets.
 - `remote_worktree_session_retention_evicts_finished_only`: 33 finished →
   32 retained; a running one is never evicted.
 - `remote_worktree_session_unavailable_without_worktree_command`: no template

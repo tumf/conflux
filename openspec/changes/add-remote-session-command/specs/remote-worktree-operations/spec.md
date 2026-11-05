@@ -4,7 +4,7 @@
 
 V2 MUST expose `GET /api/v2/worktrees` and `GET /api/v2/worktrees/{worktree_id}`. It MUST extend the closed command enum only with `create_worktree`, `delete_worktree`, `merge_worktree`, `run_worktree_command`, `create_session_worktree`, and `stop_worktree_session`. Every worktree command MUST inherit v2 authentication, `expected_revision`, idempotency, capacity admission, correlation validation, and typed errors.
 
-`create_worktree` MUST accept only `target.change_id` and an empty `params` object. `delete_worktree`, `merge_worktree`, and `run_worktree_command` MUST accept only `target.worktree_id` and an empty `params` object. `create_session_worktree` MUST accept only an empty `params` object. `stop_worktree_session` MUST accept only `session_id`. Unknown target or parameter fields MUST fail schema validation.
+`create_worktree` MUST accept only `target.change_id` and an empty `params` object. `delete_worktree`, `merge_worktree`, and `run_worktree_command` MUST accept only `target.worktree_id` and an empty `params` object. `create_session_worktree` MUST accept only an empty `params` object. `stop_worktree_session` MUST accept only `target.session_id` and an empty `params` object. Unknown target or parameter fields MUST fail schema validation.
 
 #### Scenario: Client reads one worktree by opaque ID
 

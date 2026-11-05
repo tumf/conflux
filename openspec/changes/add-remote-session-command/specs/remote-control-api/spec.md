@@ -4,7 +4,8 @@
 
 V2 MUST extend the closed command set with `run_worktree_command`
 (target opaque `worktree_id`, empty params), `create_session_worktree`
-(empty params), and `stop_worktree_session` (`session_id`), and MUST expose
+(empty params), and `stop_worktree_session` (target opaque `session_id`,
+empty params), and MUST expose
 `GET /api/v2/worktree-sessions` and `GET /api/v2/worktree-sessions/{session_id}`.
 The command executed MUST be exactly the configured `worktree_command`
 template with `{workspace_dir}` and `{repo_root}` expanded server-side; no
@@ -17,10 +18,14 @@ configured retry policy inside one session.
 `ws-session-<random>` branch at base `HEAD` under the workspace base
 directory, MUST validate the cwd after creation, run `.wt/setup` from the
 project root, validate after setup and immediately before launch, and MUST
-remove the worktree through the same cleanup the TUI uses when setup fails,
-launching nothing and settling `worktree_session_setup_failed` with the typed
-cleanup outcome. The creation steps MUST run under the repository root
-mutation guard.
+remove the worktree through the same cleanup the TUI uses when setup fails
+(forced worktree removal with teardown skipped; the `ws-session-*` branch is
+retained exactly as the TUI leaves it), launching nothing and settling
+`worktree_session_setup_failed` with the typed cleanup outcome. The creation
+steps MUST run under the repository root mutation guard. The running-slot
+and worktree-busy reservation MUST be taken before any Git effect and
+released on every refusal, so a `capacity` refusal creates no worktree and
+no branch.
 
 Each session MUST have a process-local 128-bit `session_id`, a `kind`
 (`existing` or `session`), the opaque `worktree_id`, a repository-relative
@@ -37,16 +42,33 @@ reason `capacity`. A launch command MUST be refused
 the project is not a Git repository, and `command_executor_unbound` on a
 headless owner.
 
-`stop_worktree_session` MUST send SIGTERM to the session's process group,
-escalate to SIGKILL after 5 seconds through verified process-group cleanup,
-and settle only after reaping with `terminated` and `state_after`. Owner
-shutdown MUST terminate and reap every running session under a bounded
-deadline. The shared worktree service MUST refuse deleting a worktree whose
+`stop_worktree_session` MUST cancel the session through the runner's own
+handle (`StreamingChildHandle::terminate`), whose cancellation path sends
+SIGTERM to the session's process group, escalates to SIGKILL after 5
+seconds, verifies the group, and admits no further attempt; it MUST NOT
+signal the process group externally, because the configured retry policy
+would relaunch inside the same session, and MUST settle only after the
+leader is reaped and the cleanup report is read, with `terminated` and
+`state_after`. The runner MUST be bound to a `RunCommandScope` owned by the
+session registry, and owner shutdown MUST close that scope under a bounded
+deadline so every running session is terminated and reaped and no further
+attempt can spawn. The guarantee covers the processes that remain in the
+session's process group; a descendant that left it (`setsid`,
+daemonization) is explicitly outside the stop and shutdown guarantee. The shared worktree service MUST refuse deleting a worktree whose
 session is running, for the TUI and the API alike. Sessions MUST be retained
 in memory only (running never evicted, at most 32 finished), MUST NOT be
 persisted, and MUST NOT influence scheduling, resume, acceptance, or archive.
-No response, event, or result MUST disclose the template, the expanded
-command, environment values, absolute paths, or credentials.
+No owner-generated field (path, branch, result, error detail, events, the
+log ring, the snapshot, or the OpenAPI document) MUST disclose the template,
+the expanded command, environment values, absolute paths, or credentials.
+The output tail is the command's own stdout/stderr: it MUST be retained only
+after control-sequence stripping and size bounding, MUST NOT be redacted or
+claimed to be, MUST be readable only through the bearer-authenticated
+session resource, and MUST never appear as an event, log entry, or snapshot
+field. A configured command that prints its arguments, environment, or cwd
+discloses them to every authenticated reader; that disclosure is the
+operator's responsibility when configuring `worktree_command`, and the
+documentation MUST say so.
 
 Capabilities MUST advertise `worktree_sessions` (`available`, `commands`,
 `routes`, `max_running`, `max_retained`, `max_output_bytes`, `stdin`,
@@ -79,9 +101,16 @@ before any effect. `cflx client` and `cflx client mcp` MUST gain no verb.
 
 - **GIVEN** `.wt/setup` exits non-zero
 - **WHEN** `create_session_worktree` runs
-- **THEN** the worktree and branch are removed
+- **THEN** the worktree is removed by forced removal without teardown and the `ws-session-*` branch is retained
 - **AND** no process is launched
 - **AND** the record fails `worktree_session_setup_failed` with `cleanup.removed: true`
+
+#### Scenario: Capacity refusal of creation leaves the repository untouched
+
+- **GIVEN** 4 sessions are running
+- **WHEN** a client submits `create_session_worktree`
+- **THEN** it is refused `worktree_session_busy` with reason `capacity` before any Git effect
+- **AND** no worktree or branch is created and the reservation is released
 
 #### Scenario: Resend and concurrency never duplicate a session
 
@@ -93,10 +122,10 @@ before any effect. `cflx client` and `cflx client mcp` MUST gain no verb.
 
 #### Scenario: Stop terminates the whole process group
 
-- **GIVEN** a running session whose command spawned a background child
+- **GIVEN** a running session whose command spawned a background child in the same process group, and a retry policy of at least one retry
 - **WHEN** `stop_worktree_session` is submitted
 - **THEN** both processes are gone after settlement and `terminated` is true
-- **AND** the session reads `stopped` with its signal
+- **AND** the session reads `stopped` with its signal, `attempt` stays 1, and no new process was started
 
 #### Scenario: Deletion is refused while a session runs
 
@@ -105,12 +134,19 @@ before any effect. `cflx client` and `cflx client mcp` MUST gain no verb.
 - **THEN** the shared service refuses with a typed ineligible reason
 - **AND** nothing is torn down or removed
 
-#### Scenario: Output is bounded and secrets are not disclosed
+#### Scenario: Output is bounded and owner metadata discloses no secret
 
-- **GIVEN** a template containing a credential and a command printing 200 KiB with ANSI codes
+- **GIVEN** a template containing a credential and a command that prints 200 KiB with ANSI codes but never echoes its arguments, environment, or cwd
 - **WHEN** the session finishes
 - **THEN** the retained tail is at most 65,536 bytes with `truncated_bytes` counted and no escape bytes
-- **AND** no response, event, or record contains the credential, the template, or an absolute path
+- **AND** no owner-generated field, event, log entry, snapshot field, or record contains the credential, the template, or an absolute path
+
+#### Scenario: Output tail is the command's own data
+
+- **GIVEN** a configured command that echoes the expanded `{repo_root}`
+- **WHEN** an authenticated client reads the session resource
+- **THEN** the absolute path appears in `output.lines` exactly as printed, control sequences stripped and not redacted
+- **AND** it appears in no owner-generated field, event, log entry, or snapshot field, and an unauthenticated read is refused
 
 #### Scenario: Older owner stays compatible
 

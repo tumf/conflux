@@ -79,7 +79,8 @@ Add a closed, owner-managed *session* surface:
 - Commands `run_worktree_command` (target opaque `worktree_id`, empty params),
   `create_session_worktree` (empty params; creates the `ws-session-*`
   worktree exactly as `+` does and then launches), and
-  `stop_worktree_session` (`session_id`). The command text is always the
+  `stop_worktree_session` (target opaque `session_id`, empty params, the same
+  `target`/`params` shape as the worktree commands). The command text is always the
   configured `worktree_command` template with `{workspace_dir}` and
   `{repo_root}` expanded server-side; no request field carries a command,
   argv, path, branch, or environment.
@@ -98,11 +99,18 @@ Add a closed, owner-managed *session* surface:
   key returns the original record and launches nothing; a second new request
   for a worktree whose session is still running is refused
   `worktree_session_busy`; at most 4 sessions run concurrently.
-- Lifecycle is owner-owned: `stop_worktree_session` sends SIGTERM to the
-  process group, escalates to SIGKILL after 5 seconds through the existing
-  verified process-group cleanup, and settles only after reaping. Owner
-  shutdown terminates and reaps every running session under a bounded
-  deadline. The shared worktree service refuses deleting a worktree whose
+- Lifecycle is owner-owned: `stop_worktree_session` cancels the session
+  through the runner's own handle (`StreamingChildHandle::terminate`), which
+  sends SIGTERM to the process group, escalates to SIGKILL after 5 seconds,
+  verifies the group, and returns without a further attempt; the command
+  settles only after `wait` and the typed cleanup report. An external
+  `killpg` is never used, because the configured retry policy treats any
+  non-zero exit as a crash and would relaunch inside the same session. The
+  session registry owns its own `RunCommandScope`; owner shutdown closes it
+  (`shutdown(10 s)`), which refuses new attempts and terminates and reaps
+  every running session under that bounded deadline. Descendants that left
+  the session's process group (`setsid`, daemonization) are outside this
+  guarantee. The shared worktree service refuses deleting a worktree whose
   session is running, for the TUI and the API alike.
 - Retention is in-memory only: running sessions are never evicted; at most 32
   finished sessions are retained, oldest first; nothing is written to disk and
@@ -128,24 +136,41 @@ Add a closed, owner-managed *session* surface:
    and launches the command there; the result names the new opaque
    `worktree_id`, branch, and relative path, and the worktree list shows it.
 3. When `.wt/setup` fails, the worktree is removed through the same cleanup
-   the TUI uses, no command is launched, and the record fails with
+   the TUI uses (`worktree_remove_with_options { skip_teardown: true }`,
+   i.e. `git worktree remove --force` without teardown; the `ws-session-*`
+   branch is retained exactly as the TUI leaves it), no command is launched,
+   and the record fails with
    `worktree_session_setup_failed` carrying the typed cleanup outcome
    (`removed` or `retained` with reason); when the cwd becomes invalid before
    launch, no process starts and the record fails with the cwd diagnostic.
 4. Single-flight holds: an exact replay returns the original record without a
    second process (proven by a launch counter and a PID observation), a new
    request against a running session is `worktree_session_busy`, the fifth
-   concurrent session is `worktree_session_busy` with reason `capacity`, and
-   the configured retry policy retries *inside* the one session with
-   `attempt` incremented and the same `session_id`.
-5. `stop_worktree_session` terminates the whole process group including a
-   detached grandchild, settles with `terminated: true` only after reaping,
-   and the session reads `stopped` with the signal; owner shutdown does the
-   same for every running session within the bounded deadline.
-6. No response, event, or result contains the expanded command text, the
-   configured template, any environment value, an absolute path, or a
-   bearer token; output lines are passed through `sanitize_detail` and the
-   tail is bounded at 64 KiB with dropped bytes counted.
+   concurrent session is `worktree_session_busy` with reason `capacity`
+   before any Git effect (a `capacity` refusal of `create_session_worktree`
+   creates no worktree and no branch), and the configured retry policy
+   retries *inside* the one session with `attempt` incremented and the same
+   `session_id`.
+5. `stop_worktree_session` terminates the session's whole process group,
+   including a background child that stays in that group, through the
+   runner's cancellation path; it settles with `terminated: true` only after
+   the leader is reaped and the cleanup report is read, the session reads
+   `stopped` with the signal, and with a retry policy of at least one retry
+   configured no second attempt starts (`attempt` stays 1, no new PID).
+   Owner shutdown does the same for every running session within the
+   bounded deadline. A descendant that left the process group (`setsid`,
+   daemonization) is explicitly outside the guarantee.
+6. No owner-generated field (path, branch, result, error detail, events,
+   the log ring, the snapshot, the OpenAPI document) contains the expanded
+   command text, the configured template, any environment value, an
+   absolute path, or a bearer token. The output tail is the command's own
+   stdout/stderr: it is bounded at 64 KiB with dropped bytes counted and
+   passed through `sanitize_detail`, which strips ANSI/control sequences and
+   bounds a line at 8 KiB but redacts nothing. A configured command that
+   prints its arguments, environment, or cwd discloses them to every
+   bearer-authenticated reader of the session resource; choosing such a
+   command is the operator's responsibility, and the tail is published
+   nowhere else (never as an event, log entry, or snapshot field).
 7. The shared service refuses `delete_worktree` (API, fail-closed) and the TUI
    `D`/`Y`/`S`/`X` deletion of a worktree with a running session with a typed
    ineligible reason; unrelated worktrees are unaffected.
