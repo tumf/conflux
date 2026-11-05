@@ -20,20 +20,28 @@ earlier total retained, is never reset while the owner runs, and is zero
 after restart.
 
 The snapshot MUST publish `run_clock` with `started_at`, `ended_at`, and
-`elapsed_ms`: opened by the Start that opens a run (the same dispatch that
-resets the TUI clock) and by admitted work starting from a non-running mode;
-closed, with `elapsed_ms = ended_at - started_at`, by process `Stopped`, by
-`AllCompleted` when it may overwrite the mode, by resolve completion that
-projects Ready, and by a fatal process `Error`; retained until the next run
-opens; left open by a persistent-idle park, a stop request, a cancelled
-stop, or a Start while already running. The TUI `Elapsed` presentation MUST
-freeze at the same boundaries.
+`elapsed_ms` as a projection of the existing TUI run clock through one
+shared rule, boundary for boundary and without changing the TUI: opened
+(`started_at` set, the other two `null`) by an accepted Start dispatch
+while the mode is not running; left unchanged by admitted work resuming a
+persistent-idle Ready, by `ResolveReserved`, by a persistent-idle park, by a
+stop request, by a cancelled stop, by a Start while already running, and by
+a fatal process `Error`; frozen, with `ended_at` set and `elapsed_ms` the
+monotonic duration since the open in whole milliseconds, by every process
+`Stopped` delivery, by every `AllCompleted` delivery whether or not it may
+overwrite the mode, and by a resolve-side settlement that finds no
+processing row while running; re-frozen at the later instant by a repeated
+terminal delivery, exactly when the TUI re-freezes; and retained until the
+next opening Start. All three members MUST be `null` before the first Start
+in the process.
 
 `ChangeTiming` MUST keep its existing per-run meaning: `elapsed_ms` is the
 duration of the finished run and is not cumulative. Accumulated time and
 the open boundary MUST be published in the same snapshot and revision; no
-member MUST change because time passed, and a repeated identical status
-event MUST NOT change `net_active`. None of the three members MUST be
+member MUST change because time passed, a repeated identical status event
+MUST NOT change `net_active`, and `run_clock` MUST change only on a real
+open or freeze event, so the revision MAY advance on a repeated terminal
+event only when the frozen value changes. None of the three members MUST be
 persisted, derived from process start time or logs, or read by scheduling,
 resume, acceptance, or archive decisions.
 
@@ -64,13 +72,27 @@ route, or command is introduced.
 - **WHEN** clients read the snapshot repeatedly and later submit `start`
 - **THEN** `run_clock.elapsed_ms` is constant across the reads
 - **AND** the next start publishes a new `started_at` with `ended_at` and `elapsed_ms` null
-- **AND** a persistent-idle park leaves the clock open
+- **AND** a persistent-idle park and a fatal process `Error` leave the clock open
+
+#### Scenario: Run clock keeps the TUI start across re-admission and ResolveReserved
+
+- **GIVEN** a run opened at `t0` was parked by a persistent-idle event, or stopped
+- **WHEN** admitted work resumes it, or `ResolveReserved` moves the mode to running
+- **THEN** `run_clock.started_at` is still the `t0` sample
+- **AND** the TUI `orchestration_started_at` driven at the same instants is still `t0`
+
+#### Scenario: Run clock re-freezes on a repeated terminal event like the TUI
+
+- **GIVEN** a run opened at `t0` was frozen by `Stopped` at `t1`
+- **WHEN** a second `Stopped` arrives at `t2`, or a delayed `AllCompleted` arrives at `t3`
+- **THEN** `run_clock.elapsed_ms` equals the TUI `orchestration_elapsed` after the same event (`t2 - t0` or `t3 - t0`)
+- **AND** `ended_at` moves to the later sample and the revision advances on that event, not on any read
 
 #### Scenario: Time passing does not advance the revision
 
 - **GIVEN** an active change and no new event
 - **WHEN** the snapshot is read twice at later instants
-- **THEN** both reads are byte-identical with the same `state_revision`
+- **THEN** both reads return the same stored snapshot with the same `state_revision`
 - **AND** `ChangeTiming` boundaries are unchanged from before this contract
 
 #### Scenario: Older owner reads as unpublished

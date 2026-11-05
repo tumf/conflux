@@ -17,16 +17,50 @@
   `is_active_status` (`:588-596`), closed for every row on `Stopped`
   (`src/tui/state/event_handlers/processing.rs:195-199`). Existing tests:
   `src/tui/state.rs:2850-2960`.
-- TUI run clock: `reset_for_run` on a run-opening Start
-  (`src/tui/state.rs:2250-2258, 2311-2323`), frozen at `Stopped`
-  (`processing.rs:185-187`), `AllCompleted` (`completion.rs:28-29, 43-44`),
-  resolve completion to Select (`processing.rs:158-160`); rendered live only
-  in `Running | Stopping` (`src/tui/render.rs:1628-1649`); not frozen on
-  persistent idle (`completion.rs:61-69`) or fatal `Error`
-  (`src/tui/state/event_handlers/output.rs:210-216`).
+- TUI run clock, exact current behavior (preserved by this change):
+  - Open: `reset_for_run` sets `orchestration_started_at = Instant::now()`
+    and clears `orchestration_elapsed` (`src/tui/state.rs:2250-2258`). Its
+    only production caller is `admit_run_targets`, reached from both
+    `begin_run` and `queue_run`, guarded by `execution_mode != Running`
+    (`:2311-2323`); both are the `RunDispatched` effect
+    (`src/tui/state/event_handlers/operator_commands.rs:32-51`). So any
+    accepted Start while the TUI is Select, Stopped, or Error resets the
+    clock even when the mode stays non-Running (`queue_run`); a Start while
+    Running does not.
+  - Not an open: persistent-idle re-admission, Ready → Running on
+    `is_admitted_work_start` (`event_handlers/mod.rs:56-64`);
+    `ResolveReserved { active: true }`, Select/Stopped → Running
+    (`operator_commands.rs:97-105`); `ProcessingStarted`. None touches
+    either field.
+  - Freeze (`orchestration_elapsed = Some(started.elapsed())` whenever
+    `orchestration_started_at` is `Some`, overwriting any earlier value):
+    every `Stopped` delivery including a repeated one (`processing.rs:185-187`);
+    every `AllCompleted` delivery, both the retained-terminal branch
+    (`completion.rs:28-29`) and the overwrite branch (`:43-44`);
+    `try_transition_to_select` when `execution_mode == Running` and no row's
+    `display_status_cache` is `queued`, `blocked`, `applying`, `accepting`,
+    `archiving`, `resolving`, or `resolve pending` (`processing.rs:139-162`),
+    reached from `complete_resolve_lifecycle` with an empty resolve queue
+    (`completion.rs:154-170`, called by `handle_resolve_completed`
+    unconditionally and by `handle_merge_completed` only while
+    `is_resolving() || has_queued_resolves()`), `handle_resolve_failed`
+    (`errors.rs:69`), and `handle_hook_failed` for `on_merged` (`errors.rs:98`).
+  - Not a freeze: `handle_error` (`output.rs:210-216`),
+    `handle_persistent_scheduler_idle` (`completion.rs:61-69`, asserted by
+    the existing test at `:378-381`), `StopRequested`, `StopCancelled`.
+  - Render: live `started.elapsed()` in `Running | Stopping`; otherwise
+    `orchestration_elapsed.unwrap_or_else(|| started.elapsed())`
+    (`src/tui/render.rs:1628-1649`). So in Error, and in a Ready reached by a
+    persistent-idle park, the `Elapsed` line keeps counting live until a later
+    `Stopped`/`AllCompleted` freezes it or the next Start resets it.
+- Web has no resolve-side mode transition: `ResolveCompleted` only clears
+  `is_resolving` (`src/web/state.rs:1245-1252`), `is_resolving` is set by
+  `ResolveStarted` (`:1238`) and `ResolveReserved { active }` (`:1441-1445`).
+  `app_mode` alone therefore cannot drive the run clock; the web store must
+  mirror the TUI event table directly.
 - Web app-mode boundaries: `running` on admitted work start or
-  `ProcessingStarted` (`src/web/state.rs:1081-1107`), `Effect::Started`
-  (`:1423`); `stopping`/`stopped`/`select`/`error` (`:1365-1392`);
+  `ProcessingStarted` (`src/web/state.rs:1081-1107`),
+  `OperatorCommandEffect::RunDispatched` (`:1411-1430`); `stopping`/`stopped`/`select`/`error` (`:1365-1392`);
   `all_completed_may_overwrite_mode` shared with the TUI (`src/events.rs:1063`).
 - Web per-change timing: `ChangeTiming` boundaries from event types in
   `OperatorFactsStore::record_event` (`src/web/operator_facts.rs:293-314`),
@@ -99,23 +133,73 @@ in `ChangeResource`, and in `InstanceSnapshot`:
 
 All three are `Option<_>` with `#[serde(default)]` and
 `#[schema(required, nullable = false)]`; `project_snapshot` always writes
-`Some`. `archive_complete` is `shared.archived_changes().contains(id)` read
+`Some` (`run_clock` with all three members `null` before the first Start). `archive_complete` is `shared.archived_changes().contains(id)` read
 in the same reducer hold as the display status
 (`apply_reducer_derived_queue_statuses`), stored on `ChangeStatus` as
 `archive_complete: bool` (`#[serde(default)]`).
 
-`run_clock` state lives on `OperatorFactsStore` (`run_started: Option<(Instant, DateTime<Utc>)>`,
-`run_ended: Option<DateTime<Utc>>`, `run_elapsed: Option<Duration>`):
+### Shared run clock
 
-| boundary | web trigger | TUI counterpart |
+`src/orchestration/run_clock.rs` holds the one transition rule both
+frontends apply; it is the TUI's current rule, not a new policy:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunClock { started: Option<(Instant, DateTime<Utc>)>, frozen: Option<(Duration, DateTime<Utc>)> }
+impl RunClock {
+    pub fn open_at(&mut self, now: Instant, wall: DateTime<Utc>);   // always: started = now, frozen = None
+    pub fn freeze_at(&mut self, now: Instant, wall: DateTime<Utc>); // if started: frozen = Some((now - started, wall)), overwriting; else no-op
+    pub fn started(&self) -> Option<(Instant, DateTime<Utc>)>;
+    pub fn frozen(&self) -> Option<(Duration, DateTime<Utc>)>;
+}
+```
+
+`freeze_at` deliberately overwrites: that is what `started.elapsed()` does
+on every repeated `Stopped` and delayed `AllCompleted` today. There is no
+first-close-wins rule and no reset on freeze.
+
+TUI side: `AppState` keeps its `pub orchestration_started_at` and
+`pub orchestration_elapsed` fields (render and existing tests read them) and
+gains `reset_for_run_at(now)` and `freeze_run_elapsed_at(now)`, which apply
+the same rule to those fields, plus injected-instant entry points
+`handle_stopped_at(now)`, `handle_all_completed_at(now)`, and
+`try_transition_to_select_at(now)`. The existing `reset_for_run`,
+`handle_stopped`, `handle_all_completed`, and `try_transition_to_select`
+delegate with `Instant::now()` and keep their behavior byte for byte; every
+other handler is untouched.
+
+Web side: `OperatorFactsStore` holds one `RunClock` and applies this table
+from the dispatch it observes, with `Instant` and `Utc::now()` sampled once
+per observation (the same sample as `latest_activity`):
+
+| web trigger (`ExecutionEvent`) | run clock | TUI source |
 |---|---|---|
-| open | `Effect::Started` that moves `app_mode` to `running`, or an admitted work start / `ProcessingStarted` while `app_mode` was `select`, `stopped`, or `error` | `reset_for_run` via `admit_run_targets` when not Running |
-| close | `ExecutionEvent::Stopped`; `AllCompleted` when `all_completed_may_overwrite_mode`; resolve completion that projects Select; fatal `Error` | `handle_stopped`, `handle_all_completed`, resolve completion, and the new freeze in `handle_error` |
-| no-op | `PersistentSchedulerIdle`, `StopRequested`, `StopCancelled`, a Start while already Running | same |
+| `OperatorCommandApplied { RunDispatched }` while `app_mode != "running"` (before the arm moves it) | `open_at` | `admit_run_targets` guard `execution_mode != Running`, `state.rs:2311-2323` |
+| `OperatorCommandApplied { RunDispatched }` while `app_mode == "running"` | nothing | `queue_run` while Running adds a target only |
+| admitted work start that moves Ready → `running`; `ProcessingStarted`; `OperatorCommandApplied { ResolveReserved }` | nothing | `mod.rs:56-64`, `operator_commands.rs:97-105` |
+| `Stopped`, every delivery | `freeze_at` | `processing.rs:185-187` |
+| `AllCompleted`, every delivery, regardless of `all_completed_may_overwrite_mode` | `freeze_at` | `completion.rs:28-29, 43-44` |
+| `ResolveCompleted`; `MergeCompleted` while `is_resolving` or any row is `resolve pending`; `ResolveFailed`; `HookFailed { hook_type: "on_merged" }` | `freeze_at` iff `app_mode == "running"` and, after applying the event's own row rewrite (`merged` for the two completions, `merge wait` for the two failures unless already `merged`) over the reducer display statuses of `dispatch.state`, no row is `queued`, `blocked`, `applying`, `accepting`, `archiving`, `resolving`, or `resolve pending` | `try_transition_to_select`, `processing.rs:139-162`, via `completion.rs:154-170`, `errors.rs:69, 98` |
+| `PersistentSchedulerIdle`, `StopRequested`, `StopCancelled`, `Error` | nothing | `completion.rs:61-69`, `output.rs:210-216` |
 
-Opening clears `ended_at`/`elapsed_ms`; closing sets both from the sampled
-instant; closing twice is a no-op; closing with no open run is a no-op.
-`elapsed_ms = ended_at - started_at` as whole milliseconds, saturating.
+The resolve-side row is the one place the web predicate reads TUI-local
+inputs (the handler's own row rewrite and the resolve ledger). The TUI's
+queued-resolve branch promotes a row to `resolve pending` instead of calling
+`try_transition_to_select`, and a `resolve pending` row makes the predicate
+false anyway, so the two paths agree. If the implementer finds a sequence
+where the web cannot evaluate this predicate identically from
+`dispatch.state`, `is_resolving`, and the row statuses it already holds,
+that is a blocker to report; the TUI rule is not to be redefined to fit.
+
+Publication: `started_at` is the wall sample of the open; on a freeze,
+`ended_at` is the wall sample of that freeze and `elapsed_ms` is the
+monotonic `now - started` in whole milliseconds, saturating — the same
+quantity the TUI renders, so TUI and API cannot differ by wall-clock
+adjustments. An open clears both; a freeze with no open run is a no-op; a
+repeated freeze overwrites both, so the snapshot differs and the revision
+advances on that real event, exactly when the TUI's frozen value changes.
+Before the first Start all three are `null`. Nothing is read from
+`app_mode` after the fact and no clock tick is ever observed.
 
 ### `ChangeTiming` stays per run
 
@@ -136,11 +220,29 @@ mismatch for a consumer, exactly as for `actions.refresh_proposal`. No
 capability block is added: the members are part of the snapshot and their
 presence is the discovery.
 
-### TUI parity fix
+### TUI run clock is preserved, not changed
 
-`handle_error` additionally freezes `orchestration_elapsed` from
-`orchestration_started_at` when present, so the TUI `Elapsed` line stops at
-fatal error as the API `run_clock` does. Nothing else in the TUI changes.
+This change adds no TUI freeze, reset, or idempotence rule. Three existing
+behaviors are kept deliberately and are exposed as they are:
+
+- **Fatal `Error` leaves the clock open.** `handle_error` does not freeze
+  (`output.rs:210-216`); the render falls back to live `started.elapsed()`
+  (`render.rs:1640-1645`), so the `Elapsed` line keeps counting in Error. The
+  API mirrors this: `Error` is a no-op, `started_at` stays, `ended_at` and
+  `elapsed_ms` stay `null`, and a client's `now - started_at` matches the
+  TUI. A later `AllCompleted` in Error still freezes in the TUI
+  (`completion.rs:28-29`) and therefore in the API.
+- **Persistent-idle re-admission and `ResolveReserved` keep the start.** A
+  run that parks and resumes, or a resolve admitted from Select/Stopped,
+  continues the existing `Elapsed` count; the API keeps the existing
+  `started_at`.
+- **Repeated terminal events re-freeze.** A second `Stopped`, or an
+  `AllCompleted` arriving after `Stopped`, moves `orchestration_elapsed` to
+  the later instant; the API re-closes and its revision advances on that
+  real event.
+
+The parity tests below assert these with injected instants on both sides.
+Changing any of them would be a TUI behavior change outside this contract.
 
 ### Constitution check
 
@@ -183,8 +285,17 @@ is injected through `*_at(Instant, DateTime)` methods, never slept.
   existing row tests at `src/tui/state.rs:2850-2960` pass, plus a case
   asserting `ChangeState` and a standalone `NetActiveClock` fed the same
   sequence report equal totals.
-- `remote_progress_timing_tui_elapsed_freezes_on_fatal_error`:
-  `handle_error` sets `orchestration_elapsed`.
+- `remote_progress_timing_run_clock_delegates_without_behavior_change`:
+  `reset_for_run_at`/`freeze_run_elapsed_at` on `AppState` and a standalone
+  `RunClock` fed the same instants report equal started/elapsed; the default
+  `reset_for_run`, `handle_stopped`, `handle_all_completed`, and
+  `try_transition_to_select` still produce `Some` started/elapsed, and the
+  existing assertions in `completion.rs` (persistent idle leaves
+  `orchestration_elapsed` `None`), `output.rs` (Start reset), and
+  `processing.rs` (`try_transition_to_select` guards) pass unchanged.
+- `remote_progress_timing_tui_error_leaves_elapsed_open`: `handle_error`
+  after a Start leaves `orchestration_elapsed` `None` and
+  `orchestration_started_at` unchanged (existing behavior, now pinned).
 
 ### API gate: `remote-progress-timing-api` (`src/web/remote_control_api/tests/mod.rs`)
 
@@ -197,18 +308,47 @@ registered in `tests/mod.rs`, using the existing `Harness` and
   `resolving`/`merged`/`pushed`; a fresh reducer with `resolving` and no
   archive → `false`; equals `state.archived_changes()` for every row.
 - `remote_progress_timing_net_active_matches_the_tui_row`: drive one event
-  sequence (`ApplyStarted` → acceptance → `Stopped` → retry → archived)
-  through both an `AppState` and the web harness with injected instants;
-  assert equal `accumulated_ms`, equal `active_since`/open state, equal
-  `has_history` at every step, including the stop-before-sync and
-  sync-before-stop orderings.
-- `remote_progress_timing_run_clock_boundaries`: Start opens; persistent
-  idle keeps it open; `Stopped`/`AllCompleted`/resolve completion/`Error`
-  close with `elapsed_ms`; the value is retained across later reads and a
-  new Start replaces it; a Start while running does not reopen.
+  sequence (`ApplyStarted` → acceptance → `Stopped` → retry →
+  `PersistentSchedulerIdle` → re-admission by `ApplyStarted` →
+  `ResolveReserved` → archived) through both an `AppState` and the web
+  harness with injected instants; assert equal `accumulated_ms`, equal
+  `active_since`/open state, equal `has_history` at every step, including
+  the stop-before-sync and sync-before-stop orderings.
+- `remote_progress_timing_run_clock_boundaries`: `RunDispatched` from
+  Select opens; `RunDispatched` from Stopped and from Error opens;
+  `RunDispatched` while running does not; `PersistentSchedulerIdle` and
+  `Error` leave it open with `ended_at`/`elapsed_ms` `null`; `Stopped`,
+  `AllCompleted`, and `ResolveCompleted` with no active row while running
+  freeze with `elapsed_ms`; the value is retained across later reads and the
+  next opening Start replaces it.
+- `remote_progress_timing_run_clock_persistent_idle_readmission_keeps_start`
+  (parity): Start at t0 → `PersistentSchedulerIdle` → `ApplyStarted` at t1
+  on both `AppState` and the web store; `orchestration_started_at` is still
+  t0 and `orchestration_elapsed` is `None`; `run_clock.started_at` is the t0
+  wall sample with `ended_at`/`elapsed_ms` `null`; both modes are running.
+- `remote_progress_timing_run_clock_resolve_reserved_keeps_start` (parity):
+  Start at t0 → `Stopped` at t1 → `ResolveReserved { active: true }` at t2;
+  TUI started stays t0 and elapsed stays t1 − t0; API `started_at` stays t0,
+  `elapsed_ms` stays t1 − t0, `ended_at` stays the t1 sample; both modes
+  are running.
+- `remote_progress_timing_run_clock_repeated_terminal_refreezes_like_tui`
+  (parity): Start at t0 → `Stopped` at t1 → `Stopped` at t2, and Start at
+  t0 → `Stopped` at t1 → `AllCompleted` at t3; after each event the TUI
+  `orchestration_elapsed` and the API `elapsed_ms` are equal (t1 − t0, then
+  t2 − t0 / t3 − t0), the API `ended_at` moves to the later sample, and the
+  revision advances once per re-freeze; the mode stays stopped.
+- `remote_progress_timing_run_clock_resolve_settlement_matches_tui`
+  (parity): while running, `ResolveCompleted` with another row still
+  `applying` freezes nothing on either side; `ResolveCompleted` with no
+  other active row freezes both at the same instant; `MergeCompleted` with
+  `is_resolving` false and no `resolve pending` row freezes nothing on
+  either side.
 - `remote_progress_timing_time_passing_does_not_advance_the_revision`: two
-  reads with injected later instants and no event → identical snapshot and
-  revision; a duplicate identical status event → no change to `net_active`.
+  reads with injected later instants and no event → the same stored
+  snapshot (`InstanceSnapshot` equality) and the same `state_revision`;
+  a duplicate identical status event → no change to `net_active`. Transport
+  bytes are not compared: `StateResponse` carries no read timestamp today,
+  but the assertion is on stored snapshot and revision, not on the response.
 - `remote_progress_timing_change_timing_is_unchanged`: the existing
   `ChangeTiming` boundary assertions from `operator_snapshot_tests.rs` hold
   byte-for-byte on the same sequence.
@@ -217,6 +357,12 @@ registered in `tests/mod.rs`, using the existing `Harness` and
   `None`; omitting `actions.force_stop_change` still fails.
 - `remote_progress_timing_restart_starts_from_zero`: a new `WebState` with
   the same workspace reports `false`/zero/empty.
+
+The parity cases feed identical `Instant`/`DateTime<Utc>` samples to the
+TUI `_at` entry points and to the web store's injected-instant observation,
+so equality is exact, not tolerance-based. They assert the *existing* TUI
+behavior; a parity case that can only pass by changing a TUI boundary is a
+blocker to report, not a fix to make.
 
 ### Contract gate: `remote-progress-timing-contract` (`tests/openapi_contract_tests.rs`)
 
@@ -229,8 +375,9 @@ registered in `tests/mod.rs`, using the existing `Harness` and
 ### Non-declared regression runs the implementer must still report
 
 `cargo test --lib --features web-monitoring agent_execution_observability`,
-the TUI `render` elapsed tests, and `tests/client_cli_tests.rs` must pass
-unchanged.
+the TUI `render` elapsed tests, the existing TUI run-clock assertions in
+`src/tui/state/event_handlers/{completion,output,processing}.rs`, and
+`tests/client_cli_tests.rs` must pass unchanged.
 
 ## Independent review launch contract (for the implementation worker)
 

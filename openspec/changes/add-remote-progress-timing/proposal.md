@@ -10,7 +10,7 @@ references:
   - docs/guides/USAGE.md
 verifications:
   - id: remote-progress-timing-clock
-    requirement: One shared net-active clock drives TUI rows and API projection with identical open, pause, resume, stop, and restart semantics and no revision churn from time passing
+    requirement: One shared net-active clock drives TUI rows and API projection with identical open, pause, resume, stop, and restart semantics, the API run clock reproduces the existing TUI run-clock boundaries unchanged at injected instants, and no revision churn from time passing
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -62,13 +62,23 @@ Conflux-server (CFSRV-59 / CFSRV-56, OP-42 / OP-43) needs three facts the
    client can only guess from `display_status`, which the TUI deliberately
    does not do.
 2. **Run-level elapsed time.** The TUI shows `Elapsed …` from
-   `orchestration_started_at` (set when a Start opens a run,
-   `src/tui/state.rs:2311-2323`) and freezes `orchestration_elapsed` at
-   `Stopped`, `AllCompleted`, and resolve completion
-   (`src/tui/state/event_handlers/processing.rs:158-187`,
-   `completion.rs:28-44`), keeping the value after stop until the next
-   Start. `ProcessExecutionStatus` and `InstanceSnapshot` publish no run
-   clock.
+   `orchestration_started_at`, which only `reset_for_run` sets, reached only
+   through `admit_run_targets` on an accepted Start dispatch while the TUI is
+   not Running (`src/tui/state.rs:2250-2258, 2311-2323`). It freezes
+   `orchestration_elapsed` on every `Stopped` delivery
+   (`src/tui/state/event_handlers/processing.rs:185-187`), on every
+   `AllCompleted` delivery whether or not the mode may be overwritten
+   (`completion.rs:28-29, 43-44`), and in `try_transition_to_select` when the
+   TUI is Running and no row is left in a processing status
+   (`processing.rs:139-162`, reached from resolve completion, merge
+   completion during a resolve, resolve failure, and an `on_merged` hook
+   failure). Each freeze overwrites the previous value with the later
+   instant. A fatal `Error` (`output.rs:210-216`), a persistent-idle park
+   (`completion.rs:61-69`), persistent-idle re-admission
+   (`event_handlers/mod.rs:56-64`), and `ResolveReserved`
+   (`operator_commands.rs:97-105`) touch neither field. The value is kept
+   until the next opening Start. `ProcessExecutionStatus` and
+   `InstanceSnapshot` publish no run clock.
 3. **Per-change net-active time.** The TUI accumulates closed active
    intervals plus the open one, opened on a transition into an
    `ACTIVE_STATUSES` display status and closed on a transition out or on
@@ -102,11 +112,18 @@ can show "unpublished" against an older owner.
   on a transition out and on process `Stopped`, never reset within the
   process, zero after restart.
 - Add `InstanceSnapshot.run_clock: Option<RunClock>` with `started_at`,
-  `ended_at`, and `elapsed_ms`: opened when a Start opens a run (the same
-  dispatch that resets the TUI clock), closed at `Stopped`, `AllCompleted`
-  (when it may overwrite the mode), resolve completion to Ready, and fatal
-  `Error`; `elapsed_ms` is `ended_at - started_at`, retained until the next
-  run opens; a persistent-idle park does not close it, matching the TUI.
+  `ended_at`, and `elapsed_ms` as a projection of the TUI's *existing* run
+  clock, boundary for boundary: opened by the accepted Start dispatch that
+  resets the TUI clock (any `RunDispatched` while the mode is not running),
+  frozen by every `Stopped` and every `AllCompleted` delivery and by the
+  resolve-side settlement that moves the TUI to Select, left untouched by a
+  persistent-idle park, by persistent-idle re-admission, by
+  `ResolveReserved`, and by fatal `Error`. The TUI run clock is not changed:
+  no new freeze, no new reset, no new idempotence. A later terminal delivery
+  re-freezes exactly as the TUI does today, and the API publishes that on the
+  real event. Both frontends compute the transition through one shared pure
+  `RunClock`, so the table cannot drift, and the TUI handlers gain
+  injected-instant entry points whose default path is unchanged.
 - Keep `ChangeTiming` and its documentation unchanged except for one
   clarifying schema sentence that it is per run and that `net_active` is the
   cumulative counterpart.
@@ -133,16 +150,25 @@ can show "unpublished" against an older owner.
    or at process `Stopped` (either order of the stop event and the reducer
    sync), resumed on the next active status with the earlier total retained,
    never reset while the owner runs, and `None`/zero in a new process.
-3. `run_clock` opens on the Start that opens a run, stays open across a
-   persistent-idle park, closes with `elapsed_ms` at `Stopped`, `AllCompleted`,
-   resolve completion, and fatal `Error`, retains that value until the next
-   Start, and the TUI `Elapsed` line freezes at the same boundaries
-   (including a new freeze on fatal `Error` for parity).
-4. Revision discipline: two snapshots taken with no event in between are
-   byte-identical; a repeated identical status event does not change
-   `net_active`; `accumulated_ms` changes only at a close and `active_since`
-   only at an open; `run_clock` changes only at its boundaries; the existing
-   `ChangeTiming` boundaries are untouched.
+3. `run_clock` is the TUI run clock, boundary for boundary, with no change
+   to the TUI: it opens on an accepted Start while the mode is not running;
+   persistent-idle re-admission (Ready → Running on admitted work) and
+   `ResolveReserved` (Select/Stopped → Running) keep the existing
+   `started_at`; a persistent-idle park and a fatal `Error` leave it open;
+   it closes with `elapsed_ms` at every `Stopped` and every `AllCompleted`
+   and at the resolve-side settlement to Select; a repeated `Stopped` or a
+   delayed `AllCompleted` re-closes at the later instant exactly when the
+   TUI re-freezes; and the value is retained until the next opening Start.
+   Parity tests drive the same event sequences at injected instants through
+   `AppState` and the web store and assert equal started and elapsed values
+   at every step.
+4. Revision discipline: two reads with no event in between return the same
+   stored snapshot and the same `state_revision`; a repeated identical status
+   event does not change `net_active`; `accumulated_ms` changes only at a
+   close and `active_since` only at an open; `run_clock` changes only on a
+   real open or freeze event, so the revision may advance on a repeated
+   terminal event exactly when the TUI's frozen value changes and never on a
+   clock tick; the existing `ChangeTiming` boundaries are untouched.
 5. `ChangeTiming.elapsed_ms` behavior and the existing
    `agent_execution_observability_*` cases pass unchanged.
 6. Compatibility: `/api/v2/state` from an older owner (without the three
@@ -159,22 +185,26 @@ can show "unpublished" against an older owner.
 
 The regressions in `design.md` run under `remote_progress_timing` with
 nonzero passed counts in all three declared gates; a zero-test selection
-fails. The TUI row tests at `src/tui/state.rs:2850-2960` pass unchanged
-after the extraction. `docs/guides/USAGE.md` documents the three members
+fails. The TUI row tests at `src/tui/state.rs:2850-2960` and the existing
+TUI run-clock assertions (persistent-idle park in `completion.rs`, Start
+reset in `output.rs`, `try_transition_to_select` in `processing.rs`) pass
+unchanged after the extraction. `docs/guides/USAGE.md` documents the three members
 and their lifetimes. Proposal validation is not implementation evidence;
 tasks stay unchecked until implemented and verified in a separately
 authorized execution.
 
 ## Scope / Preserved Contracts
 
-Implementation touches a new `src/orchestration/net_active_clock.rs`,
-`src/tui/state.rs` (delegation only), `src/tui/state/event_handlers/output.rs`
-(freeze on fatal error), `src/web/operator_facts.rs` and `src/web/state.rs`
-(clock observation, archive and run-clock projection),
+Implementation touches new `src/orchestration/net_active_clock.rs` and
+`src/orchestration/run_clock.rs`, `src/tui/state.rs` and the run-clock
+handlers in `src/tui/state/event_handlers/{processing,completion}.rs`
+(delegation only: injected-instant `_at` entry points whose default path
+samples `Instant::now()` exactly as today), `src/web/operator_facts.rs` and
+`src/web/state.rs` (clock observation, archive and run-clock projection),
 `src/web/remote_control_api/dto.rs` and `projection.rs`, `src/web/openapi.rs`,
 focused tests, and documentation. `ChangeTiming`, `ChangeExecutionStatus`,
-`ProcessExecutionStatus`, events, commands, the reducer, scheduling, and
-`cflx client` behavior are unchanged. No new dependency, no route, no
+`ProcessExecutionStatus`, events, commands, the reducer, scheduling, every
+TUI `Elapsed` boundary, and `cflx client` behavior are unchanged. No new dependency, no route, no
 command, no file written anywhere.
 
 The tracked `.pre-commit-config.yaml` scopes Rust checks by staged paths; the
@@ -184,7 +214,9 @@ declared focused gates stay explicit and no broad build is added as a task.
 
 Not included: server-side live elapsed counters, timing derived from
 process start times or logs, persistence of timing across restarts,
-per-phase cumulative clocks, changing `ChangeTiming`, Web UI rendering,
+per-phase cumulative clocks, changing `ChangeTiming`, changing any TUI
+`Elapsed` boundary (no fatal-error freeze, no first-close-wins idempotence),
+Web UI rendering,
 Server relay code, or new `cflx client` output. The Server folds the
 published members and shows "unpublished" when they are `None`. Running
 owners are not restarted by this change.
