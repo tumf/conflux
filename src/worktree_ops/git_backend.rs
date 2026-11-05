@@ -172,9 +172,13 @@ impl WorktreeBackend for GitWorktreeBackend {
     ) -> WorktreeOpResult<MergeAttempt> {
         match policy {
             ConflictPolicy::AbortOnConflict => {
-                match commands::merge_branch(&self.repo_root, branch).await {
-                    Ok(()) => Ok(MergeAttempt::Merged),
-                    // `merge_branch` already aborted; the message carries the files.
+                match commands::merge_branch_aborting_on_conflict(&self.repo_root, branch).await {
+                    Ok(commands::AbortingMergeOutcome::Merged) => Ok(MergeAttempt::Merged),
+                    Ok(commands::AbortingMergeOutcome::Conflict { files, abort }) => {
+                        Ok(MergeAttempt::ConflictAborted { files, abort })
+                    }
+                    // Not a conflict (dirty base, unmergeable ref): no abort
+                    // ran, and the text is passed through as before.
                     Err(error) => Err(WorktreeOpError::Internal(error.to_string())),
                 }
             }

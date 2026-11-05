@@ -234,6 +234,59 @@ Notes for client authors:
   repository root, a workspace path used as a log locator, or a `file://` URL,
   and no endpoint accepts a host path or filename.
 
+#### Merging a worktree remotely
+
+Two separately advertised commands merge a worktree's branch into base. Both
+take only `target.worktree_id` and an empty `params` object, and both run the
+same base merge (`git merge --no-ff`), root guard, and `on_merged` hook the TUI
+uses. They differ only in what a conflict does:
+
+- `merge_worktree` **preserves** a conflict. It fails `merge_conflict` with the
+  conflicting files, leaves `MERGE_HEAD` and the conflicted index in place for
+  local or TUI resolution (`recovery: local_or_tui_required`), and every later
+  incompatible mutation is `root_busy` until that happens. Its behavior,
+  parameters, and the capability `merge_conflict_preserves_state: true` are
+  unchanged.
+- `merge_worktree_abort_on_conflict` **aborts** a conflict, the way the TUI's
+  `M` does. A conflict the fresh targeted inspection already predicts is
+  refused as `merge_conflict_predicted` before any Git mutation, with the
+  files in the result. A conflict that only appears when the merge runs gets
+  exactly one `git merge --abort`, whose exit status is recorded, and then
+  three repository reads decide whether the base was restored: `HEAD` equals
+  the pre-merge commit, no `MERGE_HEAD` exists, and the root working directory
+  is clean under the read-only status policy.
+
+Restoration is reported from those reads, never from the abort attempt:
+
+| `abort.restored` | error code | meaning |
+|---|---|---|
+| `confirmed` | `merge_conflict_aborted` | the merge failed; all three reads passed, so the root is at `premerge_head`, clean, with no `MERGE_HEAD`; another merge is admissible |
+| `failed` | `merge_abort_failed` | every read answered and at least one failed — for example the abort exited non-zero and `MERGE_HEAD` is still there |
+| `unknown` | `merge_abort_failed` | at least one read could not be answered |
+
+The settled record's `result` has `kind: merge_abort` on success and on each
+of those three refusals: `outcome` (`merged`, `predicted_conflict`,
+`conflict_aborted`, `abort_failed`), `premerge_head`, `conflict_files`,
+`abort` (`exit_ok`, `head_after`, `merge_head_present`, `clean_after`,
+`restored`, `detail`), and `recovery`, which is `local_or_tui_required` only
+for `merge_abort_failed`. A `merge_abort_failed` record never claims the state
+was preserved on purpose; it reports what was observed. While `MERGE_HEAD`
+remains, incompatible mutations are `root_busy` until local or TUI recovery.
+If `MERGE_HEAD` is gone but the root is dirty, the next merge is refused by the
+ordinary clean-working-directory check (`internal_error`, "Working directory
+is not clean"), not reported as `root_busy`. The owner never retries the abort
+and never runs `git reset` or any other compensation, and a server relaying
+these commands performs none either. `on_merged` runs only after a completed
+merge, exactly once.
+
+Discover the command through `capabilities.worktrees.merge_abort`
+(`available`, `command`, `predicted_conflict_refused`, `restore_verification`,
+`reasons`) and the `merge_abort` entry in `worktrees.operations`. An owner
+built before this command omits the block, which a client decodes as
+`available: false`; such an owner refuses the command type with
+`validation_failed` before any effect, and serves `merge_worktree` exactly as
+before.
+
 The full schema is generated at runtime rather than tracked in the repository.
 Export it with `cflx openapi > openapi.yaml`, or fetch it from a running
 instance at `GET /api/v2/openapi.yaml`; both return the same document.

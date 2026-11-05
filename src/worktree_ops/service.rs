@@ -20,9 +20,10 @@
 //! * the TUI keeps its local recovery `skip_teardown` escape hatch and it is the
 //!   only caller that may grant `allow_known_dirty`, and only after a second,
 //!   explicitly destructive operator confirmation;
-//! * `/api/v2` is fail-closed on both and preserves a conflicted merge instead
-//!   of aborting it, because a remote client has no way to inspect or resolve
-//!   the intermediate state.
+//! * `/api/v2` is fail-closed on both. Its `merge_worktree` preserves a
+//!   conflicted merge instead of aborting it, because a remote client has no
+//!   way to inspect or resolve the intermediate state; the separately chosen
+//!   `merge_worktree_abort_on_conflict` aborts with verified restoration.
 //!
 //! Every safety observation deletion depends on is tri-state. An observation
 //! that failed is [`SafetyFact::Unknown`] or [`DirtyState::Unknown`], never a
@@ -284,6 +285,22 @@ pub enum WorktreeOpError {
         /// How the conflict must be resolved.
         recovery: &'static str,
     },
+    /// The fresh inspection predicted a conflict, so an aborting merge was
+    /// refused before any Git mutation.
+    PredictedConflict {
+        /// Repository-relative paths the inspection reported.
+        files: Vec<String>,
+    },
+    /// The base merge conflicted and `git merge --abort` was attempted.
+    ///
+    /// Whether the base was actually restored is `abort.restored`, read back
+    /// from the repository — never inferred from the attempt.
+    MergeConflictAborted {
+        /// Repository-relative conflicted paths.
+        files: Vec<String>,
+        /// The verified abort report.
+        abort: Box<crate::vcs::git::commands::AbortReport>,
+    },
     /// Sanitized failure from the underlying boundary.
     Internal(String),
 }
@@ -306,6 +323,14 @@ impl fmt::Display for WorktreeOpError {
                 files.join(", "),
                 recovery
             ),
+            // Unchanged from the untyped refusal this replaced, so existing
+            // operator-facing text holds.
+            Self::PredictedConflict { .. } => write!(f, "the worktree conflicts with base"),
+            Self::MergeConflictAborted { files, abort } => write!(
+                f,
+                "{}",
+                crate::vcs::git::commands::abort_message(files, abort)
+            ),
         }
     }
 }
@@ -320,7 +345,8 @@ pub type WorktreeOpResult<T> = Result<T, WorktreeOpError>;
 /// How a conflicting base merge is disposed of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
-    /// Run `git merge --abort` and report the conflict as a failure (TUI).
+    /// Refuse a predicted conflict, abort a real one, and verify restoration
+    /// (TUI and `merge_worktree_abort_on_conflict`).
     AbortOnConflict,
     /// Leave `MERGE_HEAD` and the conflicted index in place (`/api/v2`).
     PreserveConflict,
@@ -704,9 +730,9 @@ pub fn classify_merge_eligibility(
     // anyway. The preserving caller runs the merge so the evidence it promises
     // its clients actually exists in the repository.
     if policy == ConflictPolicy::AbortOnConflict && !facts.conflict_files.is_empty() {
-        return Err(WorktreeOpError::Ineligible(
-            "the worktree conflicts with base".to_string(),
-        ));
+        return Err(WorktreeOpError::PredictedConflict {
+            files: facts.conflict_files.clone(),
+        });
     }
     match facts.has_commits_ahead {
         SafetyFact::Yes => {}
@@ -751,10 +777,17 @@ use super::same_path;
 pub enum MergeAttempt {
     /// The merge produced a merge commit.
     Merged,
-    /// The merge conflicted. Whether state was preserved is the policy's business.
+    /// The merge conflicted and its intermediate state was preserved.
     Conflict {
         /// Repository-relative conflicted paths.
         files: Vec<String>,
+    },
+    /// The merge conflicted and `git merge --abort` was attempted and verified.
+    ConflictAborted {
+        /// Repository-relative conflicted paths.
+        files: Vec<String>,
+        /// The verified abort report.
+        abort: crate::vcs::git::commands::AbortReport,
     },
 }
 
@@ -1240,6 +1273,23 @@ impl WorktreeService {
                 return Err(error);
             }
         };
+
+        if let MergeAttempt::ConflictAborted { files, abort } = attempt {
+            let error = WorktreeOpError::MergeConflictAborted {
+                files,
+                abort: Box::new(abort),
+            };
+            self.events
+                .emit(WorktreeOperationEvent::MergeFailed {
+                    branch: facts.branch.clone(),
+                    error: error.to_string(),
+                })
+                .await;
+            // No `on_merged`, no retried abort, no further compensation: the
+            // report says what the repository looks like, and recovery from an
+            // unconfirmed restoration belongs to the local operator.
+            return Err(error);
+        }
 
         if let MergeAttempt::Conflict { files } = attempt {
             let error = WorktreeOpError::MergeConflict {

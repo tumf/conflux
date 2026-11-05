@@ -81,6 +81,17 @@ pub enum ErrorCode {
     WorktreeDirtyUnknown,
     /// The base merge conflicted and its intermediate state was preserved.
     MergeConflict,
+    /// `merge_worktree_abort_on_conflict` refused a conflict the fresh
+    /// targeted inspection predicted, before any Git mutation.
+    MergeConflictPredicted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict, ran
+    /// `git merge --abort`, and proved the root restored: `HEAD` is the
+    /// pre-merge commit, no `MERGE_HEAD` exists, and the root is clean.
+    MergeConflictAborted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict and restoration
+    /// was not proven: the abort failed or a verification could not be read.
+    /// Recovery is local or TUI; nothing claims state was preserved on purpose.
+    MergeAbortFailed,
     /// The addressed execution exists, but the presented instance/change
     /// binding is not the one it belongs to.
     ///
@@ -122,6 +133,9 @@ impl ErrorCode {
             | Self::WorktreeDirty
             | Self::WorktreeDirtyUnknown
             | Self::MergeConflict
+            | Self::MergeConflictPredicted
+            | Self::MergeConflictAborted
+            | Self::MergeAbortFailed
             | Self::ExecutionBindingMismatch
             | Self::RefreshRefused => StatusCode::CONFLICT,
             Self::TransportNotPermitted => StatusCode::FORBIDDEN,
@@ -150,6 +164,9 @@ impl ErrorCode {
             Self::WorktreeDirty => "worktree_dirty",
             Self::WorktreeDirtyUnknown => "worktree_dirty_unknown",
             Self::MergeConflict => "merge_conflict",
+            Self::MergeConflictPredicted => "merge_conflict_predicted",
+            Self::MergeConflictAborted => "merge_conflict_aborted",
+            Self::MergeAbortFailed => "merge_abort_failed",
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
@@ -159,7 +176,7 @@ impl ErrorCode {
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 20] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -176,6 +193,9 @@ pub const ALL_ERROR_CODES: [ErrorCode; 20] = [
     ErrorCode::WorktreeDirty,
     ErrorCode::WorktreeDirtyUnknown,
     ErrorCode::MergeConflict,
+    ErrorCode::MergeConflictPredicted,
+    ErrorCode::MergeConflictAborted,
+    ErrorCode::MergeAbortFailed,
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
@@ -342,6 +362,19 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Merge a worktree's branch into base, aborting on conflict.
+    ///
+    /// A separate command rather than a parameter on `merge_worktree`, so that
+    /// command's conflict-preserving contract holds for every call of it. A
+    /// predicted conflict is refused before any Git mutation; a real one is
+    /// aborted and the restoration is verified from the repository.
+    MergeWorktreeAbortOnConflict {
+        /// The worktree to merge.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
     /// Refresh one candidate's `proposal.md` from an explicit source commit.
     ///
     /// Takes the two full commit IDs a `refresh-preview` read returned. Exactly
@@ -408,6 +441,7 @@ impl CommandSpec {
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
+            Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
             Self::RefreshProposal { .. } => "refresh_proposal",
         }
     }
@@ -464,13 +498,15 @@ impl CommandSpec {
             // one change.
             Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
-            Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
+            Self::DeleteWorktree { .. }
+            | Self::MergeWorktree { .. }
+            | Self::MergeWorktreeAbortOnConflict { .. } => None,
         }
     }
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 16] = [
+pub const SUPPORTED_COMMANDS: [&str; 17] = [
     "start",
     "stop",
     "cancel_stop",
@@ -487,6 +523,7 @@ pub const SUPPORTED_COMMANDS: [&str; 16] = [
     "delete_worktree",
     "merge_worktree",
     "refresh_proposal",
+    "merge_worktree_abort_on_conflict",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -2055,6 +2092,112 @@ pub enum CommandResult {
     /// write (a hook rejection, an unexpected tree) left real Git state behind,
     /// and the effects object is the only truthful account of it.
     RefreshProposal(Box<RefreshProposalResult>),
+    /// Settlement evidence for `merge_worktree_abort_on_conflict`.
+    ///
+    /// Present on success and on every refusal after eligibility
+    /// (`merge_conflict_predicted`, `merge_conflict_aborted`,
+    /// `merge_abort_failed`), because a client must be able to tell a proven
+    /// restoration from an unproven one without parsing prose.
+    MergeAbort(Box<MergeAbortResult>),
+}
+
+/// How an abort-on-conflict merge settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortOutcome {
+    /// The merge completed.
+    Merged,
+    /// Refused before any Git mutation.
+    PredictedConflict,
+    /// Conflicted, aborted, and restoration was confirmed.
+    ConflictAborted,
+    /// Conflicted, and restoration was not confirmed.
+    AbortFailed,
+}
+
+/// How far the root was proven restored after `git merge --abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortRestoration {
+    /// `HEAD` is the pre-merge commit, no `MERGE_HEAD`, and the root is clean.
+    Confirmed,
+    /// Every verification was read and at least one failed.
+    Failed,
+    /// At least one verification could not be read.
+    Unknown,
+}
+
+impl From<crate::vcs::git::commands::Restoration> for MergeAbortRestoration {
+    fn from(value: crate::vcs::git::commands::Restoration) -> Self {
+        use crate::vcs::git::commands::Restoration;
+        match value {
+            Restoration::Confirmed => Self::Confirmed,
+            Restoration::Failed => Self::Failed,
+            Restoration::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// What `git merge --abort` did, re-read from the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortEvidence {
+    /// Exit status of `git merge --abort`.
+    pub exit_ok: bool,
+    /// `HEAD` after the abort; `null` when it could not be read.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub clean_after: Option<bool>,
+    /// The verdict derived from the facts above, never from the attempt alone.
+    pub restored: MergeAbortRestoration,
+    /// Bounded, sanitized tail of the abort's own output.
+    pub detail: String,
+}
+
+impl MergeAbortEvidence {
+    /// Project the VCS report onto the wire.
+    pub fn from_report(report: &crate::vcs::git::commands::AbortReport) -> Self {
+        Self {
+            exit_ok: report.exit_ok,
+            head_after: report.head_after.clone(),
+            merge_head_present: report.merge_head_present,
+            clean_after: report.clean_after,
+            restored: report.restored.into(),
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// The settled body of a `merge_worktree_abort_on_conflict` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortResult {
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// The merged branch; empty when it could not be observed.
+    pub branch: String,
+    /// How the command settled.
+    pub outcome: MergeAbortOutcome,
+    /// `HEAD` before `git merge` ran; `null` when no merge ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub premerge_head: Option<String>,
+    /// Repository-relative conflicting paths; empty after a clean merge.
+    pub conflict_files: Vec<String>,
+    /// The verified abort report; `null` when no abort ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub abort: Option<MergeAbortEvidence>,
+    /// `local_or_tui_required` when restoration was not confirmed; else `null`.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub recovery: Option<String>,
 }
 
 /// What a candidate proposal refresh actually did, re-read from Git.
