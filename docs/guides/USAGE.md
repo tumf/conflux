@@ -229,10 +229,138 @@ Notes for client authors:
   `cancelled_phase`, `last_completed_phase`, `apply_commit` (whose `present:
   null` means *unknown*, not absent), and `effects_rolled_back`, which is always
   `false` because dequeue never undoes completed worktree work.
+- Progress and timing come from three snapshot members, all process-local and
+  zero, `false`, or empty again after the owner restarts:
+  - `changes[].archive_complete` is `true` exactly when the reducer recorded
+    archive completion for the change in this process. It is not
+    `display_status`: an archived change truthfully advances to `resolving`,
+    `resolve pending`, `merge wait`, `merged`, or `pushed`, while a
+    fresh-process resolve retry shows `resolving` with `archive_complete:
+    false`. It is not merge or push success either.
+  - `changes[].timing` is *per run*: `processing_started` discards the previous
+    run's boundaries and `elapsed_ms` is the finished run's duration.
+    `changes[].net_active` is the *cumulative* counterpart, the same net
+    execution time the TUI row shows: closed active intervals in
+    `accumulated_ms`, plus the open one starting at `active_since` (`null`
+    while closed). An interval opens on a transition into `preparing`,
+    `applying`, `accepting`, `rejecting`, `archiving`, or `resolving`, closes on
+    any other status or on process `Stopped`, and is never reset while the
+    owner runs.
+  - `run_clock` is the TUI `Elapsed` line, boundary for boundary: an accepted
+    Start while the owner is not running opens it (`started_at` set,
+    `ended_at` and `elapsed_ms` `null`); a persistent-idle park, persistent-idle
+    re-admission, `ResolveReserved`, and a fatal process error leave it open;
+    every `Stopped`, every `AllCompleted`, and a resolve settlement that leaves
+    nothing processing freeze it, and a repeated terminal event re-freezes it at
+    the later instant. The value stays until the next opening Start.
+
+  No member is a live counter, so time passing never advances `state_revision`.
+  Derive live values yourself: `accumulated_ms + (now - active_since)` while
+  `active_since` is set, and `now - started_at` while `ended_at` is `null`. An
+  owner built before these members omits them; decode the absence as
+  "unpublished", never as `false` or zero.
 - Log content is available through `GET /logs`, `/events`, and `/ws` only. No
   response, schema, event, or command result discloses a log file path, a
   repository root, a workspace path used as a log locator, or a `file://` URL,
   and no endpoint accepts a host path or filename.
+
+### Configured-command worktree sessions
+
+The Worktrees view's `Enter` and `+` keys run the *configured*
+`worktree_command`. The same two actions are available over `/api/v2`, and they
+never take a command from the client:
+
+```bash
+# Run the configured command in an existing worktree (opaque ID from GET /worktrees).
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "run_worktree_command", "target": {"worktree_id": "<32 hex>"}, "params": {},
+  "expected_revision": 12, "idempotency_key": "session-1"
+}'
+
+# Create a ws-session-* worktree exactly as `+` does, then run the command there.
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "create_session_worktree", "params": {},
+  "expected_revision": 12, "idempotency_key": "session-2"
+}'
+
+curl -H "$AUTH" "$BASE/worktree-sessions"               # newest first
+curl -H "$AUTH" "$BASE/worktree-sessions/$SESSION_ID"   # one session with its output tail
+
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "stop_worktree_session", "target": {"session_id": "'$SESSION_ID'"}, "params": {},
+  "expected_revision": 12, "idempotency_key": "stop-1"
+}'
+```
+
+- **Configured command only.** The command is the configured `worktree_command`
+  template with `{workspace_dir}` and `{repo_root}` expanded by the owner. No
+  request field carries a command, argv, environment, path, branch, or base
+  commit; any such member is a 422 `validation_failed`. Without a configured
+  template, outside a Git repository, or while the owner is shutting down,
+  launches are refused `worktree_session_unavailable` before any Git or process
+  effect. A headless `cflx run` binds no command executor, so it answers
+  `command_executor_unbound`. `GET /capabilities` reports
+  `worktree_sessions.available` and the limits below.
+- **Same runner as the TUI.** `sh -c`, stdin from `/dev/null` (there is no
+  stdin relay and no PTY), its own process group, the stagger slot, and the
+  configured retry policy. Configured retries happen *inside* one session and
+  show up as `attempt`; they never create a second session.
+- **Single flight.** An exact replay of an idempotency key returns the original
+  record and launches nothing. A new request for a worktree whose session is
+  still running is `worktree_session_busy` with `reason=worktree_busy`. At most
+  4 sessions run at once; the fifth is `worktree_session_busy` with
+  `reason=capacity`, refused before any Git effect, so a refused
+  `create_session_worktree` creates no worktree and no branch.
+- **Provisioning matches `+`.** `create_session_worktree` creates a
+  `ws-session-<random>` branch at base `HEAD` under the workspace base directory,
+  validates the cwd after creation, runs `.wt/setup`, and validates again after
+  setup and immediately before launch. When `.wt/setup` fails, the worktree is
+  removed exactly as the TUI removes it — forced, teardown skipped — and the
+  `ws-session-*` branch is **retained**; nothing is launched, and the record
+  fails `worktree_session_setup_failed` with `result.cleanup` `removed` or
+  `retained` plus a reason. An invalid cwd at any validation is
+  `target_ineligible` with `reason=cwd_invalid` and launches nothing. The
+  result's `session_kind` is `existing` or `session`.
+- **Stop.** `stop_worktree_session` cancels through the runner's own handle:
+  SIGTERM to the session's process group, SIGKILL after 5 seconds, verified
+  group cleanup, and no further attempt even with retries configured. The
+  record settles only after the leader is reaped and the cleanup report is read,
+  with `result.terminated` and `result.state_after`; a session that had already
+  finished settles `no_op`. Descendants that left the process group (`setsid`,
+  daemonization) are outside this guarantee. Owner shutdown stops every running
+  session the same way under a 10-second deadline. Scheduler `stop`,
+  `stop_and_dequeue`, and `force_stop` never touch sessions.
+- **Deletion is refused while a session runs.** `delete_worktree` — and the
+  TUI's own deletion keys — refuse a worktree whose session is running with
+  `target_ineligible` ("a worktree session is running"). Merging is not gated.
+- **Retention.** Sessions are in memory only: running sessions are never
+  evicted, at most 32 finished ones are kept (oldest evicted first), nothing is
+  written to disk, and a restart forgets everything. Sessions never influence
+  scheduling, resume, acceptance, or archive.
+- **The output tail is the command's own data.** `output.lines` holds the
+  newest 64 KiB of stdout/stderr lines (`truncated_bytes` counts what was
+  dropped), passed through the same sanitizer as log lines: ANSI and control
+  sequences stripped, each line bounded at 8 KiB, **nothing redacted**. If the
+  configured command prints its arguments, its environment, or its cwd, every
+  bearer-authenticated reader of the session resource sees them. Choosing a
+  `worktree_command` that does not print secrets is the operator's
+  responsibility. The runner's own stderr notices (a `[Retry N/M]` line before
+  each configured retry, from which `attempt` is counted, and process-group
+  cleanup diagnostics) are interleaved in the same tail. A stopped session
+  reports `signal: "SIGTERM"`, the signal the cancellation path sends first;
+  its SIGKILL escalation is not reported separately. The tail is published
+  nowhere else: never as an event, a log
+  entry, or a snapshot field. Owner-generated members (`path`, `branch`,
+  results, error detail, events) never contain the template, the expanded
+  command, environment values, or an absolute path.
+- **Events.** `worktree_session_started` and `worktree_session_finished` carry
+  `{session_id, worktree_id, state, exit_code}`. They take an event sequence but
+  never advance `state_revision`. `GET /execution-status` reports
+  `process.worktree_sessions_running`.
+- **Older owners.** An owner built before this surface omits
+  `capabilities.worktree_sessions` (decode it as unavailable) and answers each
+  of the three commands with `validation_failed` before any effect. `cflx client`
+  and `cflx client mcp` have no session verb.
 
 #### Merging a worktree remotely
 

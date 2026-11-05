@@ -526,14 +526,15 @@ impl ChangeState {
     /// Idempotent by construction: repeated active updates — the same active
     /// status re-applied, or one active status following another — must keep
     /// the original start boundary rather than restarting the interval.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_active_interval(&mut self) {
         self.start_active_interval_at(Instant::now());
     }
 
     pub(crate) fn start_active_interval_at(&mut self, now: Instant) {
-        if self.started_at.is_none() {
-            self.started_at = Some(now);
-        }
+        // The shared net-active rule the `/api/v2` projection also applies, so
+        // the two frontends cannot open intervals differently.
+        crate::orchestration::net_active_clock::open_parts(&mut self.started_at, now);
     }
 
     /// Close the current active interval exactly once and add it to the total.
@@ -542,16 +543,17 @@ impl ChangeState {
     /// boundary order-independent: whichever of the stop event and the reducer's
     /// `not queued` synchronization arrives second finds no open interval and
     /// adds nothing.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pause_active_interval(&mut self) {
         self.pause_active_interval_at(Instant::now());
     }
 
     pub(crate) fn pause_active_interval_at(&mut self, now: Instant) {
-        let Some(started) = self.started_at.take() else {
-            return;
-        };
-        let interval = now.saturating_duration_since(started);
-        self.elapsed_time = Some(self.elapsed_time.unwrap_or_default() + interval);
+        crate::orchestration::net_active_clock::close_parts(
+            &mut self.started_at,
+            &mut self.elapsed_time,
+            now,
+        );
     }
 
     /// Net execution time to display: closed intervals plus the open one.
@@ -564,15 +566,7 @@ impl ChangeState {
     }
 
     pub(crate) fn current_total_elapsed_at(&self, now: Instant) -> Option<Duration> {
-        match (self.elapsed_time, self.started_at) {
-            (None, None) => None,
-            (accumulated, open) => Some(
-                accumulated.unwrap_or_default()
-                    + open
-                        .map(|started| now.saturating_duration_since(started))
-                        .unwrap_or_default(),
-            ),
-        }
+        crate::orchestration::net_active_clock::total_parts(self.started_at, self.elapsed_time, now)
     }
 
     /// Whether this row proves execution history — an open interval or a
@@ -584,16 +578,24 @@ impl ChangeState {
         self.started_at.is_some() || self.elapsed_time.is_some()
     }
 
+    /// Open or close the net-active interval for one observed display status.
+    ///
+    /// The same decision [`crate::orchestration::net_active_clock::NetActiveClock::observe_status_at`]
+    /// makes for the `/api/v2` projection, at an injected instant.
+    pub(crate) fn observe_active_status_at(&mut self, status: &str, now: Instant) {
+        if crate::orchestration::operator_command::is_active_status(status) {
+            self.start_active_interval_at(now);
+        } else {
+            self.pause_active_interval_at(now);
+        }
+    }
+
     pub fn set_display_status_cache(&mut self, status: &str) {
         // Net execution timing is centralized here so every status transition —
         // reducer synchronization, event handler, or refresh-derived repaint —
         // accumulates against the one shared active vocabulary instead of a
         // second hand-written list that could fall behind it.
-        if crate::orchestration::operator_command::is_active_status(status) {
-            self.start_active_interval();
-        } else {
-            self.pause_active_interval();
-        }
+        self.observe_active_status_at(status, Instant::now());
         self.display_status_cache = status.to_string();
         self.display_color_cache = match status {
             "not queued" => Color::DarkGray,
@@ -2246,12 +2248,32 @@ impl AppState {
 impl AppState {
     /// Reset stop/cancel state before a new run
     pub fn reset_for_run(&mut self) {
+        self.reset_for_run_at(Instant::now());
+    }
+
+    /// [`AppState::reset_for_run`] at an injected instant.
+    pub(crate) fn reset_for_run_at(&mut self, now: Instant) {
         self.stop_mode = StopMode::None;
         self.current_change = None;
         self.error_change_id = None;
-        self.orchestration_started_at = Some(Instant::now());
-        self.orchestration_elapsed = None;
+        crate::orchestration::run_clock::open_parts(
+            &mut self.orchestration_started_at,
+            &mut self.orchestration_elapsed,
+            now,
+        );
         self.reset_analysis_log_dedupe();
+    }
+
+    /// Freeze the run `Elapsed` value at `now` through the shared run-clock rule.
+    ///
+    /// Overwrites any earlier frozen value whenever a run was started — exactly
+    /// what `started.elapsed()` did inline — and is a no-op before any Start.
+    pub(crate) fn freeze_run_elapsed_at(&mut self, now: Instant) {
+        crate::orchestration::run_clock::freeze_parts(
+            self.orchestration_started_at,
+            &mut self.orchestration_elapsed,
+            now,
+        );
     }
 
     pub(crate) fn reset_analysis_log_dedupe(&mut self) {
@@ -3016,6 +3038,119 @@ mod tests {
             Some(after_first),
             "resuming must not discard the duration already accumulated"
         );
+    }
+
+    /// The row delegates to the shared net-active rule: a row and a standalone
+    /// clock fed the same status sequence at the same instants report equal
+    /// totals and the same open state at every step.
+    #[test]
+    fn remote_progress_timing_tui_row_delegates_without_behavior_change() {
+        use crate::orchestration::net_active_clock::NetActiveClock;
+
+        let base = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut row = timing_row();
+        let mut clock = NetActiveClock::default();
+        let sequence = [
+            (0, "queued"),
+            (2, "applying"),
+            (5, "accepting"),
+            (9, "not queued"),
+            (30, "applying"),
+            (31, "applying"),
+            (40, "error"),
+            (41, "error"),
+            (50, "resolving"),
+            (60, "merged"),
+        ];
+        for (offset, status) in sequence {
+            let now = base + Duration::from_secs(offset);
+            row.observe_active_status_at(status, now);
+            clock.observe_status_at(status, now, wall);
+            assert_eq!(
+                row.current_total_elapsed_at(now + Duration::from_secs(1)),
+                clock.total_at(now + Duration::from_secs(1)),
+                "totals diverged after '{status}' at +{offset}s"
+            );
+            assert_eq!(row.started_at.is_some(), clock.active_since().is_some());
+            assert_eq!(row.has_execution_history(), clock.has_history());
+        }
+        assert_eq!(row.elapsed_time, Some(clock.accumulated()));
+        assert_eq!(clock.accumulated(), Duration::from_secs(7 + 10 + 10));
+    }
+
+    /// The `_at` run-clock entry points apply the shared rule, and the default
+    /// paths still sample a real instant.
+    #[test]
+    fn remote_progress_timing_run_clock_delegates_without_behavior_change() {
+        use crate::orchestration::run_clock::RunClock;
+        use crate::tui::types::AppExecutionMode;
+
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        let mut clock = RunClock::default();
+
+        app.freeze_run_elapsed_at(t0);
+        clock.freeze_at(t0, wall);
+        assert_eq!(app.orchestration_elapsed, None);
+        assert_eq!(clock.frozen(), None);
+
+        app.reset_for_run_at(t0);
+        clock.open_at(t0, wall);
+        assert_eq!(
+            app.orchestration_started_at,
+            clock.started().map(|(i, _)| i)
+        );
+        assert_eq!(app.orchestration_elapsed, None);
+
+        app.execution_mode = AppExecutionMode::Running;
+        app.handle_stopped_at(t0 + Duration::from_secs(4));
+        clock.freeze_at(t0 + Duration::from_secs(4), wall);
+        assert_eq!(app.orchestration_elapsed, clock.frozen().map(|(d, _)| d));
+
+        app.handle_all_completed_at(t0 + Duration::from_secs(6));
+        clock.freeze_at(t0 + Duration::from_secs(6), wall);
+        assert_eq!(app.orchestration_elapsed, Some(Duration::from_secs(6)));
+        assert_eq!(app.orchestration_elapsed, clock.frozen().map(|(d, _)| d));
+
+        app.reset_for_run_at(t0 + Duration::from_secs(10));
+        clock.open_at(t0 + Duration::from_secs(10), wall);
+        app.execution_mode = AppExecutionMode::Running;
+        app.try_transition_to_select_at(t0 + Duration::from_secs(13));
+        clock.freeze_at(t0 + Duration::from_secs(13), wall);
+        assert_eq!(app.orchestration_elapsed, Some(Duration::from_secs(3)));
+        assert_eq!(app.orchestration_elapsed, clock.frozen().map(|(d, _)| d));
+
+        // Default paths: unchanged behavior, still `Some` started/elapsed.
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.reset_for_run();
+        assert!(app.orchestration_started_at.is_some());
+        assert!(app.orchestration_elapsed.is_none());
+        app.handle_stopped();
+        assert!(app.orchestration_elapsed.is_some());
+        app.reset_for_run();
+        app.handle_all_completed();
+        assert!(app.orchestration_elapsed.is_some());
+        app.reset_for_run();
+        app.execution_mode = AppExecutionMode::Running;
+        app.try_transition_to_select();
+        assert!(app.orchestration_elapsed.is_some());
+    }
+
+    /// A fatal process error does not freeze the run clock (existing behavior,
+    /// now pinned): the `Elapsed` line keeps counting live in Error.
+    #[test]
+    fn remote_progress_timing_tui_error_leaves_elapsed_open() {
+        let t0 = Instant::now();
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.reset_for_run_at(t0);
+        app.execution_mode = crate::tui::types::AppExecutionMode::Running;
+
+        app.handle_error("boom".to_string());
+
+        assert_eq!(app.orchestration_started_at, Some(t0));
+        assert_eq!(app.orchestration_elapsed, None);
     }
 
     fn visible_filtered_messages(app: &AppState) -> Vec<String> {

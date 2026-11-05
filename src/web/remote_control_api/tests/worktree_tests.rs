@@ -754,7 +754,8 @@ async fn remote_worktree_capabilities_report_the_operations_and_recovery_boundar
             "delete",
             "merge",
             "merge_abort",
-            "text"
+            "text",
+            "session"
         ]
     );
     assert_eq!(body["worktrees"]["merge_abort"]["available"], true);

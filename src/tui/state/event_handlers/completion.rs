@@ -20,14 +20,17 @@ impl AppState {
     }
 
     pub(crate) fn handle_all_completed(&mut self) {
+        self.handle_all_completed_at(std::time::Instant::now());
+    }
+
+    /// [`AppState::handle_all_completed`] at an injected instant.
+    pub(crate) fn handle_all_completed_at(&mut self, now: std::time::Instant) {
         self.reset_analysis_log_dedupe();
         // Shared with the `/api/v2` projection so a late or duplicate
         // `AllCompleted` cannot leave the two frontends reporting different
         // terminal states for the same run.
         if !crate::events::all_completed_may_overwrite_mode(self.terminal_mode_name()) {
-            if let Some(started) = self.orchestration_started_at {
-                self.orchestration_elapsed = Some(started.elapsed());
-            }
+            self.freeze_run_elapsed_at(now);
             return;
         }
 
@@ -40,9 +43,7 @@ impl AppState {
         self.execution_mode = AppExecutionMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;
-        if let Some(started) = self.orchestration_started_at {
-            self.orchestration_elapsed = Some(started.elapsed());
-        }
+        self.freeze_run_elapsed_at(now);
         self.add_log(LogEntry::success("All changes processed successfully"));
     }
 

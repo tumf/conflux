@@ -272,6 +272,7 @@ pub(crate) fn observation_for_test(changes: Vec<ChangeResource>) -> Observation 
             },
             proposal_refresh: Default::default(),
             text_edit: Default::default(),
+            worktree_sessions: Default::default(),
         },
         instance: InstanceResponse {
             instance_id: instance_id.clone(),
@@ -300,6 +301,7 @@ pub(crate) fn observation_for_test(changes: Vec<ChangeResource>) -> Observation 
                 has_active_work: false,
                 active_activities: Vec::new(),
                 latest_log: None,
+                worktree_sessions_running: 0,
             },
             changes: Vec::new(),
         },

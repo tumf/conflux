@@ -1445,9 +1445,20 @@ mod tests {
         setup_calls: std::sync::atomic::AtomicUsize,
         cleanup_calls: std::sync::atomic::AtomicUsize,
         execute_calls: std::sync::atomic::AtomicUsize,
+        /// Every seam call by name, in order, for the order-equivalence check
+        /// against the shared session provisioner.
+        steps: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl StubPlusRuntime {
+        fn step(&self, name: &'static str) {
+            self.steps.lock().unwrap().push(name);
+        }
+
+        fn steps(&self) -> Vec<&'static str> {
+            self.steps.lock().unwrap().clone()
+        }
+
         fn new() -> Self {
             Self {
                 is_git_repo: true,
@@ -1460,6 +1471,7 @@ mod tests {
                 setup_calls: std::sync::atomic::AtomicUsize::new(0),
                 cleanup_calls: std::sync::atomic::AtomicUsize::new(0),
                 execute_calls: std::sync::atomic::AtomicUsize::new(0),
+                steps: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1467,6 +1479,7 @@ mod tests {
     #[async_trait]
     impl WorktreePlusRuntime for StubPlusRuntime {
         async fn check_git_repo(&self, _repo_root: &Path) -> VcsResult<bool> {
+            self.step(crate::worktree_ops::session::step::CHECK_GIT_REPO);
             Ok(self.is_git_repo)
         }
 
@@ -1476,6 +1489,7 @@ mod tests {
             _prefix: &str,
             _max_attempts: u32,
         ) -> VcsResult<String> {
+            self.step(crate::worktree_ops::session::step::GENERATE_BRANCH);
             Ok(self.branch_name.clone())
         }
 
@@ -1486,6 +1500,7 @@ mod tests {
             _branch_name: &str,
             _base_commit: &str,
         ) -> VcsResult<()> {
+            self.step(crate::worktree_ops::session::step::WORKTREE_ADD);
             self.worktree_add_calls.fetch_add(1, Ordering::SeqCst);
             std::fs::create_dir_all(worktree_path).unwrap();
             Ok(())
@@ -1496,6 +1511,7 @@ mod tests {
             _repo_root: &Path,
             _worktree_path: &Path,
         ) -> VcsResult<()> {
+            self.step(crate::worktree_ops::session::step::VALIDATE_CWD);
             let call = self.validation_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_validation_at == Some(call) {
                 return Err(crate::vcs::VcsError::git_command(format!(
@@ -1510,6 +1526,7 @@ mod tests {
             _repo_root: &Path,
             _worktree_path: &Path,
         ) -> VcsResult<()> {
+            self.step(crate::worktree_ops::session::step::RUN_SETUP);
             self.setup_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(message) = &self.setup_error {
                 return Err(crate::vcs::VcsError::git_command(message.clone()));
@@ -1522,6 +1539,7 @@ mod tests {
             _repo_root: &Path,
             _worktree_path: &str,
         ) -> VcsResult<()> {
+            self.step(crate::worktree_ops::session::step::CLEANUP);
             self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(message) = &self.cleanup_error {
                 return Err(crate::vcs::VcsError::git_command(message.clone()));
@@ -1714,6 +1732,51 @@ mod tests {
             .await
             .unwrap();
         assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
+
+    /// The TUI `+` handler and the `/api/v2` session provisioner are separate
+    /// code paths over the same VCS functions; this list is what keeps them
+    /// from drifting (the provisioner asserts the same list in
+    /// `worktree_ops::service::tests`).
+    #[tokio::test]
+    async fn remote_worktree_session_tui_plus_order_matches_the_shared_list() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config = plus_config("true");
+
+        let mut app = worktrees_app();
+        let runtime = StubPlusRuntime::new();
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+        assert!(prepared.is_some());
+        assert_eq!(
+            runtime.steps(),
+            crate::worktree_ops::session::PLUS_STEP_ORDER.to_vec()
+        );
+
+        let mut app = worktrees_app();
+        let runtime = StubPlusRuntime {
+            setup_error: Some("setup exploded".to_string()),
+            ..StubPlusRuntime::new()
+        };
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+        assert!(prepared.is_none());
+        assert_eq!(
+            runtime.steps(),
+            crate::worktree_ops::session::PLUS_SETUP_FAILURE_STEP_ORDER.to_vec()
+        );
     }
 
     #[tokio::test]
