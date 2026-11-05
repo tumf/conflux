@@ -1278,6 +1278,329 @@ fn remote_merge_abort_contract_is_published_end_to_end() {
         .any(|error| error.contains("merge_abort_failed")));
 }
 
+/// Everything a client of consent-bound confirmed deletion branches on.
+fn confirmed_delete_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let properties_of = |schema: &Value| -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let required_of = |schema: &Value| -> BTreeSet<String> {
+        schema["required"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let spec = schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["type"]["enum"][0] == "delete_worktree_confirmed"
+            })
+        })
+        .cloned();
+    match spec {
+        None => errors.push("the delete_worktree_confirmed command is not published".into()),
+        Some(spec) => {
+            let properties = properties_of(&spec);
+            if properties != BTreeSet::from(["type", "target", "params"].map(String::from)) {
+                errors.push(format!(
+                    "delete_worktree_confirmed must accept only target and params: {properties:?}"
+                ));
+            }
+            if !spec["properties"]["params"]
+                .to_string()
+                .contains("ConfirmedDeleteParams")
+            {
+                errors
+                    .push("delete_worktree_confirmed params must be ConfirmedDeleteParams".into());
+            }
+        }
+    }
+
+    let params = &schemas(doc)["ConfirmedDeleteParams"];
+    let expected_params = BTreeSet::from(
+        [
+            "skip_teardown",
+            "discard_known_dirty",
+            "discard_commits_ahead",
+            "consent",
+        ]
+        .map(String::from),
+    );
+    if properties_of(params) != expected_params || required_of(params) != expected_params {
+        errors.push(format!(
+            "ConfirmedDeleteParams must require exactly the three permissions and consent: {params}"
+        ));
+    }
+    if params["additionalProperties"] != Value::Bool(false) {
+        errors.push("ConfirmedDeleteParams must refuse unknown members".into());
+    }
+    let consent = &schemas(doc)["DeleteConsent"];
+    let consent_fields = BTreeSet::from(
+        [
+            "branch",
+            "head",
+            "dirty",
+            "has_commits_ahead",
+            "has_ignored_content",
+            "merge_base",
+            "discardable_content_id",
+            "ignored_content_id",
+        ]
+        .map(String::from),
+    );
+    if properties_of(consent) != consent_fields {
+        errors.push(format!(
+            "DeleteConsent must hold exactly the eight consent fields: {:?}",
+            properties_of(consent)
+        ));
+    }
+    if consent["additionalProperties"] != Value::Bool(false) {
+        errors.push("DeleteConsent must refuse unknown members".into());
+    }
+
+    let preview = &doc["paths"]["/api/v2/worktrees/{worktree_id}/delete-preview"]["get"];
+    if preview.is_null() {
+        errors.push("the delete-preview route is not published".into());
+    } else if !preview.to_string().contains("DeletePreviewResponse") {
+        errors.push("the delete-preview route must answer DeletePreviewResponse".into());
+    }
+    let response = &schemas(doc)["DeletePreviewResponse"];
+    for member in [
+        "observed_at",
+        "branch",
+        "head",
+        "is_main",
+        "dirty",
+        "has_commits_ahead",
+        "inspection",
+        "content_observation",
+        "has_ignored_content",
+        "ignored_entries",
+        "teardown_script_present",
+        "options",
+        "consent",
+    ] {
+        if !required_of(response).contains(member) {
+            errors.push(format!("DeletePreviewResponse must require `{member}`"));
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants.iter().any(|variant| {
+                variant
+                    .to_string()
+                    .contains("\"delete_worktree_confirmed\"")
+            })
+        });
+    if !result_published {
+        errors.push("the delete_worktree_confirmed result kind is not published".into());
+    }
+    let result = &schemas(doc)["ConfirmedDeleteResult"];
+    for member in [
+        "worktree_id",
+        "outcome",
+        "teardown",
+        "dirty_discarded",
+        "commits_discarded",
+        "branch_deleted",
+        "branch_retained_reason",
+        "refusal",
+    ] {
+        if !required_of(result).contains(member) {
+            errors.push(format!("ConfirmedDeleteResult must require `{member}`"));
+        }
+    }
+    let teardown = published_enum(doc, "TeardownDisposition");
+    if teardown != BTreeSet::from(["ran", "skipped", "absent", "not_reached"].map(String::from)) {
+        errors.push(format!("TeardownDisposition vocabulary: {teardown:?}"));
+    }
+    let observation = published_enum(doc, "ContentObservationKind");
+    if observation
+        != BTreeSet::from(
+            [
+                "observed",
+                "status_failed",
+                "unbounded",
+                "nested_repository",
+            ]
+            .map(String::from),
+        )
+    {
+        errors.push(format!(
+            "ContentObservationKind vocabulary: {observation:?}"
+        ));
+    }
+    let reasons = published_enum(doc, "ConfirmedDeleteReason");
+    for reason in [
+        "content_changed",
+        "content_unbounded",
+        "nested_repository",
+        "ignored_content",
+        "teardown_failed",
+    ] {
+        if !reasons.contains(reason) {
+            errors.push(format!("ConfirmedDeleteReason must publish `{reason}`"));
+        }
+    }
+
+    if !published_enum(doc, "ErrorCode").contains("delete_consent_stale") {
+        errors.push("the error code `delete_consent_stale` is not published".into());
+    }
+
+    let worktrees = &schemas(doc)["WorktreeCapabilities"];
+    if worktrees["properties"]["confirmed_delete"].is_null() {
+        errors.push("capabilities.worktrees.confirmed_delete is not published".into());
+    }
+    let worktree_required = required_of(worktrees);
+    if worktree_required.contains("confirmed_delete") {
+        errors.push("confirmed_delete must decode as absent from an older owner".into());
+    }
+    if !worktree_required.contains("delete_requires_teardown") {
+        errors.push("delete_requires_teardown must stay required".into());
+    }
+    let description = worktrees["properties"]["delete_requires_teardown"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    if !description.contains("`delete_worktree` command") {
+        errors.push(format!(
+            "delete_requires_teardown must describe the delete_worktree command: {description}"
+        ));
+    }
+    errors
+}
+
+#[test]
+fn remote_confirmed_delete_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        ConfirmedDeleteRefusalResult, ConfirmedDeleteResult,
+    };
+    use conflux::web::remote_control_api::worktrees::WorktreeCapabilities;
+    use conflux::worktree_ops::consent::{
+        ConfirmedDeleteReason, ConsentObservation, ContentObservationKind, TeardownDisposition,
+    };
+
+    let doc = generated();
+    assert_eq!(confirmed_delete_contract_errors(&doc), Vec::<String>::new());
+    assert!(SUPPORTED_V2_PATHS.contains(&"/api/v2/worktrees/{worktree_id}/delete-preview"));
+    assert!(SUPPORTED_COMMANDS.contains(&"delete_worktree_confirmed"));
+
+    // What the server serializes is what the schema describes.
+    let record = CommandRecord {
+        command_type: "delete_worktree_confirmed".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::DeleteConsentStale),
+        result: Some(CommandResult::DeleteWorktreeConfirmed(Box::new(
+            ConfirmedDeleteResult {
+                worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+                branch: "alpha".to_string(),
+                head: "a".repeat(40),
+                outcome: None,
+                teardown: TeardownDisposition::NotReached,
+                dirty_discarded: false,
+                commits_discarded: false,
+                branch_deleted: false,
+                branch_retained_reason: None,
+                refusal: Some(ConfirmedDeleteRefusalResult {
+                    reason: Some(ConfirmedDeleteReason::ContentChanged),
+                    teardown_ran: false,
+                    observed: Some(ConsentObservation {
+                        branch: "alpha".to_string(),
+                        head: "a".repeat(40),
+                        dirty: Some(true),
+                        has_commits_ahead: Some(false),
+                        has_ignored_content: Some(false),
+                        merge_base: Some("b".repeat(40)),
+                        discardable_content_id: Some(format!("sha256:{}", "c".repeat(64))),
+                        ignored_content_id: Some(format!("sha256:{}", "d".repeat(64))),
+                        content_observation: ContentObservationKind::Observed,
+                    }),
+                }),
+            },
+        ))),
+        ..command_record()
+    };
+    let capabilities = WorktreeCapabilities::default();
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("WorktreeCapabilities", to_value(&capabilities)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        to_value(&record)["result"]["kind"],
+        "delete_worktree_confirmed"
+    );
+    // `delete_requires_teardown` keeps its value; only its description narrowed.
+    assert_eq!(to_value(&capabilities)["delete_requires_teardown"], true);
+    assert_eq!(
+        to_value(&capabilities)["confirmed_delete"]["available"],
+        true
+    );
+
+    // An older owner omits the block: it decodes as unavailable, and its
+    // `delete_requires_teardown: true` still reads the same.
+    let mut older = to_value(&capabilities);
+    older.as_object_mut().unwrap().remove("confirmed_delete");
+    let decoded: WorktreeCapabilities = serde_json::from_value(older).unwrap();
+    assert!(!decoded.confirmed_delete.available);
+    assert!(decoded.delete_requires_teardown);
+
+    // Negative controls: the predicate notices a dropped route, a dropped
+    // result kind, and a delete_requires_teardown that stopped being required.
+    let mut without_route = doc.clone();
+    without_route["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktrees/{worktree_id}/delete-preview");
+    assert_ne!(without_route, doc);
+    assert!(confirmed_delete_contract_errors(&without_route)
+        .iter()
+        .any(|error| error.contains("delete-preview route")));
+
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| {
+            !variant
+                .to_string()
+                .contains("\"delete_worktree_confirmed\"")
+        });
+    assert_ne!(without_kind, doc);
+    assert!(confirmed_delete_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("delete_worktree_confirmed result kind")));
+
+    let mut optional_teardown = doc.clone();
+    optional_teardown["components"]["schemas"]["WorktreeCapabilities"]["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|member| member != "delete_requires_teardown");
+    assert!(confirmed_delete_contract_errors(&optional_teardown)
+        .iter()
+        .any(|error| error.contains("delete_requires_teardown must stay required")));
+}
+
 /// The server always publishes refresh eligibility even though the client
 /// decoder accepts its absence from owners built before refresh existed.
 #[test]

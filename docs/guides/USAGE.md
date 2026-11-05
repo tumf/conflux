@@ -137,10 +137,16 @@ re-observed after teardown and immediately before removal; anything that changed
 or could not be determined refuses and leaves both the worktree and the branch
 in place.
 
-**Remote clients cannot do any of this.** `/api/v2` and the Web UI are
-fail-closed: teardown is mandatory, and a dirty or ahead worktree is reported as
-undeletable with a reason. There is no force flag, no discard parameter, and no
-remote equivalent of the `X` confirmation.
+**Remote clients reach these escalations only through explicit consent.**
+Ordinary remote deletion is unchanged: `/api/v2` `delete_worktree` and the Web
+UI are fail-closed, teardown is mandatory, and a dirty or ahead worktree is
+reported as undeletable with a reason. The same three escalations — skip
+teardown (`S`), discard known uncommitted changes, and discard commits ahead
+including the branch (`X`) — are reachable remotely only through the separate
+`delete_worktree_confirmed` command, each as its own boolean, and only against a
+`consent` object read from `GET /api/v2/worktrees/{worktree_id}/delete-preview`
+and re-verified immediately before teardown and again before removal. See
+[Deleting a worktree remotely](#deleting-a-worktree-remotely).
 
 ## Web Monitoring
 
@@ -316,6 +322,130 @@ built before this command omits the block, which a client decodes as
 `available: false`; such an owner refuses the command type with
 `validation_failed` before any effect, and serves `merge_worktree` exactly as
 before.
+
+#### Deleting a worktree remotely
+
+`delete_worktree` (empty `params`) never changes: it always runs teardown,
+refuses a dirty worktree as `worktree_dirty`, an unobservable one as
+`worktree_dirty_unknown`, and an ahead or main worktree as `target_ineligible`,
+and a `delete_worktree` carrying `skip_teardown` or any discard field is
+`validation_failed`. Its capability `delete_requires_teardown: true` still
+describes exactly that command.
+
+Destructive deletion is a two-step, consent-bound flow:
+
+1. **Preview.** `GET /api/v2/worktrees/{worktree_id}/delete-preview` is a read —
+   no command record, no revision change, nothing written to the worktree. It
+   takes a fresh targeted observation and returns `branch`, `head`, `is_main`,
+   `dirty`, `has_commits_ahead`, `inspection`, `content_observation`,
+   `has_ignored_content`, `ignored_entries`, `teardown_script_present` (true
+   exactly when `.wt/teardown` is a regular file with an execute bit), the
+   eligibility of each option (`ordinary`, `skip_teardown`,
+   `discard_known_dirty` with `entries`, `discard_commits_ahead` with `commits`
+   and `also_discards_dirty`) with a typed `blocked_reason`, and a `consent`
+   object. `observed_at` is informational and is not part of `consent`.
+   Cancelling is simply not submitting anything.
+2. **Command.** `delete_worktree_confirmed` takes `target.worktree_id` and
+   `params` with three independent booleans — `skip_teardown`,
+   `discard_known_dirty`, `discard_commits_ahead` — plus the preview's
+   `consent` echoed verbatim. Either discard permission without both content
+   identities, `discard_commits_ahead` without `merge_base`, or a commit ID that
+   is not 40 lowercase hex is `validation_failed` before anything is observed.
+   All three booleans `false` is an ordinary delete with consent revalidation.
+   When the preview's `discard_commits_ahead.also_discards_dirty` is `true`,
+   that option's eligibility assumes `discard_known_dirty` is sent too; sending
+   only `discard_commits_ahead` then refuses `worktree_dirty`.
+
+**What consent binds.** Exactly eight fields: `branch`, `head`, `dirty`,
+`has_commits_ahead`, `has_ignored_content`, `merge_base`,
+`discardable_content_id`, and `ignored_content_id`, plus the Git identity the
+opaque ID is bound to. The two identities are `sha256:` over the *bytes*
+`git worktree remove --force` would delete beyond `HEAD`:
+
+- `discardable_content_id` covers every staged, unstaged, unmerged, and
+  untracked record of `git status --porcelain=v2 -z --untracked-files=normal
+  --ignored=traditional`, and the on-disk bytes of each path (a symlink by its
+  target string, never followed). A `README` that moved from `A` to `B` under
+  the same `HEAD` and the same `dirty: true` is a different identity.
+- `ignored_content_id` covers every ignored path. Forced removal deletes
+  ignored paths too, so ignored content is disclosed (`has_ignored_content`,
+  `ignored_entries`) and needs `discard_known_dirty` **even when the worktree is
+  Git-clean**; `dirty` itself keeps its `--ignored=no` meaning. Ignored files are
+  bound by their bytes, with type, size, mtime, and mode bound in addition —
+  never metadata alone, so a same-size rewrite with the mtime restored changes
+  the identity.
+- Collapsed directories (`? dir/`, `! dir/` such as `target/`) are walked by the
+  oracle itself, so files at any depth, empty subdirectories, special files,
+  and symlinks beneath them are bound. Every path is resolved from an open
+  worktree descriptor with `O_NOFOLLOW`; files are opened non-blocking, so a
+  FIFO is recorded by type and never read, and no symlink is traversed.
+
+**What refuses, and how.** Under the repository root guard, immediately before
+teardown and again immediately before removal, every consented fact and both
+identities are recomputed. Nothing is removed on any refusal, the worktree and
+its opaque ID are retained, and the settled record's `result` has
+`kind: delete_worktree_confirmed` with `refusal.reason`, `refusal.teardown_ran`,
+and `refusal.observed` — the fresh facts — so a client can re-render its
+confirmation:
+
+| error code | `refusal.reason` |
+|---|---|
+| `delete_consent_stale` | `branch_changed`, `identity_changed`, `head_moved`, `base_moved`, `dirty_changed`, `ahead_changed`, `ignored_changed`, `content_changed` |
+| `worktree_dirty_unknown` | `dirty_unknown`, `content_unobservable`, `content_unbounded` |
+| `target_ineligible` | `ahead_unknown`, `nested_repository`, `main_worktree`, `commits_ahead` |
+| `worktree_dirty` | `dirty`, `ignored_content` |
+| `root_busy` | `root_busy` (a held root guard or a base merge in progress) |
+| `internal_error` | `teardown_failed` |
+
+Unknown is never safe: an unobservable dirty, ahead, or content fact refuses
+whatever permissions were given. Two content outcomes fail closed the same way.
+An actual nested repository — a `.git` entry at any depth, untracked or inside
+an ignored directory, or a status-reported submodule — is `nested_repository`;
+a plain ignored `target/` is walked, not refused. And one combined budget
+covers tracked, untracked, and ignored content together, each path counted
+once: more than 500,000 records (status records plus walked entries) or
+256 MiB of hashed bytes is `content_unbounded`, with both identities `null`.
+No metadata-only, partial, or ignored-excluding identity is ever substituted to
+keep the command available. A worktree past the budget — typically a large
+`target/` or other build output — is **not deletable remotely**: reduce that
+output locally (clean it in place, or run the project's clean or `.wt/teardown`
+yourself), or delete through the TUI, then preview again.
+
+**Teardown.** Without `skip_teardown`, `.wt/teardown` runs (`teardown: ran`, or
+`absent` when there is no executable script) and the facts are re-derived
+afterwards. Teardown exists to clean build output, so the ignored identity may
+afterwards be the consented one *or* empty; any other ignored set, and any
+change to tracked or untracked content, is `delete_consent_stale`
+(`content_changed`) with `teardown_ran: true`. Teardown effects are never
+reversed. A failing teardown is `internal_error` (`teardown_failed`) with the
+worktree retained; recover with a fresh preview and `skip_teardown: true`.
+
+**Success.** `outcome: deleted`, `teardown` (`ran`, `skipped`, `absent`),
+`dirty_discarded`, `commits_discarded`, `branch_deleted`, and
+`branch_retained_reason`, and the opaque ID is retired. `discard_commits_ahead`
+force-deletes the branch only at the consented commit, by atomic
+compare-and-delete; a permission the observed facts do not need changes
+nothing. Nothing is stashed, committed, backed up, or pushed first.
+
+**Guarantee boundary.** Nothing is locked between the preview and the command.
+The deletion proceeds only if every consented fact still matches under the root
+guard immediately before teardown and immediately before removal. A write from
+outside Conflux that lands after that final comparison and before
+`git worktree remove --force` is not detected — the same window the TUI has.
+Empty directories and lone special files that lie under no reported directory
+record are listed by no status mode, hold no bytes, and are not bound. A
+populated submodule that status does not report is outside the oracle; Git's
+own `worktree remove` refuses such a worktree, which surfaces as
+`internal_error` with the worktree retained.
+
+Discover the surface through `capabilities.worktrees.confirmed_delete`
+(`available`, `command`, `preview_route`, `permissions`, `consent_fields`,
+`content_id_algorithm`, `binds_ignored_content`, `reasons`) and the
+`delete_confirmed` entry in `worktrees.operations`. An owner built before this
+surface omits the block, which a client decodes as `available: false`; it
+refuses `delete_worktree_confirmed` with `validation_failed` before any effect,
+serves `delete_worktree` and every other command unchanged, and still publishes
+`delete_requires_teardown: true`.
 
 The full schema is generated at runtime rather than tracked in the repository.
 Export it with `cflx openapi > openapi.yaml`, or fetch it from a running

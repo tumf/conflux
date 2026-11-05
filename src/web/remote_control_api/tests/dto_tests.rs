@@ -28,6 +28,10 @@ fn closed_command_set_matches_the_advertised_list() {
             "delete_worktree" | "merge_worktree" | "merge_worktree_abort_on_conflict" => {
                 format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
             }
+            "delete_worktree_confirmed" => format!(
+                r#"{{"type":"delete_worktree_confirmed","target":{{"worktree_id":"a"}},"params":{{"skip_teardown":false,"discard_known_dirty":false,"discard_commits_ahead":false,"consent":{{"branch":"a","head":"{}","dirty":false,"has_commits_ahead":false,"has_ignored_content":false,"merge_base":null,"discardable_content_id":null,"ignored_content_id":null}}}}}}"#,
+                "a".repeat(40)
+            ),
             "refresh_proposal" => format!(
                 r#"{{"type":"refresh_proposal","change_id":"a","source_ref":"develop","expected_source":"{}","expected_head":"{}"}}"#,
                 "a".repeat(40),

@@ -112,6 +112,11 @@ pub enum ErrorCode {
     /// itself refused — a moved ref, a dirty candidate, a hook. The record's
     /// `result` carries the stable reason and the effects re-read from Git.
     RefreshRefused,
+    /// `delete_worktree_confirmed` found that the echoed consent no longer
+    /// describes the worktree: a consented fact or a recomputed content
+    /// identity differs. Nothing was removed; the record's `result.refusal`
+    /// carries the stable reason and the freshly observed facts.
+    DeleteConsentStale,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -137,7 +142,8 @@ impl ErrorCode {
             | Self::MergeConflictAborted
             | Self::MergeAbortFailed
             | Self::ExecutionBindingMismatch
-            | Self::RefreshRefused => StatusCode::CONFLICT,
+            | Self::RefreshRefused
+            | Self::DeleteConsentStale => StatusCode::CONFLICT,
             Self::TransportNotPermitted => StatusCode::FORBIDDEN,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
@@ -170,13 +176,14 @@ impl ErrorCode {
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
+            Self::DeleteConsentStale => "delete_consent_stale",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 24] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -199,6 +206,7 @@ pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
+    ErrorCode::DeleteConsentStale,
     ErrorCode::InternalError,
 ];
 
@@ -375,6 +383,20 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Delete a worktree on explicit, re-verified consent.
+    ///
+    /// A separate command rather than parameters on `delete_worktree`, so
+    /// that command's fail-closed contract — and the published
+    /// `delete_requires_teardown: true` — hold for every call of it. The three
+    /// destructive permissions are independent choices, and each is honored
+    /// only while every consented fact and both content identities still
+    /// match a fresh observation under the repository root guard.
+    DeleteWorktreeConfirmed {
+        /// The worktree to delete.
+        target: WorktreeTarget,
+        /// The explicit permissions and the echoed consent.
+        params: ConfirmedDeleteParams,
+    },
     /// Refresh one candidate's `proposal.md` from an explicit source commit.
     ///
     /// Takes the two full commit IDs a `refresh-preview` read returned. Exactly
@@ -422,6 +444,85 @@ pub struct WorktreeTarget {
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
 
+/// Typed parameters of `delete_worktree_confirmed`.
+///
+/// Three independent booleans — none implies another — plus the `consent`
+/// object a `delete-preview` read returned, echoed verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedDeleteParams {
+    /// Skip `.wt/teardown`. The recovery path for a failing teardown script.
+    pub skip_teardown: bool,
+    /// Discard known uncommitted changes and known ignored content.
+    pub discard_known_dirty: bool,
+    /// Discard commits ahead of base and force-delete the branch at the
+    /// consented HEAD.
+    pub discard_commits_ahead: bool,
+    /// The preview's `consent` object, unmodified.
+    pub consent: crate::worktree_ops::consent::DeleteConsent,
+}
+
+impl ConfirmedDeleteParams {
+    /// Field-level validation serde cannot express.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::orchestration::proposal_refresh::is_full_oid;
+        use crate::worktree_ops::consent::is_content_id;
+
+        let consent = &self.consent;
+        if consent.branch.trim().is_empty() {
+            return Err(
+                "delete_worktree_confirmed requires a non-empty consent.branch".to_string(),
+            );
+        }
+        if consent.head.len() != 40 || !is_full_oid(&consent.head) {
+            return Err(
+                "consent.head must be a 40-character lowercase hexadecimal commit ID".to_string(),
+            );
+        }
+        if let Some(base) = consent.merge_base.as_deref() {
+            if base.len() != 40 || !is_full_oid(base) {
+                return Err(
+                    "consent.merge_base must be a 40-character lowercase hexadecimal commit ID"
+                        .to_string(),
+                );
+            }
+        }
+        for (name, value) in [
+            ("discardable_content_id", &consent.discardable_content_id),
+            ("ignored_content_id", &consent.ignored_content_id),
+        ] {
+            if value.as_deref().is_some_and(|id| !is_content_id(id)) {
+                return Err(format!(
+                    "consent.{name} must be sha256: followed by 64 lowercase hexadecimal digits"
+                ));
+            }
+        }
+        // Independent of `consent.dirty`: a discard permission is only ever
+        // bound to named content, never to an undefined comparison.
+        if (self.discard_known_dirty || self.discard_commits_ahead)
+            && (consent.discardable_content_id.is_none() || consent.ignored_content_id.is_none())
+        {
+            return Err(
+                "a discard permission requires both consent.discardable_content_id and consent.ignored_content_id"
+                    .to_string(),
+            );
+        }
+        if self.discard_commits_ahead && consent.merge_base.is_none() {
+            return Err("discard_commits_ahead requires consent.merge_base".to_string());
+        }
+        Ok(())
+    }
+
+    /// The shared delete policy these permissions map onto, one-to-one.
+    pub fn options(&self) -> crate::worktree_ops::service::DeleteOptions {
+        crate::worktree_ops::service::DeleteOptions {
+            skip_teardown: self.skip_teardown,
+            allow_known_dirty: self.discard_known_dirty,
+            allow_commits_ahead: self.discard_commits_ahead,
+        }
+    }
+}
+
 impl CommandSpec {
     /// Wire discriminant of this command.
     pub fn type_name(&self) -> &'static str {
@@ -442,6 +543,7 @@ impl CommandSpec {
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
             Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
+            Self::DeleteWorktreeConfirmed { .. } => "delete_worktree_confirmed",
             Self::RefreshProposal { .. } => "refresh_proposal",
         }
     }
@@ -476,6 +578,7 @@ impl CommandSpec {
                 }
                 Ok(())
             }
+            Self::DeleteWorktreeConfirmed { params, .. } => params.validate(),
             _ => Ok(()),
         }
     }
@@ -499,6 +602,7 @@ impl CommandSpec {
             Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
             Self::DeleteWorktree { .. }
+            | Self::DeleteWorktreeConfirmed { .. }
             | Self::MergeWorktree { .. }
             | Self::MergeWorktreeAbortOnConflict { .. } => None,
         }
@@ -506,7 +610,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 17] = [
+pub const SUPPORTED_COMMANDS: [&str; 18] = [
     "start",
     "stop",
     "cancel_stop",
@@ -524,6 +628,7 @@ pub const SUPPORTED_COMMANDS: [&str; 17] = [
     "merge_worktree",
     "refresh_proposal",
     "merge_worktree_abort_on_conflict",
+    "delete_worktree_confirmed",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -2183,6 +2288,59 @@ pub enum CommandResult {
     /// `merge_abort_failed`), because a client must be able to tell a proven
     /// restoration from an unproven one without parsing prose.
     MergeAbort(Box<MergeAbortResult>),
+    /// Settlement evidence for `delete_worktree_confirmed`, success or refusal.
+    ///
+    /// A refused record carries the same kind, with `refusal` holding the
+    /// stable reason and the freshly observed facts, so a client can re-render
+    /// its confirmation without a second preview.
+    DeleteWorktreeConfirmed(Box<ConfirmedDeleteResult>),
+}
+
+/// Why a confirmed delete was refused, with what the service just observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteRefusalResult {
+    /// The stable reason; `null` for a refusal outside the consent vocabulary.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub reason: Option<crate::worktree_ops::consent::ConfirmedDeleteReason>,
+    /// True when `.wt/teardown` ran before the refusal. Its effects are not
+    /// reversed; the worktree was retained.
+    pub teardown_ran: bool,
+    /// The freshest observation; `null` when the worktree was not observable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub observed: Option<crate::worktree_ops::consent::ConsentObservation>,
+}
+
+/// The settled body of a `delete_worktree_confirmed` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteResult {
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// Branch of the worktree; the consented one when nothing was observed.
+    pub branch: String,
+    /// HEAD of the worktree; the consented one when nothing was observed.
+    pub head: String,
+    /// `deleted` on success; `null` when refused.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub outcome: Option<String>,
+    /// What happened to `.wt/teardown`.
+    pub teardown: crate::worktree_ops::consent::TeardownDisposition,
+    /// True when known uncommitted or ignored content was discarded.
+    pub dirty_discarded: bool,
+    /// True when commits ahead of base were discarded with their branch.
+    pub commits_discarded: bool,
+    /// True when the worktree's branch was deleted.
+    pub branch_deleted: bool,
+    /// Why the branch was kept, when the worktree was removed but it was not.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub branch_retained_reason: Option<String>,
+    /// The refusal; `null` on success.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub refusal: Option<ConfirmedDeleteRefusalResult>,
 }
 
 /// How an abort-on-conflict merge settled.

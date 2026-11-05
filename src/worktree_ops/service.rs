@@ -17,12 +17,17 @@
 //! rather than duplicated implementations, so a reader can see the whole
 //! difference in one place:
 //!
-//! * the TUI keeps its local recovery `skip_teardown` escape hatch and it is the
-//!   only caller that may grant `allow_known_dirty`, and only after a second,
-//!   explicitly destructive operator confirmation;
-//! * `/api/v2` is fail-closed on both. Its `merge_worktree` preserves a
-//!   conflicted merge instead of aborting it, because a remote client has no
-//!   way to inspect or resolve the intermediate state; the separately chosen
+//! * the TUI keeps its local recovery `skip_teardown` escape hatch and grants
+//!   `allow_known_dirty` / `allow_commits_ahead` only after a second, explicitly
+//!   destructive operator confirmation;
+//! * `/api/v2` `delete_worktree` is fail-closed on all three. The separate
+//!   `delete_worktree_confirmed` command reaches the same three permissions
+//!   only through [`WorktreeService::delete_worktree_with_consent`], which binds
+//!   them to an explicit consent re-verified under the root guard before
+//!   teardown and again before removal;
+//! * `/api/v2` `merge_worktree` preserves a conflicted merge instead of aborting
+//!   it, because a remote client has no way to inspect or resolve the
+//!   intermediate state; the separately chosen
 //!   `merge_worktree_abort_on_conflict` aborts with verified restoration.
 //!
 //! Every safety observation deletion depends on is tri-state. An observation
@@ -35,6 +40,15 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+
+use super::consent::{ConsentLimits, ContentObservation};
+
+mod confirmed;
+#[allow(unused_imports)] // The binary target compiles this tree privately.
+pub use confirmed::{
+    classify_confirmed_delete, classify_consent, ConfirmedDeleteOutcome, ConfirmedDeleteRefusal,
+    DeletePreview, OptionEligibility,
+};
 
 /// Recovery guidance reported for a preserved merge conflict.
 ///
@@ -355,14 +369,19 @@ pub enum ConflictPolicy {
 /// Caller-declared delete policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteOptions {
-    /// Skip `.wt/teardown`. Local recovery only; never reachable from `/api/v2`.
+    /// Skip `.wt/teardown`. A recovery escape hatch: set by the local TUI's
+    /// `S`, and remotely only by `delete_worktree_confirmed` with explicit
+    /// consent. `/api/v2` `delete_worktree` never sets it.
     pub skip_teardown: bool,
     /// Permission to discard *known* uncommitted work.
     ///
     /// This waives [`DirtyState::Dirty`] and nothing else. It never waives an
     /// unobservable fact, commits ahead of base, main-worktree status, or an
-    /// identity mismatch, and only the local TUI's second, explicitly
-    /// destructive confirmation may set it.
+    /// identity mismatch. It is set by the local TUI's second, explicitly
+    /// destructive confirmation, and remotely only by
+    /// `delete_worktree_confirmed`'s `discard_known_dirty` bound to a consent
+    /// whose content identities are re-verified before removal — where it also
+    /// covers known ignored content, which forced removal deletes too.
     pub allow_known_dirty: bool,
     /// Permission to discard *known* commits ahead of base, and to delete the
     /// confirmed branch that carries them.
@@ -370,8 +389,9 @@ pub struct DeleteOptions {
     /// A third, independent permission, not a stronger form of the second. It
     /// waives [`SafetyFact::Yes`] on [`WorktreeFacts::has_commits_ahead`] and
     /// nothing else — not an unobservable ahead state, not uncommitted work, not
-    /// teardown — and only the local TUI's dedicated uppercase-`X` confirmation
-    /// may set it.
+    /// teardown. It is set by the local TUI's dedicated uppercase-`X`
+    /// confirmation, and remotely only by `delete_worktree_confirmed`'s
+    /// `discard_commits_ahead` bound to a consented HEAD and merge base.
     pub allow_commits_ahead: bool,
 }
 
@@ -844,6 +864,29 @@ pub trait WorktreeBackend: Send + Sync {
     async fn run_on_merged(&self, change_id: &str, worktree_path: &Path) -> WorktreeOpResult<()>;
     /// True when `change_id` is a managed, non-archived change eligible for a worktree.
     async fn change_is_eligible(&self, change_id: &str) -> WorktreeOpResult<()>;
+    /// Bind a worktree's discardable and ignored content for a confirmed delete.
+    ///
+    /// Defaults to [`ContentObservation::Unobservable`]: a backend that cannot
+    /// bind content makes every confirmed delete fail closed.
+    async fn observe_content(&self, _path: &Path, _limits: ConsentLimits) -> ContentObservation {
+        ContentObservation::Unobservable
+    }
+    /// Merge base of `head` with the managed base, or `None` when unresolved.
+    async fn merge_base(&self, _head: &str) -> WorktreeOpResult<Option<String>> {
+        Err(WorktreeOpError::Internal(
+            "this backend cannot resolve a merge base".to_string(),
+        ))
+    }
+    /// `git rev-list --count merge_base..head`.
+    async fn commits_between(&self, _merge_base: &str, _head: &str) -> WorktreeOpResult<usize> {
+        Err(WorktreeOpError::Internal(
+            "this backend cannot count commits".to_string(),
+        ))
+    }
+    /// True exactly when [`Self::teardown`] would execute `.wt/teardown`.
+    async fn teardown_script_present(&self, _path: &Path) -> bool {
+        false
+    }
 }
 
 /// A worktree operation event, published identically by every frontend.
@@ -931,6 +974,8 @@ pub struct WorktreeService {
     /// `root_busy` immediately instead of queueing behind an operation it cannot
     /// see, which is what lets a remote client retry against a fresh revision.
     root_guard: Mutex<()>,
+    /// The content oracle's budget, shared by the preview and the command.
+    consent_limits: ConsentLimits,
 }
 
 impl WorktreeService {
@@ -945,7 +990,18 @@ impl WorktreeService {
             events,
             workspace_base_dir,
             root_guard: Mutex::new(()),
+            consent_limits: ConsentLimits::PRODUCTION,
         }
+    }
+
+    /// Replace the content oracle's budget.
+    ///
+    /// Production always runs [`ConsentLimits::PRODUCTION`]; tests inject small
+    /// limits instead of building multi-hundred-megabyte fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_consent_limits(mut self, limits: ConsentLimits) -> Self {
+        self.consent_limits = limits;
+        self
     }
 
     /// Current worktree observations. Read-only; takes no mutation guard.

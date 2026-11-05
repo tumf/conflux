@@ -492,6 +492,31 @@ impl WorktreeOperations for RemoteControlRuntime {
             }
         }
     }
+
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<worktrees::DeletePreviewResponse, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_preview(worktree_id).await,
+            None => UnboundWorktreeOperations.delete_preview(worktree_id).await,
+        }
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &dto::ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_confirmed(worktree_id, params).await,
+            None => {
+                UnboundWorktreeOperations
+                    .delete_confirmed(worktree_id, params)
+                    .await
+            }
+        }
+    }
 }
 
 /// Shared state for the v2 router.
@@ -637,6 +662,10 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/logs", get(reads::logs))
         .route("/api/v2/worktrees", get(reads::list_worktrees))
         .route("/api/v2/worktrees/{worktree_id}", get(reads::get_worktree))
+        .route(
+            worktrees::DELETE_PREVIEW_ROUTE,
+            get(reads::get_worktree_delete_preview),
+        )
         .route("/api/v2/commands", post(commands::submit_command))
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))

@@ -24,7 +24,9 @@ use super::dto::{
     ALL_PARALLEL_BLOCKED_REASONS, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
     MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
 };
-use super::worktrees::{WorktreeCapabilities, WorktreeResponse, WorktreesResponse};
+use super::worktrees::{
+    DeletePreviewResponse, WorktreeCapabilities, WorktreeResponse, WorktreesResponse,
+};
 use super::RemoteControlState;
 
 /// Responses describe a live process, so nothing may be cached anywhere.
@@ -438,4 +440,41 @@ pub async fn logs(State(state): State<RemoteControlState>) -> Response {
         event_sequence,
         logs,
     })
+}
+
+/// What a consent-bound delete of one worktree would act on.
+///
+/// A read: no command record, no revision change, and nothing in the worktree
+/// is written. It runs a fresh targeted observation and the same bounded
+/// content oracle `delete_worktree_confirmed` runs, so the per-option answers
+/// agree with what the command would decide right now. Echo `consent`
+/// unmodified as the command's `params.consent`; `observed_at` is not part of
+/// it. Cancelling is submitting nothing.
+#[utoipa::path(
+    get,
+    path = "/api/v2/worktrees/{worktree_id}/delete-preview",
+    tag = "remote-control",
+    params(("worktree_id" = String, Path, description = "Opaque process-local worktree ID")),
+    responses(
+        (status = 200, description = "Facts, per-option eligibility, and the consent to echo", body = DeletePreviewResponse),
+        (status = 404, description = "Unknown or retired worktree ID", body = ApiError),
+        (status = 409, description = "No worktree runtime is bound yet", body = ApiError)
+    )
+)]
+pub async fn get_worktree_delete_preview(
+    State(state): State<RemoteControlState>,
+    Extension(correlation): Extension<CorrelationId>,
+    Path(worktree_id): Path<String>,
+) -> Response {
+    let state_revision = state.projection.revision();
+    match state.worktrees.delete_preview(&worktree_id).await {
+        Ok(mut preview) => {
+            preview.instance_id = state.projection.instance_id().to_string();
+            preview.state_revision = state_revision;
+            no_store(preview)
+        }
+        Err(failure) => ApiError::new(failure.error_code, failure.message, &correlation.0)
+            .with_revision(state_revision)
+            .into_response(),
+    }
 }

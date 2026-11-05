@@ -64,6 +64,20 @@ pub const PATH_SCOPED_PORCELAIN_STATUS_ARGS: &[&str] = &["--porcelain", "--"];
 /// Porcelain v2, used for structural upstream failure classification.
 pub const PORCELAIN_V2_STATUS_ARGS: &[&str] = &["--porcelain=v2"];
 
+/// Porcelain v2, NUL-terminated, with collapsed untracked directories and
+/// traditional ignored records, for the confirmed-delete content identity.
+///
+/// `--untracked-files=normal` is deliberate: Git reports an all-untracked or
+/// all-ignored directory as one `dir/` record, and the consent oracle walks it
+/// itself. `--untracked-files=all` would expand it while hiding `.git` entries,
+/// empty directories, and special files — exactly what forced removal deletes.
+pub const CONSENT_STATUS_ARGS: &[&str] = &[
+    "--porcelain=v2",
+    "-z",
+    "--untracked-files=normal",
+    "--ignored=traditional",
+];
+
 /// Build the argv of a read-only `git status` observation.
 ///
 /// `status_args` are the arguments that follow the subcommand; the global
@@ -136,7 +150,7 @@ mod native_git_status_optional_locks {
 
     #[test]
     fn every_declared_observation_keeps_its_exact_argv() {
-        let cases: [(&str, &[&str], &[&str]); 7] = [
+        let cases: [(&str, &[&str], &[&str]); 8] = [
             (
                 "human readable",
                 HUMAN_READABLE_STATUS_ARGS,
@@ -182,6 +196,18 @@ mod native_git_status_optional_locks {
                 "porcelain v2",
                 PORCELAIN_V2_STATUS_ARGS,
                 &["--no-optional-locks", "status", "--porcelain=v2"],
+            ),
+            (
+                "confirmed-delete consent",
+                CONSENT_STATUS_ARGS,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignored=traditional",
+                ],
             ),
         ];
 
