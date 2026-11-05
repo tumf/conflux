@@ -33,8 +33,15 @@ use super::dto::{
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 6] =
-    ["list", "detail", "create", "delete", "merge", "merge_abort"];
+pub const WORKTREE_OPERATIONS: [&str; 7] = [
+    "list",
+    "detail",
+    "create",
+    "delete",
+    "merge",
+    "merge_abort",
+    "session",
+];
 
 /// Command the `merge_abort` operation is submitted as.
 pub const MERGE_ABORT_COMMAND: &str = "merge_worktree_abort_on_conflict";
@@ -638,6 +645,40 @@ impl RemoteWorktreeOperations {
             },
             facts,
         ))
+    }
+
+    /// Resolve a live opaque ID against a fresh observation, returning the
+    /// internal key and the redacted resource it currently projects to.
+    pub(crate) async fn resolve_live(
+        &self,
+        worktree_id: &str,
+    ) -> Result<(WorktreeKey, WorktreeResource), CommandFailure> {
+        let (listing, _) = self.observe().await?;
+        let key = self.resolve(worktree_id)?;
+        let resource = listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.worktree_id == worktree_id)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    ErrorCode::WorktreeNotFound,
+                    format!("worktree '{worktree_id}' is not a current resource in this instance"),
+                )
+            })?;
+        Ok((key, resource))
+    }
+
+    /// The opaque ID a fresh observation allocates for `path`, if it is a
+    /// registered worktree.
+    pub(crate) async fn identify(&self, path: &Path) -> Option<String> {
+        let (listing, _) = self.observe().await.ok()?;
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let display = repository_relative_display(&self.repo_root, &canonical);
+        listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.path == display)
+            .map(|resource| resource.worktree_id)
     }
 
     /// Resolve an opaque ID, distinguishing "never existed" from "retired".

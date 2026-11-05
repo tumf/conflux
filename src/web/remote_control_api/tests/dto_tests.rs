@@ -28,6 +28,17 @@ fn closed_command_set_matches_the_advertised_list() {
             "delete_worktree" | "merge_worktree" | "merge_worktree_abort_on_conflict" => {
                 format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
             }
+            "run_worktree_command" => format!(
+                r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{}"}},"params":{{}}}}"#,
+                "a".repeat(32)
+            ),
+            "create_session_worktree" => {
+                r#"{"type":"create_session_worktree","params":{}}"#.to_string()
+            }
+            "stop_worktree_session" => format!(
+                r#"{{"type":"stop_worktree_session","target":{{"session_id":"{}"}},"params":{{}}}}"#,
+                "b".repeat(32)
+            ),
             "refresh_proposal" => format!(
                 r#"{{"type":"refresh_proposal","change_id":"a","source_ref":"develop","expected_source":"{}","expected_head":"{}"}}"#,
                 "a".repeat(40),
@@ -506,6 +517,156 @@ mod legacy_owner_shape {
                 "the rejection must name `{member}`: {error}"
             );
         }
+    }
+}
+
+/// An owner built before configured-command sessions publishes no
+/// `worktree_sessions` block. This build must read it as "not available", and
+/// the three session commands are simply absent from its closed command set —
+/// which is why submitting one to it fails typed validation before any effect
+/// (see `unknown_command_type_fails_typed_validation`).
+#[test]
+fn remote_worktree_session_old_owner_capabilities_decode_as_unavailable() {
+    let legacy = serde_json::json!({
+        "api_version": "v2",
+        "instance_id": "i-legacy",
+        "commands": [
+            "start", "stop", "cancel_stop", "force_stop", "set_all_execution_marks",
+            "set_execution_mark", "set_queue_intent", "retry_change", "retry_errors",
+            "stop_and_dequeue", "force_stop_change", "resolve_merge",
+            "create_worktree", "delete_worktree", "merge_worktree", "refresh_proposal"
+        ],
+        "transports": [],
+        "error_codes": [],
+        "limits": {
+            "max_events": 1, "max_logs": 1, "max_commands": 1,
+            "max_idempotency_records": 1, "command_record_ttl_secs": 1,
+            "max_correlation_id_len": 64
+        },
+        "authentication_required": false,
+        "command_execution": { "available": true },
+        "worktrees": {
+            "operations": ["list", "detail", "create", "delete", "merge"],
+            "merge_conflict_recovery": "local_or_tui_required",
+            "merge_conflict_preserves_state": true,
+            "delete_requires_teardown": true
+        },
+        "parallel": { "max_concurrent": 1, "vcs_backend": "git", "blocked_reasons": [] }
+    });
+    let capabilities: crate::web::remote_control_api::dto::CapabilitiesResponse =
+        serde_json::from_value(legacy).expect("an older owner's capabilities decode");
+    assert!(!capabilities.worktree_sessions.available);
+    assert!(capabilities.worktree_sessions.commands.is_empty());
+    for command in [
+        "run_worktree_command",
+        "create_session_worktree",
+        "stop_worktree_session",
+    ] {
+        assert!(!capabilities.commands.iter().any(|c| c == command));
+    }
+
+    // An older execution-status body has no session counter either.
+    let status: crate::web::remote_control_api::dto::ProcessExecutionStatus =
+        serde_json::from_value(serde_json::json!({
+            "app_mode": "select",
+            "scheduler_running": false,
+            "has_active_work": false,
+            "active_activities": [],
+            "latest_log": null
+        }))
+        .expect("an older process status decodes");
+    assert_eq!(status.worktree_sessions_running, 0);
+}
+
+/// The session commands accept exactly their target and an empty `params`:
+/// no command text, argv, environment, path, or branch can be smuggled in, and
+/// a blank or malformed opaque ID is a validation failure, not a record.
+fn envelope(command: &str) -> String {
+    let body = command.strip_suffix('}').expect("a JSON object");
+    format!(r#"{body},"expected_revision":0,"idempotency_key":"k"}}"#)
+}
+
+#[test]
+fn remote_worktree_session_commands_are_closed() {
+    let id = "c".repeat(32);
+    for smuggled in [
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}","path":"/tmp"}},"params":{{}}}}"#
+        ),
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{"command":"rm -rf /"}}}}"#
+        ),
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{}},"argv":["sh"]}}"#
+        ),
+        r#"{"type":"create_session_worktree","params":{"env":{"A":"B"}}}"#.to_string(),
+        r#"{"type":"create_session_worktree","params":{},"branch":"main"}"#.to_string(),
+        format!(r#"{{"type":"create_session_worktree","target":{{"worktree_id":"{id}"}}}}"#),
+        format!(r#"{{"type":"stop_worktree_session","session_id":"{id}"}}"#),
+        format!(
+            r#"{{"type":"stop_worktree_session","target":{{"session_id":"{id}","change_id":"a"}}}}"#
+        ),
+    ] {
+        let request = envelope(&smuggled);
+        assert!(
+            serde_json::from_str::<CommandRequest>(&request).is_err(),
+            "must fail typed validation: {request}"
+        );
+    }
+
+    // Positive controls through the same envelope builder, so the refusals
+    // above are about the smuggled member and not about the construction.
+    for accepted in [
+        format!(
+            r#"{{"type":"run_worktree_command","target":{{"worktree_id":"{id}"}},"params":{{}}}}"#
+        ),
+        r#"{"type":"create_session_worktree","params":{}}"#.to_string(),
+        format!(
+            r#"{{"type":"stop_worktree_session","target":{{"session_id":"{id}"}},"params":{{}}}}"#
+        ),
+    ] {
+        let request = envelope(&accepted);
+        serde_json::from_str::<CommandRequest>(&request)
+            .unwrap_or_else(|e| panic!("must parse: {request}: {e}"));
+    }
+
+    for blank in ["", "   ", "ABCDEF", &"g".repeat(32), &"a".repeat(31)] {
+        let run = CommandSpec::RunWorktreeCommand {
+            target: crate::web::remote_control_api::dto::WorktreeTarget {
+                worktree_id: blank.to_string(),
+            },
+            params: Default::default(),
+        };
+        assert!(
+            run.validate().is_err(),
+            "worktree_id {blank:?} must be refused"
+        );
+        let stop = CommandSpec::StopWorktreeSession {
+            target: crate::web::remote_control_api::dto::SessionTarget {
+                session_id: blank.to_string(),
+            },
+            params: Default::default(),
+        };
+        assert!(
+            stop.validate().is_err(),
+            "session_id {blank:?} must be refused"
+        );
+    }
+
+    let parsed: CommandRequest = serde_json::from_str(
+        r#"{"type":"create_session_worktree","expected_revision":0,"idempotency_key":"k"}"#,
+    )
+    .expect("params defaults to empty");
+    assert_eq!(parsed.command.type_name(), "create_session_worktree");
+    assert!(parsed.command.validate().is_ok());
+
+    for code in [
+        ErrorCode::WorktreeSessionUnavailable,
+        ErrorCode::WorktreeSessionBusy,
+        ErrorCode::WorktreeSessionSetupFailed,
+    ] {
+        assert_eq!(code.http_status(), StatusCode::CONFLICT);
+        assert!(ALL_ERROR_CODES.contains(&code));
     }
 }
 

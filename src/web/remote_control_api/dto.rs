@@ -112,6 +112,18 @@ pub enum ErrorCode {
     /// itself refused — a moved ref, a dirty candidate, a hook. The record's
     /// `result` carries the stable reason and the effects re-read from Git.
     RefreshRefused,
+    /// The configured-command session surface cannot launch here: no
+    /// `worktree_command` is configured, the project is not a Git repository,
+    /// or the owner is shutting down. Refused before any Git or process effect.
+    WorktreeSessionUnavailable,
+    /// A session is already running for that worktree (`reason=worktree_busy`)
+    /// or the running-session limit is reached (`reason=capacity`). Refused
+    /// before any Git or process effect.
+    WorktreeSessionBusy,
+    /// `.wt/setup` failed for a provisioned session worktree; the worktree was
+    /// cleaned up and nothing was launched. The record's result carries the
+    /// typed cleanup outcome.
+    WorktreeSessionSetupFailed,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -137,7 +149,10 @@ impl ErrorCode {
             | Self::MergeConflictAborted
             | Self::MergeAbortFailed
             | Self::ExecutionBindingMismatch
-            | Self::RefreshRefused => StatusCode::CONFLICT,
+            | Self::RefreshRefused
+            | Self::WorktreeSessionUnavailable
+            | Self::WorktreeSessionBusy
+            | Self::WorktreeSessionSetupFailed => StatusCode::CONFLICT,
             Self::TransportNotPermitted => StatusCode::FORBIDDEN,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
@@ -170,13 +185,16 @@ impl ErrorCode {
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
+            Self::WorktreeSessionUnavailable => "worktree_session_unavailable",
+            Self::WorktreeSessionBusy => "worktree_session_busy",
+            Self::WorktreeSessionSetupFailed => "worktree_session_setup_failed",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 26] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -199,6 +217,9 @@ pub const ALL_ERROR_CODES: [ErrorCode; 23] = [
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
+    ErrorCode::WorktreeSessionUnavailable,
+    ErrorCode::WorktreeSessionBusy,
+    ErrorCode::WorktreeSessionSetupFailed,
     ErrorCode::InternalError,
 ];
 
@@ -389,6 +410,35 @@ pub enum CommandSpec {
         /// Full commit ID the candidate `HEAD` must still be at.
         expected_head: String,
     },
+    /// Launch the configured `worktree_command` in an existing worktree.
+    ///
+    /// The command text is always the owner's configured template with
+    /// `{workspace_dir}` and `{repo_root}` expanded server-side. No request field
+    /// carries a command, argv, environment, path, or branch.
+    RunWorktreeCommand {
+        /// The worktree to run in.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Create a `ws-session-*` worktree from base `HEAD` exactly as the TUI `+`
+    /// key does — setup, cleanup on setup failure, revalidation — and launch
+    /// the configured `worktree_command` there.
+    CreateSessionWorktree {
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Stop one session through the runner's own cancellation path and settle
+    /// after the leader is reaped and the cleanup report is read.
+    StopWorktreeSession {
+        /// The session to stop.
+        target: SessionTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
 }
 
 /// Change-addressed command target.
@@ -412,6 +462,22 @@ pub struct ChangeTarget {
 pub struct WorktreeTarget {
     /// Opaque 128-bit hexadecimal worktree ID from a v2 read.
     pub worktree_id: String,
+}
+
+/// Session-addressed command target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTarget {
+    /// Opaque 128-bit hexadecimal session ID from a v2 read or launch result.
+    pub session_id: String,
+}
+
+/// True for a 32-character lowercase hexadecimal opaque ID.
+pub fn is_opaque_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A parameter object that accepts nothing.
@@ -443,6 +509,9 @@ impl CommandSpec {
             Self::MergeWorktree { .. } => "merge_worktree",
             Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
             Self::RefreshProposal { .. } => "refresh_proposal",
+            Self::RunWorktreeCommand { .. } => "run_worktree_command",
+            Self::CreateSessionWorktree { .. } => "create_session_worktree",
+            Self::StopWorktreeSession { .. } => "stop_worktree_session",
         }
     }
 
@@ -476,6 +545,28 @@ impl CommandSpec {
                 }
                 Ok(())
             }
+            Self::RunWorktreeCommand { target, .. } => {
+                if is_opaque_id(&target.worktree_id) {
+                    Ok(())
+                } else {
+                    Err(
+                        "run_worktree_command requires a 32-character lowercase hexadecimal \
+                         target.worktree_id"
+                            .to_string(),
+                    )
+                }
+            }
+            Self::StopWorktreeSession { target, .. } => {
+                if is_opaque_id(&target.session_id) {
+                    Ok(())
+                } else {
+                    Err(
+                        "stop_worktree_session requires a 32-character lowercase hexadecimal \
+                         target.session_id"
+                            .to_string(),
+                    )
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -501,12 +592,16 @@ impl CommandSpec {
             Self::DeleteWorktree { .. }
             | Self::MergeWorktree { .. }
             | Self::MergeWorktreeAbortOnConflict { .. } => None,
+            // Sessions are addressed by opaque worktree or session ID, never by change.
+            Self::RunWorktreeCommand { .. }
+            | Self::CreateSessionWorktree { .. }
+            | Self::StopWorktreeSession { .. } => None,
         }
     }
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 17] = [
+pub const SUPPORTED_COMMANDS: [&str; 20] = [
     "start",
     "stop",
     "cancel_stop",
@@ -524,6 +619,9 @@ pub const SUPPORTED_COMMANDS: [&str; 17] = [
     "merge_worktree",
     "refresh_proposal",
     "merge_worktree_abort_on_conflict",
+    "run_worktree_command",
+    "create_session_worktree",
+    "stop_worktree_session",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -724,6 +822,51 @@ pub struct CapabilitiesResponse {
     /// absent field means "not served".
     #[serde(default)]
     pub proposal_refresh: ProposalRefreshCapability,
+    /// The configured-command worktree session surface.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field decodes as `available: false` — exactly what such an owner is.
+    #[serde(default)]
+    pub worktree_sessions: WorktreeSessionCapability,
+}
+
+/// Whether configured-command worktree sessions can be launched here, and the
+/// limits that bound them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionCapability {
+    /// True only when `worktree_command` is configured, the project is a Git
+    /// repository, and a command executor is bound.
+    pub available: bool,
+    /// The three session command types.
+    pub commands: Vec<String>,
+    /// The two session read routes.
+    pub routes: Vec<String>,
+    /// Sessions that may run at once.
+    pub max_running: usize,
+    /// Finished sessions retained, oldest evicted first.
+    pub max_retained: usize,
+    /// Retained output tail per session, in bytes.
+    pub max_output_bytes: usize,
+    /// What the command's stdin is. Always `null`: there is no stdin relay.
+    pub stdin: String,
+    /// Every stable refusal reason.
+    pub reasons: Vec<String>,
+    /// The state events a session publishes. Output is never an event.
+    #[serde(default)]
+    pub event_types: Vec<WorktreeSessionEventType>,
+}
+
+/// State events a configured-command worktree session publishes.
+///
+/// Payload `{session_id, worktree_id, state, exit_code}`, `change_id: null`. They
+/// take an event sequence but never advance `state_revision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSessionEventType {
+    /// A session was launched.
+    WorktreeSessionStarted,
+    /// A session settled.
+    WorktreeSessionFinished,
 }
 
 /// Whether a mutation can be executed by this process at all.
@@ -1651,6 +1794,12 @@ pub struct ProcessExecutionStatus {
     /// Latest retained structured log line, regardless of change; `null` when
     /// the ring is empty.
     pub latest_log: Option<LatestLogProjection>,
+    /// Configured-command worktree sessions currently running.
+    ///
+    /// Computed on read. Independent of `has_active_work` and
+    /// `scheduler_running`: a session is not lifecycle work.
+    #[serde(default)]
+    pub worktree_sessions_running: u32,
 }
 
 /// One change's execution facts.
@@ -2176,6 +2325,22 @@ pub enum CommandResult {
     /// write (a hook rejection, an unexpected tree) left real Git state behind,
     /// and the effects object is the only truthful account of it.
     RefreshProposal(Box<RefreshProposalResult>),
+    /// Launch evidence for `run_worktree_command` and `create_session_worktree`.
+    ///
+    /// A failed `create_session_worktree` that already created a worktree also
+    /// carries it, with `session_id: null`, so the setup and cleanup facts are
+    /// not lost.
+    WorktreeSession(Box<WorktreeSessionResult>),
+    /// Settlement evidence for `stop_worktree_session`.
+    WorktreeSessionStop {
+        /// The session the command addressed.
+        session_id: String,
+        /// True when the runner cancelled it and proved the process group
+        /// quiescent. `false` for a session that had already finished.
+        terminated: bool,
+        /// Session state after settlement.
+        state_after: String,
+    },
     /// Settlement evidence for `merge_worktree_abort_on_conflict`.
     ///
     /// Present on success and on every refusal after eligibility
@@ -2183,6 +2348,135 @@ pub enum CommandResult {
     /// `merge_abort_failed`), because a client must be able to tell a proven
     /// restoration from an unproven one without parsing prose.
     MergeAbort(Box<MergeAbortResult>),
+}
+
+/// What a session launch (or a refused provisioning) produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResult {
+    /// The launched session; `null` when nothing was launched.
+    pub session_id: Option<String>,
+    /// `existing` or `session`.
+    ///
+    /// Not named `kind`: that member is the `CommandResult` discriminant, and a
+    /// second `kind` would overwrite it on the wire.
+    pub session_kind: String,
+    /// Opaque worktree ID; `null` when no live worktree could be identified.
+    pub worktree_id: Option<String>,
+    /// Checked-out branch.
+    pub branch: String,
+    /// Repository-relative display path.
+    pub path: String,
+    /// Setup facts of a provisioned worktree; `null` for `existing`.
+    pub setup: Option<SessionSetupFacts>,
+    /// Setup-failure cleanup facts; `null` when no cleanup ran.
+    pub cleanup: Option<SessionCleanupFacts>,
+}
+
+/// What `.wt/setup` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSetupFacts {
+    /// A `.wt/setup` script existed and ran.
+    pub ran: bool,
+    /// Setup did not fail.
+    pub succeeded: bool,
+}
+
+/// What the setup-failure cleanup did.
+///
+/// `removed: true` means the worktree directory and registration are gone; the
+/// `ws-session-*` branch is retained exactly as after a TUI `+` setup failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionCleanupFacts {
+    /// `removed` or `retained`.
+    pub outcome: String,
+    /// True when the worktree is gone.
+    pub removed: bool,
+    /// Why removal failed, when it did.
+    pub reason: Option<String>,
+}
+
+/// One retained output line of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionOutputLine {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    /// The command's own text after control-sequence stripping and the 8 KiB
+    /// line bound. Not redacted.
+    pub text: String,
+}
+
+/// Bounded, sanitized output tail of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionOutput {
+    /// Retained lines, oldest first.
+    pub lines: Vec<SessionOutputLine>,
+    /// Bytes of line text retained (at most 65,536).
+    pub retained_bytes: usize,
+    /// Bytes of line text dropped to stay within the bound.
+    pub truncated_bytes: u64,
+}
+
+/// One configured-command worktree session.
+///
+/// Owner-generated members never carry the configured template, the expanded
+/// command, environment values, absolute paths, or a process-group ID.
+/// `output.lines` is different in kind: it is the command's own stdout/stderr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResource {
+    /// Random 128-bit process-local hexadecimal session ID.
+    pub session_id: String,
+    /// Process incarnation that owns the session.
+    pub instance_id: String,
+    /// `existing` or `session`.
+    pub kind: String,
+    /// Opaque worktree ID.
+    pub worktree_id: Option<String>,
+    /// Repository-relative display path.
+    pub path: String,
+    /// Checked-out branch.
+    pub branch: String,
+    /// `running`, `succeeded`, `failed`, or `stopped`.
+    pub state: String,
+    /// Runner attempts inside this one session (configured retries).
+    pub attempt: u32,
+    /// Launch instant (RFC 3339).
+    pub started_at: String,
+    /// Settlement instant (RFC 3339), once settled.
+    pub finished_at: Option<String>,
+    /// Exit code of the final attempt, when it exited on its own.
+    pub exit_code: Option<i32>,
+    /// Terminating signal name, when a signal ended it.
+    pub signal: Option<String>,
+    /// A stop or owner shutdown was requested.
+    pub stop_requested: bool,
+    /// Setup facts of a provisioned session.
+    pub setup: Option<SessionSetupFacts>,
+    /// Setup-failure cleanup facts; always `null` for a launched session.
+    pub cleanup: Option<SessionCleanupFacts>,
+    /// Bounded sanitized output tail.
+    pub output: SessionOutput,
+}
+
+/// `GET /api/v2/worktree-sessions` body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionsResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the list was read at. Sessions never advance it.
+    pub state_revision: u64,
+    /// Retained sessions, newest first.
+    pub sessions: Vec<WorktreeSessionResource>,
+}
+
+/// `GET /api/v2/worktree-sessions/{session_id}` body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the session was read at.
+    pub state_revision: u64,
+    /// The requested session.
+    pub session: WorktreeSessionResource,
 }
 
 /// How an abort-on-conflict merge settled.

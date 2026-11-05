@@ -129,6 +129,31 @@ impl WorktreeBackend for GitWorktreeBackend {
         Ok(())
     }
 
+    async fn create_without_setup(
+        &self,
+        path: &Path,
+        branch: &str,
+        base_commit: &str,
+    ) -> WorktreeOpResult<()> {
+        let path_str = utf8_path(path)?;
+        commands::worktree_add(&self.repo_root, path_str, branch, base_commit)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to create worktree: {e}")))
+    }
+
+    async fn remove_after_setup_failure(&self, path: &Path) -> WorktreeOpResult<()> {
+        let path_str = utf8_path(path)?;
+        commands::worktree_remove_with_options(
+            &self.repo_root,
+            path_str,
+            commands::WorktreeRemoveOptions {
+                skip_teardown: true,
+            },
+        )
+        .await
+        .map_err(|e| WorktreeOpError::Internal(format!("failed to remove worktree: {e}")))
+    }
+
     async fn teardown(&self, path: &Path) -> WorktreeOpResult<()> {
         let path_str = utf8_path(path)?;
         commands::run_worktree_teardown(&self.repo_root, path_str)

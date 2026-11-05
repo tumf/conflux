@@ -276,6 +276,9 @@ pub fn remote_control_router(
         // capability reports the surface as unavailable rather than serving a
         // route that could never deliver.
         .with_completion_sinks(runtime.completion_sinks())
+        // Same late binding for configured-command sessions: bound with the
+        // worktree runtime, unbound reads answer an empty list.
+        .with_worktree_sessions(runtime.worktree_sessions())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
         .with_worktrees(runtime)

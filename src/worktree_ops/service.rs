@@ -844,6 +844,38 @@ pub trait WorktreeBackend: Send + Sync {
     async fn run_on_merged(&self, change_id: &str, worktree_path: &Path) -> WorktreeOpResult<()>;
     /// True when `change_id` is a managed, non-archived change eligible for a worktree.
     async fn change_is_eligible(&self, change_id: &str) -> WorktreeOpResult<()>;
+    /// Create a worktree *without* running `.wt/setup`.
+    ///
+    /// Used only by the session provisioner, where setup is fatal and its
+    /// failure triggers cleanup exactly as for the TUI `+` key. [`Self::create`]
+    /// keeps setup non-fatal for change worktrees. The default refuses, so a
+    /// backend that does not provision sessions cannot pretend to.
+    async fn create_without_setup(
+        &self,
+        _path: &Path,
+        _branch: &str,
+        _base_commit: &str,
+    ) -> WorktreeOpResult<()> {
+        Err(WorktreeOpError::Internal(
+            "this worktree backend does not provision session worktrees".to_string(),
+        ))
+    }
+    /// Remove a session worktree whose setup failed: forced, teardown skipped,
+    /// and its branch retained, exactly as the TUI `+` key's cleanup.
+    async fn remove_after_setup_failure(&self, _path: &Path) -> WorktreeOpResult<()> {
+        Err(WorktreeOpError::Internal(
+            "this worktree backend does not provision session worktrees".to_string(),
+        ))
+    }
+}
+
+/// Whether a configured-command session is running in a worktree.
+///
+/// Consulted by [`WorktreeService::delete_worktree`] under the root guard, so
+/// the TUI and the API refuse deleting a directory a session is using alike.
+pub trait SessionProbe: Send + Sync {
+    /// True while a session runs (or is reserved to run) with `path` as cwd.
+    fn session_running(&self, path: &Path) -> bool;
 }
 
 /// A worktree operation event, published identically by every frontend.
@@ -931,7 +963,12 @@ pub struct WorktreeService {
     /// `root_busy` immediately instead of queueing behind an operation it cannot
     /// see, which is what lets a remote client retry against a fresh revision.
     root_guard: Mutex<()>,
+    /// Running configured-command sessions, when a registry is bound.
+    session_probe: Option<std::sync::Arc<dyn SessionProbe>>,
 }
+
+/// Refusal detail for deleting a worktree a session is running in.
+pub const SESSION_RUNNING_REFUSAL: &str = "a worktree session is running";
 
 impl WorktreeService {
     /// Build a service over a backend, an event sink, and the managed workspace root.
@@ -945,7 +982,32 @@ impl WorktreeService {
             events,
             workspace_base_dir,
             root_guard: Mutex::new(()),
+            session_probe: None,
         }
+    }
+
+    /// Refuse deleting any worktree `probe` reports a running session in.
+    pub fn with_session_probe(mut self, probe: std::sync::Arc<dyn SessionProbe>) -> Self {
+        self.session_probe = Some(probe);
+        self
+    }
+
+    /// The backend every effect goes through, for the session provisioner.
+    pub fn backend(&self) -> std::sync::Arc<dyn WorktreeBackend> {
+        self.backend.clone()
+    }
+
+    /// Where managed worktrees are created.
+    pub fn workspace_base_dir(&self) -> &Path {
+        &self.workspace_base_dir
+    }
+
+    /// Take the repository mutation guard for an operation outside this service.
+    ///
+    /// The session provisioner holds it for its creation steps, so a session
+    /// worktree is `root_busy` while a merge or deletion runs and vice versa.
+    pub fn acquire_mutation_guard(&self) -> WorktreeOpResult<tokio::sync::MutexGuard<'_, ()>> {
+        self.acquire_root()
     }
 
     /// Current worktree observations. Read-only; takes no mutation guard.
@@ -1035,6 +1097,17 @@ impl WorktreeService {
 
         let before = self.locate(path).await?;
         classify_delete_identity(&before, expected)?;
+        // A session's cwd is not something teardown may pull out from under
+        // it. Checked under the root guard, before teardown, for every frontend.
+        if self
+            .session_probe
+            .as_ref()
+            .is_some_and(|probe| probe.session_running(&before.path))
+        {
+            return Err(WorktreeOpError::Ineligible(
+                SESSION_RUNNING_REFUSAL.to_string(),
+            ));
+        }
         classify_delete_eligibility(&before, options)?;
 
         // Teardown must succeed before the resource is retired: a failed delete

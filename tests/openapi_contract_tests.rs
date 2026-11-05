@@ -2148,6 +2148,7 @@ fn execution_status() -> ExecutionStatusResponse {
             has_active_work: true,
             active_activities: vec!["dependency_analysis".to_string()],
             latest_log: Some(latest_log()),
+            worktree_sessions_running: 1,
         },
         changes: vec![ChangeExecutionStatus {
             id: "a-change".to_string(),
@@ -2221,4 +2222,341 @@ fn event_envelope() -> EventEnvelope {
 
 fn api_error() -> ApiError {
     ApiError::new(ErrorCode::StaleRevision, "revision moved", "corr-1").with_revision(9)
+}
+
+// ============================================================================
+// Configured-command worktree sessions
+// ============================================================================
+
+/// The `kind` discriminants a `CommandResult` variant publishes, whether the
+/// variant is inline or an `allOf` over its own result schema.
+fn result_kinds(doc: &Value) -> BTreeSet<String> {
+    let mut kinds = BTreeSet::new();
+    for variant in schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let parts: Vec<Value> = match variant["allOf"].as_array() {
+            Some(parts) => parts.clone(),
+            None => vec![variant.clone()],
+        };
+        for part in parts {
+            for kind in part["properties"]["kind"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                if let Some(kind) = kind.as_str() {
+                    kinds.insert(kind.to_string());
+                }
+            }
+        }
+    }
+    kinds
+}
+
+fn command_variant<'a>(doc: &'a Value, name: &str) -> Option<&'a Value> {
+    schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()?
+        .iter()
+        .find(|variant| variant["properties"]["type"]["enum"][0] == name)
+}
+
+fn session_resource() -> conflux::web::remote_control_api::dto::WorktreeSessionResource {
+    use conflux::web::remote_control_api::dto::{
+        SessionCleanupFacts, SessionOutput, SessionOutputLine, SessionSetupFacts,
+        WorktreeSessionResource,
+    };
+    WorktreeSessionResource {
+        session_id: "a".repeat(32),
+        instance_id: "instance-1".to_string(),
+        kind: "session".to_string(),
+        worktree_id: Some("b".repeat(32)),
+        path: "../ws/proposal-1730000000000".to_string(),
+        branch: "ws-session-ab12cd34ef".to_string(),
+        state: "stopped".to_string(),
+        attempt: 1,
+        started_at: "2026-08-04T00:00:00Z".to_string(),
+        finished_at: Some("2026-08-04T00:00:05Z".to_string()),
+        exit_code: None,
+        signal: Some("SIGTERM".to_string()),
+        stop_requested: true,
+        setup: Some(SessionSetupFacts {
+            ran: true,
+            succeeded: true,
+        }),
+        cleanup: Some(SessionCleanupFacts {
+            outcome: "retained".to_string(),
+            removed: false,
+            reason: Some("device busy".to_string()),
+        }),
+        output: SessionOutput {
+            lines: vec![SessionOutputLine {
+                stream: "stdout".to_string(),
+                text: "hello".to_string(),
+            }],
+            retained_bytes: 5,
+            truncated_bytes: 0,
+        },
+    }
+}
+
+/// Everything the session surface publishes, as one predicate so the same
+/// check can be run against a deliberately incomplete copy.
+fn session_contract_errors(doc: &Value) -> Vec<String> {
+    use conflux::web::remote_control_api::dto::{
+        SessionCleanupFacts, SessionSetupFacts, WorktreeSessionCapability,
+        WorktreeSessionEventType, WorktreeSessionResponse, WorktreeSessionResult,
+        WorktreeSessionsResponse,
+    };
+    let mut errors = Vec::new();
+
+    // Three commands, each closed over its own target.
+    for (name, target) in [
+        ("run_worktree_command", Some("WorktreeTarget")),
+        ("create_session_worktree", None),
+        ("stop_worktree_session", Some("SessionTarget")),
+    ] {
+        let Some(variant) = command_variant(doc, name) else {
+            errors.push(format!("the command `{name}` is not published"));
+            continue;
+        };
+        let reference = variant["properties"]["target"]["$ref"].as_str();
+        match target {
+            Some(schema) => {
+                if reference != Some(&format!("#/components/schemas/{schema}")) {
+                    errors.push(format!("`{name}` must target `{schema}`: {variant}"));
+                }
+            }
+            None => {
+                if variant["properties"].get("target").is_some() {
+                    errors.push(format!("`{name}` must take no target: {variant}"));
+                }
+            }
+        }
+        for smuggled in ["command", "argv", "env", "path", "branch", "change_id"] {
+            if variant["properties"].get(smuggled).is_some() {
+                errors.push(format!("`{name}` must not publish `{smuggled}`"));
+            }
+        }
+    }
+    if schemas(doc)["SessionTarget"]["properties"]
+        .as_object()
+        .map(|p| p.keys().cloned().collect::<Vec<_>>())
+        != Some(vec!["session_id".to_string()])
+    {
+        errors.push("SessionTarget must carry exactly `session_id`".into());
+    }
+
+    // Two read routes, both bearer-gated GETs.
+    for route in [
+        "/api/v2/worktree-sessions",
+        "/api/v2/worktree-sessions/{session_id}",
+    ] {
+        if doc["paths"][route]["get"].is_null() {
+            errors.push(format!("the route `{route}` is not published"));
+        }
+        if UNAUTHENTICATED_V2_PATHS.contains(&route) {
+            errors.push(format!("the route `{route}` must be authenticated"));
+        }
+    }
+
+    // Two result kinds and three error codes.
+    let kinds = result_kinds(doc);
+    for kind in ["worktree_session", "worktree_session_stop"] {
+        if !kinds.contains(kind) {
+            errors.push(format!("the result kind `{kind}` is not published"));
+        }
+    }
+    let codes = published_enum(doc, "ErrorCode");
+    for code in [
+        "worktree_session_unavailable",
+        "worktree_session_busy",
+        "worktree_session_setup_failed",
+    ] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    // The capability, the event vocabulary, and the execution-status counter.
+    if schemas(doc)["CapabilitiesResponse"]["properties"]["worktree_sessions"].is_null() {
+        errors.push("CapabilitiesResponse.worktree_sessions is not published".into());
+    }
+    let events = published_enum(doc, "WorktreeSessionEventType");
+    for event in ["worktree_session_started", "worktree_session_finished"] {
+        if !events.contains(event) {
+            errors.push(format!("the event type `{event}` is not published"));
+        }
+    }
+    if schemas(doc)["ProcessExecutionStatus"]["properties"]["worktree_sessions_running"].is_null() {
+        errors.push("ProcessExecutionStatus.worktree_sessions_running is not published".into());
+    }
+
+    // DTO values constructed field by field validate against what is published.
+    let launch = CommandRecord {
+        command_type: "create_session_worktree".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::WorktreeSessionSetupFailed),
+        result: Some(CommandResult::WorktreeSession(Box::new(
+            WorktreeSessionResult {
+                session_id: None,
+                session_kind: "session".to_string(),
+                worktree_id: None,
+                branch: "ws-session-ab12cd34ef".to_string(),
+                path: "../ws/proposal-1730000000000".to_string(),
+                setup: Some(SessionSetupFacts {
+                    ran: true,
+                    succeeded: false,
+                }),
+                cleanup: Some(SessionCleanupFacts {
+                    outcome: "removed".to_string(),
+                    removed: true,
+                    reason: None,
+                }),
+            },
+        ))),
+        ..command_record()
+    };
+    let stop = CommandRecord {
+        command_type: "stop_worktree_session".to_string(),
+        state: CommandState::Succeeded,
+        error_code: None,
+        result: Some(CommandResult::WorktreeSessionStop {
+            session_id: "a".repeat(32),
+            terminated: true,
+            state_after: "stopped".to_string(),
+        }),
+        ..command_record()
+    };
+    let capability = WorktreeSessionCapability {
+        available: true,
+        commands: vec![
+            "run_worktree_command".to_string(),
+            "create_session_worktree".to_string(),
+            "stop_worktree_session".to_string(),
+        ],
+        routes: vec![
+            "/api/v2/worktree-sessions".to_string(),
+            "/api/v2/worktree-sessions/{session_id}".to_string(),
+        ],
+        max_running: 4,
+        max_retained: 32,
+        max_output_bytes: 65_536,
+        stdin: "null".to_string(),
+        reasons: vec!["capacity".to_string()],
+        event_types: vec![
+            WorktreeSessionEventType::WorktreeSessionStarted,
+            WorktreeSessionEventType::WorktreeSessionFinished,
+        ],
+    };
+    let cases: Vec<(&str, Value)> = vec![
+        ("CommandRecord", to_value(&launch)),
+        ("CommandRecord", to_value(&stop)),
+        ("WorktreeSessionCapability", to_value(&capability)),
+        (
+            "WorktreeSessionResponse",
+            to_value(&WorktreeSessionResponse {
+                instance_id: "instance-1".to_string(),
+                state_revision: 3,
+                session: session_resource(),
+            }),
+        ),
+        (
+            "WorktreeSessionsResponse",
+            to_value(&WorktreeSessionsResponse {
+                instance_id: "instance-1".to_string(),
+                state_revision: 3,
+                sessions: vec![session_resource()],
+            }),
+        ),
+        ("ExecutionStatusResponse", to_value(&execution_status())),
+    ];
+    for (name, payload) in cases {
+        let schema = &schemas(doc)[name];
+        if schema.is_null() {
+            errors.push(format!("{name} is served but is not published"));
+            continue;
+        }
+        validate(&payload, schema, schemas(doc), name, &mut errors);
+    }
+    errors
+}
+
+#[test]
+fn remote_worktree_session_contract_is_published_end_to_end() {
+    let doc = generated();
+    let errors = session_contract_errors(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    // The worktree capability names the session operation.
+    assert!(conflux::web::remote_control_api::worktrees::WORKTREE_OPERATIONS.contains(&"session"));
+
+    // Negative control: a copy missing one route and one result kind must fail,
+    // and the failure must name exactly what is missing.
+    let mut incomplete = doc.clone();
+    incomplete["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktree-sessions/{session_id}")
+        .expect("the route was published");
+    incomplete["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("worktree_session_stop"));
+    let errors = session_contract_errors(&incomplete);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("/api/v2/worktree-sessions/{session_id}")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("worktree_session_stop")),
+        "{errors:#?}"
+    );
+}
+
+/// The exported document and the live one are the same bytes, and both carry
+/// the session surface.
+#[tokio::test]
+async fn remote_worktree_session_cli_export_equals_the_live_document() {
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    let response = protected_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v2/openapi.yaml")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let served = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let exported = std::process::Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .arg("openapi")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("the cflx binary under test is runnable");
+    assert!(exported.status.success());
+    let exported = String::from_utf8(exported.stdout).unwrap();
+    assert_eq!(exported, served);
+    for needle in [
+        "/api/v2/worktree-sessions/{session_id}",
+        "run_worktree_command",
+        "worktree_session_finished",
+    ] {
+        assert!(exported.contains(needle), "{needle}");
+    }
 }

@@ -747,7 +747,15 @@ async fn remote_worktree_capabilities_report_the_operations_and_recovery_boundar
     assert_eq!(operations, WORKTREE_OPERATIONS.to_vec());
     assert_eq!(
         operations,
-        ["list", "detail", "create", "delete", "merge", "merge_abort"]
+        [
+            "list",
+            "detail",
+            "create",
+            "delete",
+            "merge",
+            "merge_abort",
+            "session"
+        ]
     );
     assert_eq!(body["worktrees"]["merge_abort"]["available"], true);
     assert_eq!(
