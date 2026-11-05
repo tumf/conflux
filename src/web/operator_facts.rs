@@ -136,6 +136,19 @@ impl OperatorFactsStore {
         self.repo_root.clone()
     }
 
+    /// The change whose observed worktree relation is `worktree`, if any.
+    ///
+    /// Compared canonically, so a symlink alias of the worktree on either side
+    /// still names its owner.
+    pub fn worktree_owner(&self, worktree: &std::path::Path) -> Option<String> {
+        let target = std::fs::canonicalize(worktree).ok()?;
+        self.worktree_paths
+            .iter()
+            .filter(|(_, path)| std::fs::canonicalize(path).ok().as_deref() == Some(&target))
+            .map(|(change_id, _)| change_id.clone())
+            .min()
+    }
+
     /// The absolute managed worktree path last observed for one change.
     pub fn worktree_path(&self, change_id: &str) -> Option<PathBuf> {
         self.worktree_paths

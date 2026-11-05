@@ -281,7 +281,10 @@ pub fn remote_control_router(
         .with_worktrees(runtime)
         // The refresh preview reads the same change-to-worktree relation the
         // projected `worktree` field describes.
-        .with_refresh_paths(state),
+        .with_refresh_paths(state.clone())
+        // The text surface resolves against the same project root, worktree
+        // relation, and managed-termination port the snapshot publishes.
+        .with_text_edit(state),
     ))
 }
 

@@ -497,6 +497,30 @@ a cancellation is still in flight. Read the settled command record's typed
 which is always `false`. Creating a manual commit, archive, or merge on that
 guess is exactly the failure this contract exists to prevent.
 
+### Editing a text file over `/api/v2`
+
+`GET /api/v2/changes/{change_id}/text?path=` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=` read one regular UTF-8 file
+(at most 1 MiB, path at most 1024 bytes) under a server-derived root and return
+its `sha256:` `content_id`; `write_change_text` and `write_worktree_text` save
+it only while `params.expected` still holds (`content` identity, or `absent` to
+create). A mismatch is `text_stale` with `result.current_content_id`. `.git`,
+top-level `.wt/` and `.conflux-inflight`, nested repositories, symlinks,
+executable, oversized, and non-text files are `text_not_editable` with a stable
+`reason`. Every read publishes `editable` and `edit_blocked_reason`
+(`change_active`, `change_admitted`, `managed_process_live`, `root_busy`) from
+the same classifier a write is refused by (`target_ineligible`);
+`managed_process_live` means a managed writer is bound to the root *or* the
+owner cannot prove none is, and `edit_blocked_detail` says which. Retained
+unproven processes from an earlier run keep their root blocked; restarting the
+owner is not quiescence evidence, and the editor kills nothing. External
+editors are not excluded: the compare and the rename are not atomic against
+them. A save never commits, stages, or pushes, but it can advance the state
+revision through the ordinary observation refresh — re-read `state_revision`
+afterwards. A crash mid-write can leave `.<leaf>.cflx-tmp-<hex>`, which shows
+up as ordinary untracked dirt. Read `capabilities.text_edit`; an older owner
+omits it (decoded as unavailable). Full detail: `docs/guides/USAGE.md`.
+
 ### Merging a worktree over `/api/v2`
 
 `merge_worktree` and `merge_worktree_abort_on_conflict` are separate commands

@@ -133,6 +133,9 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
                 .map(|reason| reason.as_str().to_string())
                 .collect(),
         },
+        // A read surface plus two fenced commands, served once the owner-side
+        // facts it resolves against are attached.
+        text_edit: super::text_edit::capability(state.text_edit.is_some()),
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,
             vcs_backend: parallel.vcs_backend,

@@ -22,6 +22,7 @@ mod read_tests;
 mod registry_tests;
 mod stop_result_tests;
 mod stream_tests;
+mod text_edit_tests;
 mod worktree_tests;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

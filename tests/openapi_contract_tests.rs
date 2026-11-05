@@ -2038,3 +2038,308 @@ fn event_envelope() -> EventEnvelope {
 fn api_error() -> ApiError {
     ApiError::new(ErrorCode::StaleRevision, "revision moved", "corr-1").with_revision(9)
 }
+
+// ============================================================================
+// Bounded remote text edit
+// ============================================================================
+
+fn variant<'a>(doc: &'a Value, schema: &str, tag: &str, value: &str) -> Option<&'a Value> {
+    schemas(doc)[schema]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants
+                .iter()
+                .find(|variant| variant["properties"][tag]["enum"][0] == value)
+        })
+}
+
+fn property_names(schema: &Value) -> BTreeSet<&str> {
+    schema["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+fn required_names(schema: &Value) -> BTreeSet<&str> {
+    schema["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Every element of the text surface a generated client needs, by name.
+fn text_edit_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for route in [
+        "/api/v2/changes/{change_id}/text",
+        "/api/v2/worktrees/{worktree_id}/text",
+    ] {
+        let operation = &doc["paths"][route]["get"];
+        if operation.is_null() {
+            errors.push(format!("the text read route {route} is not published"));
+            continue;
+        }
+        let params: BTreeSet<&str> = operation["parameters"]
+            .as_array()
+            .map(|p| p.iter().filter_map(|p| p["name"].as_str()).collect())
+            .unwrap_or_default();
+        if !params.contains("path") {
+            errors.push(format!("{route} must publish its `path` query parameter"));
+        }
+        if !operation.to_string().contains("TextReadResponse") {
+            errors.push(format!("{route} must answer with TextReadResponse"));
+        }
+    }
+
+    for command in ["write_change_text", "write_worktree_text"] {
+        match variant(doc, "CommandSpec", "type", command) {
+            None => errors.push(format!("the {command} command is not published")),
+            Some(spec) => {
+                if property_names(spec) != BTreeSet::from(["type", "target", "params"]) {
+                    errors.push(format!("{command} must accept only target and params"));
+                }
+                if !spec["properties"]["params"]
+                    .to_string()
+                    .contains("TextWriteParams")
+                {
+                    errors.push(format!("{command} params must be TextWriteParams"));
+                }
+            }
+        }
+    }
+    let params = &schemas(doc)["TextWriteParams"];
+    if required_names(params) != BTreeSet::from(["path", "expected", "content"]) {
+        errors.push("TextWriteParams must require exactly path, expected, and content".into());
+    }
+    for kind in ["content", "absent"] {
+        if variant(doc, "TextExpectation", "kind", kind).is_none() {
+            errors.push(format!("the `{kind}` expectation is not published"));
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants
+                .iter()
+                .any(|variant| variant.to_string().contains("\"text_write\""))
+        });
+    if !result_published {
+        errors.push("the text_write result kind is not published".into());
+    }
+    let result_required = required_names(&schemas(doc)["TextWriteResult"]);
+    for member in [
+        "scope",
+        "path",
+        "outcome",
+        "reason",
+        "detail",
+        "content_id_before",
+        "content_id_after",
+        "current_content_id",
+        "bytes_written",
+        "mode",
+        "effects",
+    ] {
+        if !result_required.contains(member) {
+            errors.push(format!("TextWriteResult must require `{member}`"));
+        }
+    }
+    let read_required = required_names(&schemas(doc)["TextReadResponse"]);
+    for member in [
+        "content",
+        "content_id",
+        "editable",
+        "edit_blocked_reason",
+        "edit_blocked_detail",
+        "limits",
+    ] {
+        if !read_required.contains(member) {
+            errors.push(format!("TextReadResponse must require `{member}`"));
+        }
+    }
+    let reasons = published_enum(doc, "TextEditBlockedReason");
+    if reasons
+        != BTreeSet::from(
+            [
+                "change_active",
+                "change_admitted",
+                "managed_process_live",
+                "root_busy",
+            ]
+            .map(String::from),
+        )
+    {
+        errors.push(format!("TextEditBlockedReason vocabulary: {reasons:?}"));
+    }
+
+    let codes = published_enum(doc, "ErrorCode");
+    for code in ["text_stale", "text_not_editable"] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    let capabilities = &schemas(doc)["CapabilitiesResponse"];
+    if capabilities["properties"]["text_edit"].is_null() {
+        errors.push("capabilities.text_edit is not published".into());
+    }
+    if required_names(capabilities).contains("text_edit") {
+        errors.push("text_edit must decode as absent from an older owner".into());
+    }
+    errors
+}
+
+#[test]
+fn remote_text_edit_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        TextEditBlockedReason, TextReadResponse, TextScope, TextWriteEffects, TextWriteOutcome,
+        TextWriteResult,
+    };
+
+    let doc = generated();
+    assert_eq!(text_edit_contract_errors(&doc), Vec::<String>::new());
+    for route in [
+        "/api/v2/changes/{change_id}/text",
+        "/api/v2/worktrees/{worktree_id}/text",
+    ] {
+        assert!(SUPPORTED_V2_PATHS.contains(&route), "{route}");
+    }
+    assert!(SUPPORTED_COMMANDS.contains(&"write_change_text"));
+    assert!(SUPPORTED_COMMANDS.contains(&"write_worktree_text"));
+
+    // What the server serializes is what the schemas describe, field by field.
+    let record = CommandRecord {
+        command_type: "write_worktree_text".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::TextStale),
+        result: Some(CommandResult::TextWrite(Box::new(TextWriteResult {
+            scope: TextScope::Worktree {
+                worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            path: "src/lib.rs".to_string(),
+            outcome: None,
+            reason: Some("stale".to_string()),
+            detail: None,
+            content_id_before: None,
+            content_id_after: None,
+            current_content_id: Some(format!("sha256:{}", "a".repeat(64))),
+            bytes_written: None,
+            mode: None,
+            effects: TextWriteEffects {
+                file_written: false,
+            },
+        }))),
+        ..command_record()
+    };
+    let written = CommandRecord {
+        command_type: "write_change_text".to_string(),
+        state: CommandState::Succeeded,
+        error_code: None,
+        result: Some(CommandResult::TextWrite(Box::new(TextWriteResult {
+            scope: TextScope::Change {
+                change_id: "alpha".to_string(),
+            },
+            path: "tasks.md".to_string(),
+            outcome: Some(TextWriteOutcome::Written),
+            reason: None,
+            detail: None,
+            content_id_before: Some(format!("sha256:{}", "a".repeat(64))),
+            content_id_after: Some(format!("sha256:{}", "b".repeat(64))),
+            current_content_id: Some(format!("sha256:{}", "b".repeat(64))),
+            bytes_written: Some(12),
+            mode: Some("0644".to_string()),
+            effects: TextWriteEffects { file_written: true },
+        }))),
+        ..command_record()
+    };
+    let read = TextReadResponse {
+        instance_id: "instance-1".to_string(),
+        state_revision: 41,
+        scope: TextScope::Worktree {
+            worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+        },
+        path: "src/lib.rs".to_string(),
+        exists: true,
+        content: Some("fn main() {}\n".to_string()),
+        content_id: Some(format!("sha256:{}", "c".repeat(64))),
+        size_bytes: Some(13),
+        mode: Some("0644".to_string()),
+        editable: false,
+        edit_blocked_reason: Some(TextEditBlockedReason::ManagedProcessLive),
+        edit_blocked_detail: Some("managed writer coverage is unknown".to_string()),
+        limits: conflux::web::remote_control_api::text_edit::limits(),
+    };
+    let capability = conflux::web::remote_control_api::text_edit::capability(true);
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("CommandRecord", to_value(&written)),
+        ("TextReadResponse", to_value(&read)),
+        ("TextEditCapability", to_value(&capability)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(to_value(&record)["result"]["kind"], "text_write");
+    assert_eq!(
+        to_value(&read)["edit_blocked_reason"],
+        "managed_process_live"
+    );
+
+    // The route surface and removed-path predicates still hold with the two
+    // new routes in place.
+    assert_eq!(route_surface_errors(&doc), Vec::<String>::new());
+    assert_eq!(removed_path_errors(&doc), Vec::<String>::new());
+}
+
+#[test]
+fn remote_text_edit_contract_omission_is_detected() {
+    let doc = generated();
+
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("\"text_write\""));
+    assert_ne!(without_kind, doc);
+    assert!(text_edit_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("text_write result kind")));
+
+    let mut without_route = doc.clone();
+    without_route["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktrees/{worktree_id}/text");
+    assert_ne!(without_route, doc);
+    assert!(text_edit_contract_errors(&without_route)
+        .iter()
+        .any(|error| error.contains("/api/v2/worktrees/{worktree_id}/text")));
+    assert!(!route_surface_errors(&without_route).is_empty());
+
+    let mut without_command = doc.clone();
+    without_command["components"]["schemas"]["CommandSpec"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| variant["properties"]["type"]["enum"][0] != "write_change_text");
+    assert!(text_edit_contract_errors(&without_command)
+        .iter()
+        .any(|error| error.contains("write_change_text")));
+
+    let mut without_code = doc.clone();
+    without_code["components"]["schemas"]["ErrorCode"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|code| code != "text_stale");
+    assert!(text_edit_contract_errors(&without_code)
+        .iter()
+        .any(|error| error.contains("text_stale")));
+}

@@ -1633,6 +1633,40 @@ impl crate::web::remote_control_api::proposal_refresh::RefreshPathSource for Web
     }
 }
 
+#[async_trait::async_trait]
+impl crate::web::remote_control_api::text_edit::TextEditSource for WebState {
+    async fn project_root(&self) -> Option<std::path::PathBuf> {
+        self.operator_facts.read().await.repo_root()
+    }
+
+    async fn worktree_owner(&self, worktree: &std::path::Path) -> Option<String> {
+        self.operator_facts.read().await.worktree_owner(worktree)
+    }
+
+    /// Coverage comes from the same managed-termination port the snapshot's
+    /// change-keyed `managed_process_live` reads. That mapping keeps its
+    /// `None => false` default because it feeds `force_stop_change`; this one
+    /// does not, so an unbound port is `Unknown`, never `Clear`.
+    async fn writer_coverage_under(
+        &self,
+        root: &std::path::Path,
+    ) -> crate::orchestration::operator_command::WriterCoverage {
+        let port = self.managed_termination.read().await.clone();
+        match port {
+            Some(port) => port.writer_coverage_under(root).await,
+            None => crate::orchestration::operator_command::WriterCoverage::Unknown {
+                detail: "managed writer coverage is unknown: no managed-process port is bound \
+                         to this owner"
+                    .to_string(),
+            },
+        }
+    }
+
+    async fn after_text_write(&self) {
+        self.sync_remote_control_projection().await;
+    }
+}
+
 impl Default for WebState {
     fn default() -> Self {
         Self::new(&[])

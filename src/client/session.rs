@@ -271,6 +271,7 @@ pub(crate) fn observation_for_test(changes: Vec<ChangeResource>) -> Observation 
                 blocked_reasons: Vec::new(),
             },
             proposal_refresh: Default::default(),
+            text_edit: Default::default(),
         },
         instance: InstanceResponse {
             instance_id: instance_id.clone(),
