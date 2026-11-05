@@ -5,21 +5,25 @@
 //! going, what the last lifecycle-significant thing to happen was, and which
 //! changes appeared after the process started watching. This store owns exactly
 //! those, plus the two server-side observations (parallel eligibility, worktree
-//! relation) that a client would otherwise have to run Git to reproduce.
+//! relation) that a client would otherwise have to run Git to reproduce, and
+//! the two shared clocks — per-change net-active time and the run clock — that
+//! the TUI computes through the same rules.
 //!
 //! Everything here is in-memory for one process lifetime and is discarded on
 //! restart, so none of it can become durable workflow-control state.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
 use crate::events::ExecutionEvent;
+use crate::orchestration::net_active_clock::NetActiveClock;
 use crate::tui::types::WorktreeInfo;
 use crate::web::remote_control_api::dto::{
-    AttentionState, ChangeActivity, ChangeTiming, ChangeWorktree, ParallelBlockedReason,
-    ParallelEligibility,
+    AttentionState, ChangeActivity, ChangeTiming, ChangeWorktree, NetActiveTiming,
+    ParallelBlockedReason, ParallelEligibility, RunClock as RunClockView,
 };
 use crate::web::remote_control_api::projection::describe_event;
 use crate::web::remote_control_api::worktrees::repository_relative_display;
@@ -117,6 +121,20 @@ pub struct OperatorFactsStore {
     worktree_paths: HashMap<String, PathBuf>,
     /// Latest worktree observation, used to resolve branches.
     worktrees: Vec<WorktreeInfo>,
+    /// Net-active clock per change.
+    ///
+    /// Kept apart from `facts` on purpose: a change briefly absent from a
+    /// catalog refresh must not lose its accumulated time, because the shared
+    /// clock is never reset while the owner runs — the TUI keeps a row with
+    /// execution history alive for the same reason.
+    net_active: HashMap<String, NetActiveClock>,
+    /// The reducer display status each change had at the latest observation.
+    ///
+    /// The pre-event status the resolve-side run-clock rule reads, the way the
+    /// TUI handlers read their row cache before rewriting it.
+    observed_statuses: HashMap<String, String>,
+    /// The run clock this frontend projects from the TUI's own event table.
+    run_clock: crate::orchestration::run_clock::RunClock,
 }
 
 impl OperatorFactsStore {
@@ -152,6 +170,73 @@ impl OperatorFactsStore {
     /// Sanitized fatal process error, when one was reported.
     pub fn process_error(&self) -> Option<String> {
         self.process_error.clone()
+    }
+
+    /// Observe the reducer display status of every row at one instant.
+    ///
+    /// The web counterpart of the TUI's reducer synchronization: each status
+    /// opens or closes that change's net-active interval through the shared
+    /// rule, so the same sequence produces the same intervals in both
+    /// frontends. A repeated identical status changes nothing.
+    pub fn observe_display_statuses_at<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+        now: Instant,
+        wall: DateTime<Utc>,
+    ) {
+        for (id, status) in rows {
+            self.net_active
+                .entry(id.to_string())
+                .or_default()
+                .observe_status_at(status, now, wall);
+            match self.observed_statuses.get_mut(id) {
+                Some(current) if current == status => {}
+                Some(current) => *current = status.to_string(),
+                None => {
+                    self.observed_statuses
+                        .insert(id.to_string(), status.to_string());
+                }
+            }
+        }
+    }
+
+    /// The display status observed for one change at the latest observation.
+    pub fn observed_status(&self, change_id: &str) -> Option<&str> {
+        self.observed_statuses.get(change_id).map(String::as_str)
+    }
+
+    /// Published net-active timing for one change; zero with no history.
+    pub fn net_active(&self, change_id: &str) -> NetActiveTiming {
+        let Some(clock) = self.net_active.get(change_id) else {
+            return NetActiveTiming::default();
+        };
+        NetActiveTiming {
+            accumulated_ms: u64::try_from(clock.accumulated().as_millis()).unwrap_or(u64::MAX),
+            active_since: clock.active_since().map(|wall| wall.to_rfc3339()),
+            has_history: clock.has_history(),
+        }
+    }
+
+    /// Open the run clock: an accepted Start while the owner was not running.
+    pub fn open_run_at(&mut self, now: Instant, wall: DateTime<Utc>) {
+        self.run_clock.open_at(now, wall);
+    }
+
+    /// Freeze the run clock, overwriting any earlier freeze.
+    pub fn freeze_run_at(&mut self, now: Instant, wall: DateTime<Utc>) {
+        self.run_clock.freeze_at(now, wall);
+    }
+
+    /// Published run clock; all `null` before the first Start.
+    pub fn run_clock(&self) -> RunClockView {
+        RunClockView {
+            started_at: self.run_clock.started().map(|(_, wall)| wall.to_rfc3339()),
+            ended_at: self.run_clock.frozen().map(|(_, wall)| wall.to_rfc3339()),
+            elapsed_ms: self
+                .run_clock
+                .frozen()
+                .map(|(elapsed, _)| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+        }
     }
 
     /// Reconcile the store with the complete set of currently known changes.
@@ -266,7 +351,34 @@ impl OperatorFactsStore {
     /// Uses the same [`describe_event`] projection the event stream publishes,
     /// so `latest_activity.event_type` and the stream's `event_type` are the
     /// same vocabulary rather than two parallel taxonomies.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_event(&mut self, event: &ExecutionEvent) {
+        self.record_event_at(event, Instant::now(), Utc::now());
+    }
+
+    /// [`Self::record_event`] at one injected observation sample.
+    ///
+    /// `now` and `wall` are the single sample of this observation: the wall
+    /// instant is shared by `latest_activity`, `timing`, and the clocks, so one
+    /// event yields one timestamp.
+    pub fn record_event_at(&mut self, event: &ExecutionEvent, now: Instant, wall: DateTime<Utc>) {
+        // Context-free run-clock and net-active boundaries, exactly the TUI's:
+        // every `Stopped` delivery freezes the run clock and closes every row's
+        // open interval (order-independent with the reducer's `not queued`
+        // synchronization); every `AllCompleted` delivery freezes, whether or
+        // not it may overwrite the mode. A fatal `Error`, a persistent-idle park,
+        // and stop request or cancellation touch neither.
+        match event {
+            ExecutionEvent::Stopped => {
+                self.run_clock.freeze_at(now, wall);
+                for clock in self.net_active.values_mut() {
+                    clock.close_at(now);
+                }
+            }
+            ExecutionEvent::AllCompleted => self.run_clock.freeze_at(now, wall),
+            _ => {}
+        }
+
         let (event_type, change_id, _) = describe_event(event);
         let detail = match event {
             ExecutionEvent::ProcessingError { error, .. }
@@ -295,7 +407,7 @@ impl OperatorFactsStore {
         let Some(change_id) = change_id else {
             return;
         };
-        let now = Utc::now();
+        let now = wall;
         let facts = self.facts.entry(change_id).or_default();
 
         // `processing_started` begins a fresh run and discards the previous

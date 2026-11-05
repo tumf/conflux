@@ -20,6 +20,10 @@ mod render;
 pub mod run_supervisor;
 mod runner;
 mod state;
+/// Re-exported for the `/api/v2` progress-timing parity tests, which drive the
+/// TUI and the web projection through one event sequence at the same instants.
+#[cfg(test)]
+pub(crate) use state::AppState;
 /// Re-exported for cross-module redaction tests that follow one provenance
 /// record from the executor all the way to the popup's copy text.
 #[cfg(test)]

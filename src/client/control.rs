@@ -1093,6 +1093,8 @@ mod tests {
             latest_activity: None,
             worktree: None,
             acceptance_provenance: None,
+            archive_complete: None,
+            net_active: None,
         }
     }
 

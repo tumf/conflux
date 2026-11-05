@@ -1244,6 +1244,8 @@ mod enabled {
             latest_activity: None,
             worktree: None,
             acceptance_provenance: None,
+            archive_complete: None,
+            net_active: None,
         }
     }
 
@@ -1308,6 +1310,7 @@ mod enabled {
                 in_progress: 0,
                 pending: total,
             },
+            run_clock: None,
         }
     }
 

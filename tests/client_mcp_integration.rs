@@ -387,6 +387,8 @@ impl Owner {
                     latest_activity: None,
                     worktree: None,
                     acceptance_provenance: None,
+                    archive_complete: None,
+                    net_active: None,
                 }
             })
             .collect();
@@ -408,6 +410,7 @@ impl Owner {
                     in_progress: 0,
                     pending: total,
                 },
+                run_clock: None,
             },
         );
     }
