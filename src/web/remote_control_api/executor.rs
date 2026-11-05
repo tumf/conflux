@@ -623,7 +623,8 @@ impl SharedServiceExecutor {
             },
             CommandSpec::CreateWorktree { .. }
             | CommandSpec::DeleteWorktree { .. }
-            | CommandSpec::MergeWorktree { .. } => return None,
+            | CommandSpec::MergeWorktree { .. }
+            | CommandSpec::MergeWorktreeAbortOnConflict { .. } => return None,
         })
     }
 
@@ -642,6 +643,11 @@ impl SharedServiceExecutor {
             }
             CommandSpec::MergeWorktree { target, .. } => {
                 self.worktrees.merge(&target.worktree_id).await
+            }
+            CommandSpec::MergeWorktreeAbortOnConflict { target, .. } => {
+                self.worktrees
+                    .merge_abort_on_conflict(&target.worktree_id)
+                    .await
             }
             other => {
                 debug_assert!(false, "not a worktree command: {other:?}");

@@ -528,6 +528,24 @@ active_since)` and "run elapsed" as `now - started_at` while `ended_at` is
 `null`. An older owner omits all three; that decodes as `None` — "unpublished" —
 never as `false` or zero, and every `cflx client` verb keeps working against it.
 
+### Merging a worktree over `/api/v2`
+
+`merge_worktree` and `merge_worktree_abort_on_conflict` are separate commands
+on purpose. `merge_worktree` preserves a conflict (`merge_conflict`,
+`local_or_tui_required`, `MERGE_HEAD` retained, later mutations `root_busy`),
+and `merge_conflict_preserves_state: true` describes it alone. The abort
+variant refuses a predicted conflict as `merge_conflict_predicted` before any
+Git mutation, and aborts a real one once, then verifies restoration from the
+repository: `HEAD` equals `premerge_head`, no `MERGE_HEAD`, and a clean root.
+Only all three passing is `merge_conflict_aborted` (`restored: confirmed`); a
+failed or unreadable check is `merge_abort_failed` (`restored: failed` or
+`unknown`, `recovery: local_or_tui_required`), and the root stays `root_busy`
+while `MERGE_HEAD` remains. Read the typed `merge_abort` result, never the
+prose, and never treat an abort attempt as a restoration. Nothing retries the
+abort or compensates — not the owner and not a relaying server. An older
+owner omits `capabilities.worktrees.merge_abort` (decoded as unavailable) and
+refuses the command with `validation_failed`.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on
