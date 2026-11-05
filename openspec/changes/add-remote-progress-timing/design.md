@@ -174,8 +174,9 @@ per observation (the same sample as `latest_activity`):
 
 | web trigger (`ExecutionEvent`) | run clock | TUI source |
 |---|---|---|
-| `OperatorCommandApplied { RunDispatched }` while `app_mode != "running"` (before the arm moves it) | `open_at` | `admit_run_targets` guard `execution_mode != Running`, `state.rs:2311-2323` |
+| `OperatorCommandApplied { RunDispatched }` with non-empty `change_ids` while `app_mode != "running"` (before the arm moves it) | `open_at` | `admit_run_targets` guard `execution_mode != Running`, `state.rs:2311-2323` |
 | `OperatorCommandApplied { RunDispatched }` while `app_mode == "running"` | nothing | `queue_run` while Running adds a target only |
+| `OperatorCommandApplied { RunDispatched }` with empty `change_ids` | nothing | not an accepted Start: run control refuses an empty Start before dispatch, and a committed-nothing dispatch publishes no revision (`event_ownership_tests.rs`) |
 | admitted work start that moves Ready → `running`; `ProcessingStarted`; `OperatorCommandApplied { ResolveReserved }` | nothing | `mod.rs:56-64`, `operator_commands.rs:97-105` |
 | `Stopped`, every delivery | `freeze_at` | `processing.rs:185-187` |
 | `AllCompleted`, every delivery, regardless of `all_completed_may_overwrite_mode` | `freeze_at` | `completion.rs:28-29, 43-44` |

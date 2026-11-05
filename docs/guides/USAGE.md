@@ -229,6 +229,36 @@ Notes for client authors:
   `cancelled_phase`, `last_completed_phase`, `apply_commit` (whose `present:
   null` means *unknown*, not absent), and `effects_rolled_back`, which is always
   `false` because dequeue never undoes completed worktree work.
+- Progress and timing come from three snapshot members, all process-local and
+  zero, `false`, or empty again after the owner restarts:
+  - `changes[].archive_complete` is `true` exactly when the reducer recorded
+    archive completion for the change in this process. It is not
+    `display_status`: an archived change truthfully advances to `resolving`,
+    `resolve pending`, `merge wait`, `merged`, or `pushed`, while a
+    fresh-process resolve retry shows `resolving` with `archive_complete:
+    false`. It is not merge or push success either.
+  - `changes[].timing` is *per run*: `processing_started` discards the previous
+    run's boundaries and `elapsed_ms` is the finished run's duration.
+    `changes[].net_active` is the *cumulative* counterpart, the same net
+    execution time the TUI row shows: closed active intervals in
+    `accumulated_ms`, plus the open one starting at `active_since` (`null`
+    while closed). An interval opens on a transition into `preparing`,
+    `applying`, `accepting`, `rejecting`, `archiving`, or `resolving`, closes on
+    any other status or on process `Stopped`, and is never reset while the
+    owner runs.
+  - `run_clock` is the TUI `Elapsed` line, boundary for boundary: an accepted
+    Start while the owner is not running opens it (`started_at` set,
+    `ended_at` and `elapsed_ms` `null`); a persistent-idle park, persistent-idle
+    re-admission, `ResolveReserved`, and a fatal process error leave it open;
+    every `Stopped`, every `AllCompleted`, and a resolve settlement that leaves
+    nothing processing freeze it, and a repeated terminal event re-freezes it at
+    the later instant. The value stays until the next opening Start.
+
+  No member is a live counter, so time passing never advances `state_revision`.
+  Derive live values yourself: `accumulated_ms + (now - active_since)` while
+  `active_since` is set, and `now - started_at` while `ended_at` is `null`. An
+  owner built before these members omits them; decode the absence as
+  "unpublished", never as `false` or zero.
 - Log content is available through `GET /logs`, `/events`, and `/ws` only. No
   response, schema, event, or command result discloses a log file path, a
   repository root, a workspace path used as a log locator, or a `file://` URL,

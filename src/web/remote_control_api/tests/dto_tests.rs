@@ -295,6 +295,8 @@ mod legacy_owner_shape {
             latest_activity: None,
             worktree: None,
             acceptance_provenance: None,
+            archive_complete: None,
+            net_active: None,
         };
         serde_json::to_value(row).expect("a projected row serializes")
     }
@@ -451,4 +453,54 @@ mod legacy_owner_shape {
             );
         }
     }
+}
+
+/// An owner that predates archive completion and the two clocks serves
+/// `/api/v2/state` without `archive_complete`, `net_active`, and `run_clock`.
+/// Each decodes as `None` — "unpublished" — never as `false` or zero, while a
+/// payload missing a pre-existing required member is still rejected.
+#[test]
+fn remote_progress_timing_old_owner_payload_decodes_as_unpublished() {
+    use crate::web::remote_control_api::dto::StateResponse;
+    use crate::web::remote_control_api::projection::project_snapshot;
+    use crate::web::state::{ChangeStatus, OrchestratorStateSnapshot};
+
+    let mut source = OrchestratorStateSnapshot::from_changes(&[]);
+    source.changes = vec![ChangeStatus {
+        id: "alpha".to_string(),
+        ..Default::default()
+    }];
+    let response = StateResponse {
+        instance_id: "instance-1".to_string(),
+        state_revision: 3,
+        event_sequence: 4,
+        snapshot: project_snapshot(&source),
+    };
+    let mut current = serde_json::to_value(&response).unwrap();
+    assert_eq!(current["snapshot"]["changes"][0]["archive_complete"], false);
+    assert!(current["snapshot"]["changes"][0]["net_active"].is_object());
+    assert!(current["snapshot"]["run_clock"].is_object());
+
+    let snapshot = current["snapshot"].as_object_mut().unwrap();
+    snapshot.remove("run_clock").expect("published");
+    let row = snapshot["changes"][0].as_object_mut().unwrap();
+    row.remove("archive_complete").expect("published");
+    row.remove("net_active").expect("published");
+    let legacy = current;
+
+    let decoded: StateResponse =
+        serde_json::from_value(legacy.clone()).expect("an older owner's state must decode");
+    assert_eq!(decoded.snapshot.run_clock, None);
+    assert_eq!(decoded.snapshot.changes[0].archive_complete, None);
+    assert_eq!(decoded.snapshot.changes[0].net_active, None);
+
+    let mut malformed = legacy;
+    malformed["snapshot"]["changes"][0]["actions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("force_stop_change")
+        .expect("published");
+    let error = serde_json::from_value::<StateResponse>(malformed)
+        .expect_err("a payload missing a pre-existing required member is malformed");
+    assert!(error.to_string().contains("force_stop_change"), "{error}");
 }

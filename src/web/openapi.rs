@@ -189,6 +189,8 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::ChangeActivity,
             crate::web::remote_control_api::dto::ChangeBlocker,
             crate::web::remote_control_api::dto::ChangeTiming,
+            crate::web::remote_control_api::dto::NetActiveTiming,
+            crate::web::remote_control_api::dto::RunClock,
             crate::web::remote_control_api::dto::ChangeWorktree,
             crate::web::remote_control_api::dto::ErrorCode,
             // Execution observability: the closed vocabularies and the resource

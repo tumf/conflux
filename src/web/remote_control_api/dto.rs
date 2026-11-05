@@ -1122,6 +1122,9 @@ impl Default for ParallelEligibility {
 /// Only boundary instants are published. A live elapsed counter in the snapshot
 /// would make every projection look changed and advance the revision forever, so
 /// a client derives "running for" from `started_at` itself.
+///
+/// Per-run boundaries of the current or most recent run; `elapsed_ms` is that
+/// run's duration and is not cumulative — see `net_active`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeTiming {
     /// When the current or most recent run started (RFC 3339).
@@ -1129,6 +1132,56 @@ pub struct ChangeTiming {
     /// When it finished (RFC 3339); `null` while it is still running.
     pub completed_at: Option<String>,
     /// Duration of the finished run in milliseconds.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Cumulative net-active execution time of one change in this owner process.
+///
+/// Driven by the same shared clock the TUI row's net execution time uses: an
+/// interval opens on a transition into an active display status (`preparing`,
+/// `applying`, `accepting`, `rejecting`, `archiving`, `resolving`), stays open
+/// across repeated or successive active statuses, and closes exactly once on a
+/// transition to any other status or on process `Stopped`. Closed intervals
+/// accumulate and are never reset while the owner runs; a restarted owner
+/// starts from zero. Unlike `timing`, which is per run, this is cumulative.
+///
+/// No live counter is published: a client derives the current total as
+/// `accumulated_ms + (now - active_since)` while `active_since` is set, so the
+/// snapshot never changes merely because time passed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NetActiveTiming {
+    /// Sum of closed active intervals, in milliseconds.
+    pub accumulated_ms: u64,
+    /// When the open active interval started (RFC 3339); `null` while closed.
+    #[schema(required)]
+    pub active_since: Option<String>,
+    /// Whether this change was ever active in this owner process.
+    pub has_history: bool,
+}
+
+/// Run-level elapsed clock, the projection of the TUI `Elapsed` line.
+///
+/// Opened by an accepted Start while the owner is not running; left open by a
+/// persistent-idle park, persistent-idle re-admission, `ResolveReserved`, and a
+/// fatal process error; frozen by every `Stopped` and every `AllCompleted`
+/// delivery and by a resolve-side settlement that leaves nothing processing; a
+/// repeated terminal delivery re-freezes at the later instant. The value is
+/// retained until the next opening Start. All three members are `null` before
+/// the first Start in this process. Process-local presentation only.
+///
+/// While `ended_at` is `null` a client derives the live value as
+/// `now - started_at`; no server-side counter is ever published.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunClock {
+    /// When the current or most recent run was opened (RFC 3339).
+    #[schema(required)]
+    pub started_at: Option<String>,
+    /// When the run clock was last frozen (RFC 3339); `null` while open.
+    #[schema(required)]
+    pub ended_at: Option<String>,
+    /// Monotonic duration from the open to the latest freeze, in whole
+    /// milliseconds; `null` while open.
+    #[schema(required)]
     pub elapsed_ms: Option<u64>,
 }
 
@@ -1225,6 +1278,29 @@ pub struct ChangeResource {
     #[serde(default)]
     pub acceptance_provenance:
         Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
+    /// Whether the reducer recorded archive completion for this change in this
+    /// owner process.
+    ///
+    /// Read in the same reducer hold as `display_status` and distinct from it:
+    /// stays `true` while the row advances to `resolving`, `resolve pending`,
+    /// `merge wait`, `merged`, or `pushed`, and is `false` for a fresh-process
+    /// resolve retry with no archive on record. Not merge or push success.
+    /// Process-local; never a workflow input.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as `false`. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub archive_complete: Option<bool>,
+    /// Cumulative net-active execution time; see `NetActiveTiming`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as zero. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub net_active: Option<NetActiveTiming>,
 }
 
 /// Aggregate counts over the projected changes.
@@ -1276,6 +1352,13 @@ pub struct InstanceSnapshot {
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
     pub totals: SnapshotTotals,
+    /// Run-level elapsed clock; see `RunClock`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"). This server always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub run_clock: Option<RunClock>,
 }
 
 impl InstanceSnapshot {
@@ -1294,6 +1377,7 @@ impl InstanceSnapshot {
                 in_progress: 0,
                 pending: 0,
             },
+            run_clock: Some(RunClock::default()),
         }
     }
 }
