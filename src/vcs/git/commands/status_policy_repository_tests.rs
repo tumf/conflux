@@ -722,6 +722,39 @@ fn production_status_argv_construction_uses_the_shared_policy() {
     );
 }
 
+/// The confirmed-delete content oracle is one more inventoried read-only
+/// status call site, built through the shared policy and nowhere else.
+#[test]
+fn remote_confirmed_delete_status_argv_is_inventoried() {
+    use crate::vcs::git::commands::status_policy::CONSENT_STATUS_ARGS;
+
+    let consent = production_sources()
+        .into_iter()
+        .find(|(path, _)| path.ends_with("worktree_ops/consent.rs"))
+        .expect("the consent oracle is part of the production corpus");
+    assert!(
+        consent
+            .1
+            .contains("read_only_status_argv(CONSENT_STATUS_ARGS)"),
+        "the consent oracle must build its status argv through the shared policy"
+    );
+    assert!(
+        argv_literals_containing(&consent.1, STATUS_SUBCOMMAND).is_empty(),
+        "the consent oracle must not hand-build a status argv"
+    );
+    assert_eq!(
+        read_only_status_argv(CONSENT_STATUS_ARGS),
+        vec![
+            NO_OPTIONAL_LOCKS,
+            STATUS_SUBCOMMAND,
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=normal",
+            "--ignored=traditional",
+        ]
+    );
+}
+
 /// Index-mutating commands keep Git's normal lock semantics.
 #[test]
 fn mutating_command_builders_never_suppress_optional_locks() {

@@ -635,6 +635,7 @@ impl SharedServiceExecutor {
             },
             CommandSpec::CreateWorktree { .. }
             | CommandSpec::DeleteWorktree { .. }
+            | CommandSpec::DeleteWorktreeConfirmed { .. }
             | CommandSpec::MergeWorktree { .. }
             | CommandSpec::MergeWorktreeAbortOnConflict { .. }
             | CommandSpec::WriteChangeText { .. }
@@ -701,6 +702,11 @@ impl SharedServiceExecutor {
             }
             CommandSpec::DeleteWorktree { target, .. } => {
                 self.worktrees.delete(&target.worktree_id).await
+            }
+            CommandSpec::DeleteWorktreeConfirmed { target, params } => {
+                self.worktrees
+                    .delete_confirmed(&target.worktree_id, params)
+                    .await
             }
             CommandSpec::MergeWorktree { target, .. } => {
                 self.worktrees.merge(&target.worktree_id).await

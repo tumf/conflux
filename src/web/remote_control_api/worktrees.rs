@@ -22,27 +22,40 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::worktree_ops::consent::{
+    ConfirmedDeleteReason, ContentObservationKind, DeleteConsent, CONFIRMED_DELETE_PERMISSIONS,
+    CONSENT_FIELDS, CONTENT_ID_ALGORITHM,
+};
 use crate::worktree_ops::service::{
     classify_delete_eligibility, classify_merge_eligibility, ConflictPolicy, DeleteOptions,
-    ExpectedTarget, WorktreeFacts, WorktreeOpError, WorktreeService, RECOVERY_LOCAL_OR_TUI,
+    ExpectedTarget, OptionEligibility, WorktreeFacts, WorktreeOpError, WorktreeService,
+    RECOVERY_LOCAL_OR_TUI,
 };
 
 use super::dto::{
-    new_hex_id, CommandResult, ErrorCode, MergeAbortEvidence, MergeAbortOutcome, MergeAbortResult,
+    new_hex_id, CommandResult, ConfirmedDeleteParams, ConfirmedDeleteRefusalResult,
+    ConfirmedDeleteResult, ErrorCode, MergeAbortEvidence, MergeAbortOutcome, MergeAbortResult,
 };
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 8] = [
+pub const WORKTREE_OPERATIONS: [&str; 9] = [
     "list",
     "detail",
     "create",
     "delete",
     "merge",
     "merge_abort",
+    "delete_confirmed",
     "text",
     "session",
 ];
+
+/// Command the `delete_confirmed` operation is submitted as.
+pub const CONFIRMED_DELETE_COMMAND: &str = "delete_worktree_confirmed";
+
+/// Route template of the read-only delete preview.
+pub const DELETE_PREVIEW_ROUTE: &str = "/api/v2/worktrees/{worktree_id}/delete-preview";
 
 /// Command the `merge_abort` operation is submitted as.
 pub const MERGE_ABORT_COMMAND: &str = "merge_worktree_abort_on_conflict";
@@ -430,6 +443,52 @@ impl MergeAbortCapability {
     }
 }
 
+/// Whether consent-bound destructive deletion is served, and how to use it.
+///
+/// `Default` is the *unavailable* answer, which is what `#[serde(default)]`
+/// decodes an older owner's omission as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteCapability {
+    /// True when `delete_worktree_confirmed` and its preview are served.
+    pub available: bool,
+    /// Command type the operation is submitted as.
+    pub command: String,
+    /// Route template of the read-only preview whose `consent` is echoed.
+    pub preview_route: String,
+    /// The three independent permissions the command accepts.
+    pub permissions: Vec<String>,
+    /// Exactly the fields of the `consent` object.
+    pub consent_fields: Vec<String>,
+    /// Hash algorithm both content identities use.
+    pub content_id_algorithm: String,
+    /// True when ignored content is disclosed and bound by its bytes.
+    pub binds_ignored_content: bool,
+    /// Every stable refusal and blocked-option reason.
+    pub reasons: Vec<String>,
+}
+
+impl ConfirmedDeleteCapability {
+    /// The capability this build serves.
+    pub fn served() -> Self {
+        Self {
+            available: true,
+            command: CONFIRMED_DELETE_COMMAND.to_string(),
+            preview_route: DELETE_PREVIEW_ROUTE.to_string(),
+            permissions: CONFIRMED_DELETE_PERMISSIONS
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+            consent_fields: CONSENT_FIELDS.iter().map(|f| f.to_string()).collect(),
+            content_id_algorithm: CONTENT_ID_ALGORITHM.to_string(),
+            binds_ignored_content: true,
+            reasons: ConfirmedDeleteReason::ALL
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Worktree section of `GET /api/v2/capabilities`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorktreeCapabilities {
@@ -439,7 +498,7 @@ pub struct WorktreeCapabilities {
     pub merge_conflict_recovery: String,
     /// True when a conflicting `merge_worktree` leaves the intermediate Git state in place; the separately advertised `merge_abort` command aborts instead.
     pub merge_conflict_preserves_state: bool,
-    /// True when deletion always runs managed teardown with no bypass.
+    /// True when the `delete_worktree` command always runs managed teardown with no bypass. The only bypass is the separately advertised `confirmed_delete` command, which requires explicit consent.
     pub delete_requires_teardown: bool,
     /// The explicit abort-on-conflict merge.
     ///
@@ -447,6 +506,12 @@ pub struct WorktreeCapabilities {
     /// absent field means "unavailable".
     #[serde(default)]
     pub merge_abort: MergeAbortCapability,
+    /// Consent-bound destructive deletion.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field means "unavailable".
+    #[serde(default)]
+    pub confirmed_delete: ConfirmedDeleteCapability,
 }
 
 impl Default for WorktreeCapabilities {
@@ -457,8 +522,104 @@ impl Default for WorktreeCapabilities {
             merge_conflict_preserves_state: true,
             delete_requires_teardown: true,
             merge_abort: MergeAbortCapability::served(),
+            confirmed_delete: ConfirmedDeleteCapability::served(),
         }
     }
+}
+
+/// One option's eligibility on a delete preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeleteOptionEligibility {
+    /// True when the command with this option would pass its guards now.
+    pub eligible: bool,
+    /// Why it would not; `null` when eligible.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub blocked_reason: Option<ConfirmedDeleteReason>,
+    /// Paths in the discardable identity (`discard_known_dirty` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<usize>,
+    /// Commits between the merge base and HEAD (`discard_commits_ahead` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<usize>,
+    /// True when the ahead option also discards known dirty or ignored
+    /// content (`discard_commits_ahead` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub also_discards_dirty: Option<bool>,
+}
+
+impl DeleteOptionEligibility {
+    fn from_result(result: &OptionEligibility) -> Self {
+        Self {
+            eligible: result.is_ok(),
+            blocked_reason: result.err(),
+            entries: None,
+            commits: None,
+            also_discards_dirty: None,
+        }
+    }
+}
+
+/// Per-option eligibility of a delete preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeletePreviewOptions {
+    /// All three permissions `false`: an ordinary delete with consent revalidation.
+    pub ordinary: DeleteOptionEligibility,
+    /// `skip_teardown` alone.
+    pub skip_teardown: DeleteOptionEligibility,
+    /// `discard_known_dirty` alone.
+    pub discard_known_dirty: DeleteOptionEligibility,
+    /// `discard_commits_ahead`, with `discard_known_dirty` when anything is dirty.
+    pub discard_commits_ahead: DeleteOptionEligibility,
+}
+
+/// `GET /api/v2/worktrees/{worktree_id}/delete-preview` body.
+///
+/// A read: it creates no command record and advances no revision. `consent`
+/// is exactly what `delete_worktree_confirmed` must be sent, unmodified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeletePreviewResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the preview was read at.
+    pub state_revision: u64,
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// When the observation was taken (RFC 3339). Informational; not consent.
+    pub observed_at: String,
+    /// Branch, empty when detached.
+    pub branch: String,
+    /// Current HEAD commit.
+    pub head: String,
+    /// True for the main worktree, which is never deletable.
+    pub is_main: bool,
+    /// Uncommitted-change state (`--ignored=no`); `null` when unobservable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub dirty: Option<bool>,
+    /// Commits-ahead state; `null` when unobservable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub has_commits_ahead: Option<bool>,
+    /// How the ahead fact was obtained. Always a fresh targeted inspection.
+    pub inspection: crate::worktree_ops::InspectionState,
+    /// How the content observation came out.
+    pub content_observation: ContentObservationKind,
+    /// True when forced removal would also delete ignored content; `null`
+    /// unless content was observed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub has_ignored_content: Option<bool>,
+    /// Paths in the ignored identity; `null` unless content was observed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub ignored_entries: Option<usize>,
+    /// True exactly when teardown would execute `.wt/teardown`.
+    pub teardown_script_present: bool,
+    /// What each permission combination would decide right now.
+    pub options: DeletePreviewOptions,
+    /// The object to echo as `params.consent`.
+    pub consent: DeleteConsent,
 }
 
 // ============================================================================
@@ -481,6 +642,19 @@ pub trait WorktreeOperations: Send + Sync {
     async fn merge_abort_on_conflict(
         &self,
         worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure>;
+    /// Observe what a confirmed delete would act on. A read.
+    ///
+    /// `instance_id` and `state_revision` are the read route's to fill in.
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure>;
+    /// Delete a worktree on explicit, re-verified consent.
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &ConfirmedDeleteParams,
     ) -> Result<ExecutionSummary, CommandFailure>;
 
     /// The directory a live opaque ID is bound to, for the text surface.
@@ -538,6 +712,19 @@ impl WorktreeOperations for UnboundWorktreeOperations {
     async fn merge_abort_on_conflict(
         &self,
         _worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        Err(unbound())
+    }
+    async fn delete_preview(
+        &self,
+        _worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure> {
+        Err(unbound())
+    }
+    async fn delete_confirmed(
+        &self,
+        _worktree_id: &str,
+        _params: &ConfirmedDeleteParams,
     ) -> Result<ExecutionSummary, CommandFailure> {
         Err(unbound())
     }
@@ -834,6 +1021,124 @@ impl WorktreeOperations for RemoteWorktreeOperations {
                         }
                         None => failure,
                     },
+                )
+            }
+        }
+    }
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let preview = self
+            .service
+            .delete_preview(&key.path, &key.identity)
+            .await
+            .map_err(|error| map_worktree_error(&error))?;
+
+        let mut discard_known_dirty =
+            DeleteOptionEligibility::from_result(&preview.discard_known_dirty);
+        discard_known_dirty.entries = preview.content.observed().map(|c| c.entries);
+        let mut discard_commits_ahead =
+            DeleteOptionEligibility::from_result(&preview.discard_commits_ahead);
+        discard_commits_ahead.commits = preview.commits_ahead;
+        discard_commits_ahead.also_discards_dirty = Some(preview.also_discards_dirty);
+
+        Ok(DeletePreviewResponse {
+            instance_id: String::new(),
+            state_revision: 0,
+            worktree_id: worktree_id.to_string(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            branch: preview.facts.branch.clone(),
+            head: preview.facts.head.clone(),
+            is_main: preview.facts.is_main,
+            dirty: preview.observation.dirty,
+            has_commits_ahead: preview.observation.has_commits_ahead,
+            inspection: preview.facts.inspection,
+            content_observation: preview.observation.content_observation,
+            has_ignored_content: preview.observation.has_ignored_content,
+            ignored_entries: preview.content.observed().map(|c| c.ignored_entries),
+            teardown_script_present: preview.teardown_script_present,
+            options: DeletePreviewOptions {
+                ordinary: DeleteOptionEligibility::from_result(&preview.ordinary),
+                skip_teardown: DeleteOptionEligibility::from_result(&preview.skip_teardown),
+                discard_known_dirty,
+                discard_commits_ahead,
+            },
+            consent: preview.observation.consent(),
+        })
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let consent = &params.consent;
+        // The opaque ID pins the Git identity; the consent pins branch and
+        // HEAD. All three are revalidated under the service's root guard.
+        let expected = ExpectedTarget::on_branch(consent.branch.clone())
+            .with_identity(key.identity.clone())
+            .with_head(consent.head.clone());
+        let result = self
+            .service
+            .delete_worktree_with_consent(&key.path, &expected, consent, params.options())
+            .await;
+
+        match result {
+            Ok(deleted) => {
+                self.registry.retire(worktree_id);
+                let _ = self.observe().await;
+                let detail = format!(
+                    "{}; worktree_id {worktree_id} retired",
+                    deleted.outcome.detail
+                );
+                Ok(ExecutionSummary::changed(detail).with_result(
+                    CommandResult::DeleteWorktreeConfirmed(Box::new(ConfirmedDeleteResult {
+                        worktree_id: worktree_id.to_string(),
+                        branch: deleted.outcome.branch.clone(),
+                        head: deleted.head.clone(),
+                        outcome: Some("deleted".to_string()),
+                        teardown: deleted.teardown,
+                        dirty_discarded: deleted.dirty_discarded,
+                        commits_discarded: deleted.commits_discarded,
+                        branch_deleted: deleted.branch_deleted,
+                        branch_retained_reason: deleted.branch_retained_reason.clone(),
+                        refusal: None,
+                    })),
+                ))
+            }
+            Err(refusal) => {
+                let failure = if refusal.stale {
+                    CommandFailure::new(ErrorCode::DeleteConsentStale, refusal.error.to_string())
+                } else {
+                    map_worktree_error(&refusal.error)
+                };
+                let (branch, head) = refusal
+                    .observed
+                    .as_ref()
+                    .map(|o| (o.branch.clone(), o.head.clone()))
+                    .unwrap_or_else(|| (consent.branch.clone(), consent.head.clone()));
+                Err(
+                    failure.with_result(CommandResult::DeleteWorktreeConfirmed(Box::new(
+                        ConfirmedDeleteResult {
+                            worktree_id: worktree_id.to_string(),
+                            branch,
+                            head,
+                            outcome: None,
+                            teardown: refusal.teardown,
+                            dirty_discarded: false,
+                            commits_discarded: false,
+                            branch_deleted: false,
+                            branch_retained_reason: None,
+                            refusal: Some(ConfirmedDeleteRefusalResult {
+                                reason: refusal.reason,
+                                teardown_ran: refusal.teardown_ran(),
+                                observed: refusal.observed.as_deref().cloned(),
+                            }),
+                        },
+                    ))),
                 )
             }
         }

@@ -511,6 +511,31 @@ impl WorktreeOperations for RemoteControlRuntime {
         }
     }
 
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<worktrees::DeletePreviewResponse, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_preview(worktree_id).await,
+            None => UnboundWorktreeOperations.delete_preview(worktree_id).await,
+        }
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &dto::ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_confirmed(worktree_id, params).await,
+            None => {
+                UnboundWorktreeOperations
+                    .delete_confirmed(worktree_id, params)
+                    .await
+            }
+        }
+    }
+
     async fn text_root(&self, worktree_id: &str) -> Result<std::path::PathBuf, CommandFailure> {
         match self.worktrees.read().await.clone() {
             Some(port) => port.text_root(worktree_id).await,
@@ -707,6 +732,10 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/logs", get(reads::logs))
         .route("/api/v2/worktrees", get(reads::list_worktrees))
         .route("/api/v2/worktrees/{worktree_id}", get(reads::get_worktree))
+        .route(
+            worktrees::DELETE_PREVIEW_ROUTE,
+            get(reads::get_worktree_delete_preview),
+        )
         .route(
             text_edit::WORKTREE_TEXT_ROUTE,
             get(text_edit::read_worktree_text),

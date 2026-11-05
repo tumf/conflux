@@ -8,6 +8,7 @@ mod accepted_command_tests;
 mod auth_tests;
 mod command_tests;
 mod compatibility_tests;
+mod confirmed_delete_tests;
 mod dto_tests;
 mod event_ownership_tests;
 mod execution_mark_event_tests;
@@ -123,6 +124,9 @@ impl RemoteControlExecutor for RecordingExecutor {
                 }
                 CommandSpec::MergeWorktreeAbortOnConflict { target, .. } => {
                     return port.merge_abort_on_conflict(&target.worktree_id).await
+                }
+                CommandSpec::DeleteWorktreeConfirmed { target, params } => {
+                    return port.delete_confirmed(&target.worktree_id, params).await
                 }
                 _ => {}
             }

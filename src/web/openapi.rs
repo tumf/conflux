@@ -42,6 +42,7 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/logs",
     "/api/v2/worktrees",
     "/api/v2/worktrees/{worktree_id}",
+    "/api/v2/worktrees/{worktree_id}/delete-preview",
     "/api/v2/worktrees/{worktree_id}/text",
     "/api/v2/worktree-sessions",
     "/api/v2/worktree-sessions/{session_id}",
@@ -161,6 +162,21 @@ External editors are not excluded, and a save never commits, stages, or pushes.
 server-derived and are rejected as mutation input, so no client can steer where a
 worktree lands or what it is cut from.
 
+**Confirmed deletion.** `delete_worktree` is fail-closed and never changes:
+teardown always runs, and dirty, ahead, or unknown worktrees refuse. The three
+TUI escalations — skip teardown, discard known uncommitted (and ignored)
+content, discard commits ahead including the branch — are reachable only
+through `delete_worktree_confirmed`, each as its own boolean. Read
+`GET /api/v2/worktrees/{worktree_id}/delete-preview` first and echo its
+`consent` object verbatim. Consent binds branch, HEAD, Git identity, the dirty,
+ahead, and ignored-content facts, the merge base, and two `sha256:` content
+identities over the bytes `git worktree remove --force` would delete beyond
+`HEAD`, ignored content included. Under the root guard, before teardown and
+again before removal, every fact is re-derived; any difference is
+`delete_consent_stale` with nothing removed. An unobservable or over-budget
+content observation is `worktree_dirty_unknown`, and a nested repository is
+`target_ineligible`, whatever permissions were given.
+
 **Worktree sessions.** `run_worktree_command` (an existing worktree by opaque
 `worktree_id`) and `create_session_worktree` (a fresh `ws-session-*` worktree
 from base `HEAD`, set up and cleaned up exactly as the TUI `+` key does) launch
@@ -207,6 +223,7 @@ expanded command, environment values, or absolute paths. Session state events
         crate::web::remote_control_api::reads::logs,
         crate::web::remote_control_api::reads::list_worktrees,
         crate::web::remote_control_api::reads::get_worktree,
+        crate::web::remote_control_api::reads::get_worktree_delete_preview,
         crate::web::remote_control_api::text_edit::read_worktree_text,
         crate::web::remote_control_api::worktree_sessions::list_sessions,
         crate::web::remote_control_api::worktree_sessions::get_session,
@@ -324,6 +341,20 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::MergeAbortRestoration,
             crate::web::remote_control_api::dto::MergeAbortResult,
             crate::web::remote_control_api::worktrees::MergeAbortCapability,
+            // Consent-bound destructive deletion: a read-only preview whose
+            // `consent` is echoed to one separate, re-verified command.
+            crate::web::remote_control_api::dto::ConfirmedDeleteParams,
+            crate::web::remote_control_api::dto::ConfirmedDeleteRefusalResult,
+            crate::web::remote_control_api::dto::ConfirmedDeleteResult,
+            crate::web::remote_control_api::worktrees::ConfirmedDeleteCapability,
+            crate::web::remote_control_api::worktrees::DeleteOptionEligibility,
+            crate::web::remote_control_api::worktrees::DeletePreviewOptions,
+            crate::web::remote_control_api::worktrees::DeletePreviewResponse,
+            crate::worktree_ops::consent::ConfirmedDeleteReason,
+            crate::worktree_ops::consent::ConsentObservation,
+            crate::worktree_ops::consent::ContentObservationKind,
+            crate::worktree_ops::consent::DeleteConsent,
+            crate::worktree_ops::consent::TeardownDisposition,
             crate::web::remote_control_api::worktrees::WorktreeCapabilities,
             crate::web::remote_control_api::worktrees::WorktreeConflict,
             crate::web::remote_control_api::worktrees::WorktreeEligibility,

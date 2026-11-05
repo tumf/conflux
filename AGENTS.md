@@ -617,6 +617,41 @@ abort or compensates — not the owner and not a relaying server. An older
 owner omits `capabilities.worktrees.merge_abort` (decoded as unavailable) and
 refuses the command with `validation_failed`.
 
+### Deleting a worktree over `/api/v2`
+
+`delete_worktree` is fail-closed and unchanged: teardown always runs; dirty,
+ahead, main, and unknown refuse; any extra param is `validation_failed`; and
+`delete_requires_teardown: true` describes exactly it. Skip-teardown,
+known-dirty discard, and ahead discard (branch included) are reachable remotely
+only through `delete_worktree_confirmed`, three independent booleans plus the
+`consent` object of `GET /api/v2/worktrees/{worktree_id}/delete-preview`, echoed
+verbatim. The preview is a read; not submitting is cancelling.
+
+Consent binds branch, HEAD, Git identity, `dirty`, `has_commits_ahead`,
+`has_ignored_content`, `merge_base`, and two `sha256:` content identities over
+the bytes forced removal would delete beyond `HEAD` — tracked, untracked, *and
+ignored*, walked through collapsed directories, metadata bound in addition to
+bytes, never instead. Ignored content needs `discard_known_dirty` even when Git
+calls the worktree clean. Every fact is re-derived under the root guard before
+teardown and again before removal; any difference is `delete_consent_stale`
+with nothing removed, and `refusal.observed` carries the fresh facts. Unknown
+dirty/content and a content observation past the combined budget (500,000
+records or 256 MiB) are `worktree_dirty_unknown`; a nested repository is
+`target_ineligible`; neither yields to any permission, and no weaker identity is
+ever substituted. A worktree too large to bind — usually build output — is
+reduced locally or deleted through the TUI, never remotely. After teardown the
+ignored identity may be the consented one or empty and nothing else; a refusal
+after teardown says `teardown_ran: true`, and teardown is never reversed. A
+failing teardown is recovered with fresh consent and `skip_teardown: true`.
+
+Read the typed `result` (`kind: delete_worktree_confirmed`): `teardown`,
+`dirty_discarded`, `commits_discarded`, `branch_deleted`,
+`branch_retained_reason`, and on refusal `refusal.reason`. An older owner omits
+`capabilities.worktrees.confirmed_delete` (decoded as unavailable) and refuses
+the command with `validation_failed`. Nothing is locked between preview and
+command: an external write after the final comparison is not detected, the same
+window the TUI has. `cflx client` and `cflx client mcp` gain no verb for this.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on

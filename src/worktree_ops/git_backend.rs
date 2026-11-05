@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 use crate::config::OrchestratorConfig;
 use crate::vcs::git::commands;
 
+use super::consent::{ConsentLimits, ContentObservation};
 use super::service::{
     ConflictPolicy, DirtyState, MergeAttempt, SafetyFact, WorktreeBackend, WorktreeFacts,
     WorktreeOpError, WorktreeOpResult,
@@ -256,6 +257,48 @@ impl WorktreeBackend for GitWorktreeBackend {
             .run_hook(crate::hooks::HookType::OnMerged, &context)
             .await
             .map_err(|e| WorktreeOpError::Internal(e.to_string()))
+    }
+
+    async fn observe_content(&self, path: &Path, limits: ConsentLimits) -> ContentObservation {
+        let path = path.to_path_buf();
+        // Filesystem and subprocess work only; it must not occupy a runtime
+        // worker while it reads a large tree.
+        tokio::task::spawn_blocking(move || {
+            super::consent::observe_discardable_content(&path, &limits)
+        })
+        .await
+        .unwrap_or(ContentObservation::Unobservable)
+    }
+
+    async fn merge_base(&self, head: &str) -> WorktreeOpResult<Option<String>> {
+        // The base is the main worktree's branch, exactly as the ahead
+        // inspection resolves it, so the merge base a consent binds is the one
+        // the commits-ahead fact was measured against.
+        let base_branch = commands::get_current_branch(&self.repo_root)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to read base branch: {e}")))?
+            .ok_or_else(|| {
+                WorktreeOpError::Internal("the base worktree has a detached HEAD".to_string())
+            })?;
+        let Some(base_head) = commands::rev_parse_commit(&self.repo_root, &base_branch)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to resolve base: {e}")))?
+        else {
+            return Ok(None);
+        };
+        commands::merge_base(&self.repo_root, &base_head, head)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to read merge base: {e}")))
+    }
+
+    async fn commits_between(&self, merge_base: &str, head: &str) -> WorktreeOpResult<usize> {
+        commands::count_commits_ahead(&self.repo_root, merge_base, head)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to count commits: {e}")))
+    }
+
+    async fn teardown_script_present(&self, path: &Path) -> bool {
+        commands::teardown_script_would_run(path)
     }
 
     async fn change_is_eligible(&self, change_id: &str) -> WorktreeOpResult<()> {
