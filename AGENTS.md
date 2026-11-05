@@ -497,6 +497,54 @@ a cancellation is still in flight. Read the settled command record's typed
 which is always `false`. Creating a manual commit, archive, or merge on that
 guess is exactly the failure this contract exists to prevent.
 
+### Configured-command worktree sessions
+
+`run_worktree_command` (existing worktree by opaque `worktree_id`) and
+`create_session_worktree` (a fresh `ws-session-*` worktree provisioned exactly as
+the TUI `+` key does) launch the owner's **configured** `worktree_command`; no
+request carries a command, argv, environment, path, or branch. Sessions are read
+from `GET /api/v2/worktree-sessions[/{session_id}]` and stopped with
+`stop_worktree_session`. `cflx client` and `cflx client mcp` have no verb for
+any of it.
+
+- Same runner path as the TUI: `sh -c`, stdin `/dev/null`, own process group,
+  stagger, and the configured retry policy *inside* one session (`attempt`).
+  An exact idempotent replay launches nothing; a running worktree is
+  `worktree_session_busy` (`reason=worktree_busy`); a fifth concurrent session is
+  `worktree_session_busy` (`reason=capacity`) before any Git effect.
+- Setup failure removes the worktree (forced, no teardown), **keeps** the
+  `ws-session-*` branch, launches nothing, and fails
+  `worktree_session_setup_failed` with `result.cleanup` `removed` or `retained`.
+  An invalid cwd is `target_ineligible` with `reason=cwd_invalid`. With no
+  template, outside Git, or during owner shutdown, launches are
+  `worktree_session_unavailable`.
+- Stop goes through `StreamingChildHandle::terminate` (SIGTERM, SIGKILL after
+  5 s, verified cleanup, no further attempt) and settles after the reap. Never
+  `killpg` a session yourself: the retry policy reads that as a crash and
+  relaunches. Descendants that left the process group (`setsid`, daemonization)
+  are outside the guarantee. Owner shutdown closes the registry's own
+  `RunCommandScope` with a 10 s deadline; scheduler `stop`, `stop_and_dequeue`,
+  and `force_stop` do not touch sessions.
+- Deleting a worktree with a running session is refused for the TUI and the API
+  alike (`target_ineligible`, "a worktree session is running").
+- In memory only: running sessions are never evicted, at most 32 finished are
+  kept, nothing is written to disk or survives restart, and no scheduling,
+  resume, acceptance, or archive decision reads them.
+- `output.lines` is the command's **own** stdout/stderr — the newest 64 KiB,
+  ANSI/control-stripped, 8 KiB per line, **not redacted** — and is visible to
+  every bearer-authenticated reader. A command that prints its arguments,
+  environment, or cwd discloses them; that is the operator's choice when
+  configuring `worktree_command`. The tail is never an event, log entry, or
+  snapshot field, and owner-generated members never carry the template, the
+  expanded command, environment values, or absolute paths. The runner's own
+  stderr notices (`[Retry N/M]`, from which `attempt` is counted, and cleanup
+  diagnostics) are interleaved in the tail.
+- The launch result names the session kind as `result.session_kind`, not
+  `kind`: `kind` is the `CommandResult` discriminant. The session resource
+  itself uses `kind`.
+- An older owner omits `capabilities.worktree_sessions` (decode as unavailable)
+  and refuses the three commands as `validation_failed` before any effect.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on

@@ -815,8 +815,20 @@ async fn run_tui_loop(
     // One worktree service for this repository, for the same reason: it owns the
     // repository mutation guard, and two instances would be two guards that
     // cannot see each other's in-flight deletion.
-    let worktree_service =
-        crate::tui::command_handlers::build_worktree_service(&repo_root, &config, &tx);
+    //
+    // Configured-command worktree sessions live for the whole TUI process: the
+    // registry owns its own run-command scope, runs the TUI's own runner clone
+    // (same stagger, retry policy, and process-group handling), and is probed
+    // by the shared service so a running session's worktree cannot be deleted
+    // from either frontend.
+    let worktree_sessions =
+        crate::worktree_ops::session::WorktreeSessionRegistry::new(ai_runner.clone());
+    let worktree_service = crate::tui::command_handlers::build_worktree_service_with_sessions(
+        &repo_root,
+        &config,
+        &tx,
+        worktree_sessions.clone(),
+    );
 
     // Bind `/api/v2` command delegation to the shared application services.
     //
@@ -831,25 +843,47 @@ async fn run_tui_loop(
         // worktrees exist and which opaque IDs address them. It is wired to the
         // *same* service the TUI commands through, so a remote delete and a
         // keypress contend for one guard rather than racing through two.
+        let remote_worktrees = Arc::new(
+            crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
+                worktree_service.clone(),
+                Arc::new(crate::web::remote_control_api::worktrees::WorktreeRegistry::new()),
+                repo_root.clone(),
+            ),
+        );
         let worktree_port: Arc<dyn crate::web::remote_control_api::worktrees::WorktreeOperations> =
-            Arc::new(
-                crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
-                    worktree_service.clone(),
-                    Arc::new(crate::web::remote_control_api::worktrees::WorktreeRegistry::new()),
-                    repo_root.clone(),
-                ),
-            );
+            remote_worktrees.clone();
 
         let runtime = ws.remote_control();
+        // Session state events are presentation events on the same projection:
+        // they take a sequence and never move the revision.
+        worktree_sessions.set_event_sink(Arc::new(
+            crate::web::remote_control_api::worktree_sessions::ProjectionSessionEvents::new(
+                runtime.projection(),
+            ),
+        ));
+        let session_port: Arc<
+            dyn crate::web::remote_control_api::worktree_sessions::WorktreeSessionOperations,
+        > = Arc::new(
+            crate::web::remote_control_api::worktree_sessions::RemoteSessionOperations::new(
+                worktree_sessions.clone(),
+                remote_worktrees,
+                worktree_service.clone(),
+                repo_root.clone(),
+                config.get_worktree_command().map(str::to_string),
+            )
+            .await,
+        );
         runtime
             .bind(Arc::new(
                 crate::web::remote_control_api::executor::SharedServiceExecutor::new(
                     application.clone(),
                     ws.clone(),
                 )
-                .with_worktrees(worktree_port.clone()),
+                .with_worktrees(worktree_port.clone())
+                .with_worktree_sessions(session_port.clone()),
             ))
             .await;
+        runtime.bind_worktree_sessions(session_port);
         runtime.bind_worktrees(worktree_port).await;
         // The same gate a keypress takes. Binding it is what turns `/api/v2`
         // admission from "atomic for the record" into "serialized through
@@ -1245,6 +1279,18 @@ async fn run_tui_loop(
     // Wait for tasks to finish gracefully. Remote mode has no local orchestrator handle here;
     // remote server-side work is stopped only by explicit Stop/ForceStop commands.
     refresh_handle.abort();
+    // Owner shutdown terminates and reaps every configured-command session
+    // through the runner's own cancellation path, under one bounded deadline,
+    // before the listeners close. Scheduler stop never reaches here.
+    let session_cleanup = worktree_sessions
+        .shutdown(crate::worktree_ops::session::SHUTDOWN_DEADLINE)
+        .await;
+    if !session_cleanup.is_quiescent() {
+        warn!(
+            "worktree sessions were not all confirmed terminated at shutdown: {}",
+            session_cleanup.diagnostics()
+        );
+    }
     // Remote mode has no local run, so the supervisor holds no handle and no
     // scope and this is a no-op: closing a remote TUI client still sends no stop.
     //

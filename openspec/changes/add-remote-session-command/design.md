@@ -203,7 +203,10 @@ gains `worktree_sessions_running: u32` (computed on read, `#[serde(default)]`).
 
 ### Result kinds, errors, events, capability
 
-- `CommandResult::WorktreeSession { session_id, kind, worktree_id, branch, path, setup, cleanup }`
+- `CommandResult::WorktreeSession { session_id, session_kind, worktree_id, branch, path, setup, cleanup }`
+  (implemented as `session_kind` because `kind` is the internally tagged
+  `CommandResult` discriminant and a second `kind` member would overwrite it on
+  the wire; the session *resource* keeps `kind`)
   on launch success; on `create_session_worktree` refusal after creation
   (setup failed, cwd invalid) the failed record carries the same kind with
   `session_id: null` and the cleanup outcome, as `refresh_proposal` refusals do.

@@ -41,6 +41,8 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/logs",
     "/api/v2/worktrees",
     "/api/v2/worktrees/{worktree_id}",
+    "/api/v2/worktree-sessions",
+    "/api/v2/worktree-sessions/{session_id}",
     "/api/v2/commands",
     "/api/v2/commands/{command_id}",
     "/api/v2/events",
@@ -142,7 +144,24 @@ environment dumps, credentials, or unrestricted error bodies.
 **Worktree safety.** Worktrees are addressed only by the opaque process-local
 `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
 server-derived and are rejected as mutation input, so no client can steer where a
-worktree lands or what it is cut from.";
+worktree lands or what it is cut from.
+
+**Worktree sessions.** `run_worktree_command` (an existing worktree by opaque
+`worktree_id`) and `create_session_worktree` (a fresh `ws-session-*` worktree
+from base `HEAD`, set up and cleaned up exactly as the TUI `+` key does) launch
+the owner's *configured* `worktree_command`. No request carries a command, argv,
+environment, path, or branch; the template's `{workspace_dir}` and `{repo_root}`
+are expanded server-side. stdin is `/dev/null`, the configured retry policy
+retries inside one session (`attempt`), an exact idempotent replay launches
+nothing, and a second request for a running worktree or a fifth concurrent
+session is `worktree_session_busy`. `stop_worktree_session` cancels through the
+runner's own path and settles after the reap. `GET /api/v2/worktree-sessions`
+publishes each session with a bounded output tail: that tail is the command's own
+stdout/stderr with control sequences stripped, **not redacted**, readable by every
+authenticated client. Owner-generated members never carry the template, the
+expanded command, environment values, or absolute paths. Session state events
+(`worktree_session_started`, `worktree_session_finished`) never advance
+`state_revision`; output is never an event or a log entry.";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -172,6 +191,8 @@ worktree lands or what it is cut from.";
         crate::web::remote_control_api::reads::logs,
         crate::web::remote_control_api::reads::list_worktrees,
         crate::web::remote_control_api::reads::get_worktree,
+        crate::web::remote_control_api::worktree_sessions::list_sessions,
+        crate::web::remote_control_api::worktree_sessions::get_session,
         crate::web::remote_control_api::commands::submit_command,
         crate::web::remote_control_api::commands::get_command,
         crate::web::remote_control_api::stream::events,
@@ -242,6 +263,18 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::CommandState,
             crate::web::remote_control_api::dto::ChangeTarget,
             crate::web::remote_control_api::dto::WorktreeTarget,
+            // Configured-command worktree sessions.
+            crate::web::remote_control_api::dto::SessionTarget,
+            crate::web::remote_control_api::dto::SessionCleanupFacts,
+            crate::web::remote_control_api::dto::SessionOutput,
+            crate::web::remote_control_api::dto::SessionOutputLine,
+            crate::web::remote_control_api::dto::SessionSetupFacts,
+            crate::web::remote_control_api::dto::WorktreeSessionCapability,
+            crate::web::remote_control_api::dto::WorktreeSessionEventType,
+            crate::web::remote_control_api::dto::WorktreeSessionResource,
+            crate::web::remote_control_api::dto::WorktreeSessionResponse,
+            crate::web::remote_control_api::dto::WorktreeSessionResult,
+            crate::web::remote_control_api::dto::WorktreeSessionsResponse,
             crate::web::remote_control_api::dto::EmptyParams,
             crate::events::LogLevel,
             crate::web::remote_control_api::dto::EventCategory,

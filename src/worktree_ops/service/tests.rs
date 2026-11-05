@@ -1883,3 +1883,269 @@ async fn dirty_discard_concurrent_mutation_reports_root_busy() {
         .await
         .is_ok());
 }
+
+// ── Configured-command sessions ──────────────────────────────────────────────
+
+/// A session probe answering from a fixed set of running cwd paths.
+struct FakeSessionProbe(Vec<PathBuf>);
+
+impl SessionProbe for FakeSessionProbe {
+    fn session_running(&self, path: &Path) -> bool {
+        self.0.iter().any(|running| running == path)
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_session_delete_refuses_with_a_running_session() {
+    let backend = FakeBackend::stable(vec![
+        managed("/workspaces/busy", "busy"),
+        managed("/workspaces/idle", "idle"),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let service = WorktreeService::new(backend.clone(), sink, PathBuf::from("/workspaces"))
+        .with_session_probe(Arc::new(FakeSessionProbe(vec![PathBuf::from(
+            "/workspaces/busy",
+        )])));
+
+    let refused = service
+        .delete_worktree(
+            Path::new("/workspaces/busy"),
+            &ExpectedTarget::on_branch("busy"),
+            DeleteOptions::local(false),
+        )
+        .await
+        .expect_err("a worktree with a running session is not deletable");
+    assert!(
+        matches!(&refused, WorktreeOpError::Ineligible(detail) if detail == SESSION_RUNNING_REFUSAL),
+        "typed ineligible refusal, got {refused:?}"
+    );
+    // Refused before teardown: the only backend call was the targeted observation.
+    assert_eq!(backend.calls(), vec![Call::Observe]);
+
+    // An unrelated worktree keeps the existing delete path unchanged.
+    service
+        .delete_worktree(
+            Path::new("/workspaces/idle"),
+            &ExpectedTarget::on_branch("idle"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("an unrelated worktree still deletes");
+    let calls = backend.calls();
+    assert!(calls.contains(&Call::Teardown) && calls.contains(&Call::RemoveWorktree));
+
+    // With no session running, the same target deletes exactly as before.
+    let backend = FakeBackend::stable(vec![managed("/workspaces/busy", "busy")]);
+    let (plain, _sink) = service_with_probe(backend.clone(), Vec::new());
+    plain
+        .delete_worktree(
+            Path::new("/workspaces/busy"),
+            &ExpectedTarget::on_branch("busy"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("probe false leaves deletion unchanged");
+    assert!(backend.calls().contains(&Call::RemoveWorktree));
+}
+
+fn service_with_probe(
+    backend: Arc<FakeBackend>,
+    running: Vec<PathBuf>,
+) -> (WorktreeService, Arc<RecordingSink>) {
+    let sink = Arc::new(RecordingSink::default());
+    (
+        WorktreeService::new(backend, sink.clone(), PathBuf::from("/workspaces"))
+            .with_session_probe(Arc::new(FakeSessionProbe(running))),
+        sink,
+    )
+}
+
+/// A provisioning seam that records every call by name.
+#[derive(Default)]
+struct RecordingProvisionRuntime {
+    calls: Mutex<Vec<&'static str>>,
+    setup_error: Option<String>,
+    cleanup_error: Option<String>,
+    fail_validation_at: Option<usize>,
+}
+
+impl RecordingProvisionRuntime {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: &'static str) -> usize {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(call);
+        calls.iter().filter(|c| **c == call).count()
+    }
+}
+
+#[async_trait]
+impl crate::worktree_ops::session::SessionProvisionRuntime for RecordingProvisionRuntime {
+    async fn check_git_repo(&self, _repo_root: &Path) -> Result<bool, String> {
+        self.record(crate::worktree_ops::session::step::CHECK_GIT_REPO);
+        Ok(true)
+    }
+
+    async fn generate_unique_branch_name(
+        &self,
+        _repo_root: &Path,
+        prefix: &str,
+        max_attempts: u32,
+    ) -> Result<String, String> {
+        self.record(crate::worktree_ops::session::step::GENERATE_BRANCH);
+        assert_eq!((prefix, max_attempts), ("ws-session", 10));
+        Ok("ws-session-abc".to_string())
+    }
+
+    async fn worktree_add(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &str,
+        branch_name: &str,
+        base_commit: &str,
+    ) -> Result<(), String> {
+        self.record(crate::worktree_ops::session::step::WORKTREE_ADD);
+        assert_eq!((branch_name, base_commit), ("ws-session-abc", "HEAD"));
+        Ok(())
+    }
+
+    async fn validate_worktree_command_cwd(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &Path,
+    ) -> Result<(), String> {
+        let n = self.record(crate::worktree_ops::session::step::VALIDATE_CWD);
+        if self.fail_validation_at == Some(n) {
+            return Err(format!("validation {n} failed"));
+        }
+        Ok(())
+    }
+
+    async fn run_worktree_setup(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &Path,
+    ) -> Result<bool, String> {
+        self.record(crate::worktree_ops::session::step::RUN_SETUP);
+        match &self.setup_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(true),
+        }
+    }
+
+    async fn worktree_remove_after_setup_failure(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &str,
+    ) -> Result<(), String> {
+        self.record(crate::worktree_ops::session::step::CLEANUP);
+        match &self.cleanup_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_session_provisioner_order_matches_tui_plus() {
+    use crate::worktree_ops::session::{
+        CleanupOutcome, CwdPhase, ProvisionError, SessionProvisioner,
+        PLUS_SETUP_FAILURE_STEP_ORDER, PLUS_STEP_ORDER,
+    };
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let base = temp.path().join("ws");
+    let template = "sh run.sh {workspace_dir} {repo_root}";
+
+    // Success: exactly the TUI `+` sequence, three validations, expanded command.
+    let runtime = RecordingProvisionRuntime::default();
+    let provisioned = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect("provisioning succeeds");
+    assert_eq!(runtime.calls(), PLUS_STEP_ORDER.to_vec());
+    assert_eq!(
+        provisioned.validations,
+        vec![
+            CwdPhase::AfterCreate,
+            CwdPhase::AfterSetup,
+            CwdPhase::BeforeLaunch
+        ]
+    );
+    assert_eq!(provisioned.branch, "ws-session-abc");
+    assert!(provisioned.path.starts_with(&base));
+    assert!(base.is_dir(), "the base directory is created first");
+    assert_eq!(
+        provisioned.command,
+        format!(
+            "sh run.sh {} {}",
+            provisioned.path.display(),
+            temp.path().display()
+        )
+    );
+
+    // Setup failure: the TUI's cleanup call, nothing after it.
+    let runtime = RecordingProvisionRuntime {
+        setup_error: Some("setup exploded".to_string()),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("setup failure stops provisioning");
+    assert_eq!(runtime.calls(), PLUS_SETUP_FAILURE_STEP_ORDER.to_vec());
+    assert!(matches!(
+        error,
+        ProvisionError::SetupFailed {
+            cleanup: CleanupOutcome::Removed,
+            ..
+        }
+    ));
+
+    // A cleanup that itself fails reports `retained` with its reason.
+    let runtime = RecordingProvisionRuntime {
+        setup_error: Some("setup exploded".to_string()),
+        cleanup_error: Some("still locked".to_string()),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("setup failure stops provisioning");
+    match error {
+        ProvisionError::SetupFailed {
+            cleanup: CleanupOutcome::Retained { reason },
+            ..
+        } => assert_eq!(reason, "still locked"),
+        other => panic!("expected a retained cleanup, got {other:?}"),
+    }
+
+    // Invalid cwd immediately before launch: the full sequence ran, nothing launches.
+    let runtime = RecordingProvisionRuntime {
+        fail_validation_at: Some(3),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("invalid cwd stops provisioning");
+    assert_eq!(runtime.calls(), PLUS_STEP_ORDER.to_vec());
+    assert!(matches!(
+        error,
+        ProvisionError::CwdInvalid {
+            phase: CwdPhase::BeforeLaunch,
+            ..
+        }
+    ));
+
+    // No template: unavailable before any call.
+    let runtime = RecordingProvisionRuntime::default();
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, None)
+        .provision()
+        .await
+        .expect_err("no template");
+    assert!(matches!(error, ProvisionError::Unavailable(_)));
+    assert!(runtime.calls().is_empty());
+}

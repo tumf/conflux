@@ -30,6 +30,7 @@ pub mod reads;
 pub mod registry;
 pub mod sinks;
 pub mod stream;
+pub mod worktree_sessions;
 pub mod worktrees;
 
 use std::sync::Arc;
@@ -115,6 +116,8 @@ pub struct RemoteControlRuntime {
     /// Execution-scoped completion sinks, bound with the orchestration runtime
     /// whose typed transitions they observe.
     completion_sinks: Arc<CompletionSinkHandle>,
+    /// Configured-command worktree sessions, bound with the worktree runtime.
+    worktree_sessions: Arc<worktree_sessions::WorktreeSessionHandle>,
 }
 
 /// Late-bound holder of this incarnation's completion-sink registry.
@@ -315,7 +318,21 @@ impl RemoteControlRuntime {
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
             execution_contract: Arc::new(ExecutionContractHandle::default()),
             completion_sinks: Arc::new(CompletionSinkHandle::default()),
+            worktree_sessions: Arc::new(worktree_sessions::WorktreeSessionHandle::default()),
         }
+    }
+
+    /// The late-bound worktree-session handle the router reads.
+    pub fn worktree_sessions(&self) -> Arc<worktree_sessions::WorktreeSessionHandle> {
+        self.worktree_sessions.clone()
+    }
+
+    /// Bind the worktree-session port this incarnation serves.
+    pub fn bind_worktree_sessions(
+        &self,
+        port: Arc<dyn worktree_sessions::WorktreeSessionOperations>,
+    ) {
+        self.worktree_sessions.bind(port);
     }
 
     /// The projection owner for this incarnation.
@@ -514,6 +531,12 @@ pub struct RemoteControlState {
     /// `None` is a process that knows no candidate worktree, which previews
     /// every eligible row as `no_candidate_worktree`.
     pub refresh_paths: Option<Arc<dyn proposal_refresh::RefreshPathSource>>,
+    /// Configured-command worktree sessions.
+    ///
+    /// Unbound is a process that holds no session and can launch none; the
+    /// read routes answer an empty list and the capability reports
+    /// `available: false`.
+    pub worktree_sessions: Arc<worktree_sessions::WorktreeSessionHandle>,
 }
 
 impl RemoteControlState {
@@ -540,7 +563,17 @@ impl RemoteControlState {
             execution_contract: Arc::new(ExecutionContractHandle::default()),
             completion_sinks: Arc::new(CompletionSinkHandle::default()),
             refresh_paths: None,
+            worktree_sessions: Arc::new(worktree_sessions::WorktreeSessionHandle::default()),
         }
+    }
+
+    /// Attach the worktree-session handle this router serves.
+    pub fn with_worktree_sessions(
+        mut self,
+        handle: Arc<worktree_sessions::WorktreeSessionHandle>,
+    ) -> Self {
+        self.worktree_sessions = handle;
+        self
     }
 
     /// Attach the candidate-worktree locator the refresh preview reads.
@@ -623,6 +656,14 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/logs", get(reads::logs))
         .route("/api/v2/worktrees", get(reads::list_worktrees))
         .route("/api/v2/worktrees/{worktree_id}", get(reads::get_worktree))
+        .route(
+            "/api/v2/worktree-sessions",
+            get(worktree_sessions::list_sessions),
+        )
+        .route(
+            "/api/v2/worktree-sessions/{session_id}",
+            get(worktree_sessions::get_session),
+        )
         .route("/api/v2/commands", post(commands::submit_command))
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))
