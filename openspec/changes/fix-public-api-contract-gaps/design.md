@@ -130,6 +130,12 @@ MERGE_ABORT_REASONS += "merge_failed", "merged_hook_failed"
 | real conflict, aborted / abort failed | unchanged | unchanged | `not_landed` / per `abort` | `ran: false` |
 | before eligibility (`worktree_not_found`, `root_busy`, `target_ineligible`) | unchanged | result `null` | — | — |
 
+The recorded operation stage determines `outcome` and `hook.ran`, not whether
+Git landed. `merge.landed` is separately re-read from Git. A failed hook whose
+re-read is inconclusive or contrary still reports `merged_hook_failed` and
+`hook.ran: true`, but publishes `merge.landed: unknown | not_landed` instead of
+inventing `confirmed`. It does not compensate or repeat the hook.
+
 `landed: confirmed` requires all of: re-read `HEAD != premerge_head`,
 `git merge-base --is-ancestor premerge_head HEAD` true, and no `MERGE_HEAD`.
 `not_landed` requires `HEAD == premerge_head` and no `MERGE_HEAD`. Any
@@ -154,6 +160,7 @@ re-merges, aborts, resets, or reverts.
 ```rust
 pub enum RunnerNotice {
     RetryScheduled { next_attempt: u32, max_attempts: u32, cause: RetryCause, delay_ms: u64 },
+    AttemptStarted { attempt: u32 },
     InactivityTerminated { attempt: u32, timeout_secs: u64 },
     RuntimeLimitReached { attempt: u32 },
     LaunchFailed { attempt: u32, stage: &'static str },
@@ -181,8 +188,11 @@ pub enum RetryCause { Crash, InactivityTimeout }
   branches publish `LeaderReaped` from the real wait status. The synthetic
   `make_fail_status()` sent on `status_tx` is untouched (other consumers read
   it); the session ignores it for cancelled runs.
-- Session registry: `attempt = 1`, set to `next_attempt` on each
-  `RetryScheduled`; `runner_notices: Vec<RunnerNoticeRecord { kind,
+- Session registry: preserve the legacy initial `attempt = 1`; update it
+  only from `AttemptStarted` emitted immediately after a successful spawn.
+  A `RetryScheduled` notice during the delay does not increment `attempt`:
+  stopping before the next spawn leaves the last started attempt visible.
+  `runner_notices: Vec<RunnerNoticeRecord { kind,
   attempt, detail }>` bounded at 32 (oldest dropped, a `dropped` count kept),
   `detail` passed through `sanitize_detail` and never containing the
   template, expanded command, environment, or an absolute path (the PGID

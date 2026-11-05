@@ -224,15 +224,17 @@ without weakening a single existing promise:
   `internal_error` with no result. No re-merge, abort, reset, or hook re-run.
 - **Typed runner notices for sessions.** `AiCommandRunner` gains a
   `RunnerNotice` enum (`RetryScheduled { next_attempt, max_attempts, cause,
-  delay_ms }`, `InactivityTerminated`, `RuntimeLimitReached`, `LaunchFailed`,
+  delay_ms }`, `AttemptStarted { attempt }`, `InactivityTerminated`,
+  `RuntimeLimitReached`, `LaunchFailed`,
   `ShutdownRefused { stage }`, `ProcessGroupCleanupUnconfirmed { pgid,
   force_killed }`, `LeaderReaped { attempt, exit_code, signal }`,
   `LeaderNotReaped { attempt }`) and a second streaming entry point that
   publishes those on a dedicated channel and sends **no** runner text on the
   output channel. The existing entry point keeps emitting the same stderr
   lines, so the TUI terminal, parallel executor, and shell command path are
-  untouched. The session registry uses the typed entry point, sets `attempt`
-  from `RetryScheduled.next_attempt`, retains notices in a bounded
+  untouched. The session registry uses the typed entry point, sets later
+  `attempt` values from `AttemptStarted` after a successful spawn, not from
+  a retry merely scheduled during its delay; it retains notices in a bounded
   `runner_notices` list, stores only child lines in `output.lines`, and
   derives `signal`/`exit_code` from the final `LeaderReaped` — `SIGTERM`,
   `SIGKILL`, or a real exit code — and publishes `null` for both when the
@@ -276,6 +278,8 @@ without weakening a single existing promise:
    `output.lines` verbatim. A real crash-retry finishes with `attempt: 2`,
    one `retry_scheduled` notice, and no runner text in the tail; the TUI
    terminal path still prints `[Retry 1/1]` to stderr for the same command.
+   If stop cancels the delay after scheduling but before a second spawn,
+   `attempt` stays `1` and the scheduled notice remains visible.
 3. Stopping a session whose command ignores SIGTERM settles `stopped`,
    `signal: SIGKILL`, `terminated: true`, `attempt: 1`, with the whole group
    gone; a command that honours SIGTERM settles `signal: SIGTERM`; a

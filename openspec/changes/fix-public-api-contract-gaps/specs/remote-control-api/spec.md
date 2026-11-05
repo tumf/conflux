@@ -6,9 +6,7 @@
 every settlement after eligibility, including the two paths that today
 settle `internal_error` with `result: null`: an `on_merged` hook failure
 after the merge commit landed, and a Git failure after eligibility but
-before any merge commit landed. The owner MUST distinguish the two from
-repository evidence re-read after the failure, never from the error text or
-from the stage it believes it reached.
+before any merge commit landed. The owner MUST distinguish whether the hook ran and failed or Git failed before it from its recorded operation stage, never from error text. Separately, `merge.landed` MUST be derived from repository evidence re-read after the failure, never inferred from that stage. A hook failure with inconclusive or contrary landing evidence MUST publish the observed `unknown` or `not_landed`, not an invented `confirmed`; the owner MUST NOT compensate or run the hook again.
 
 A merge whose commit landed and whose `on_merged` hook then failed MUST
 settle the typed error code `merge_hook_failed` (HTTP 409) with
@@ -64,11 +62,14 @@ omits them MUST still decode as before.
 A worktree session's `attempt`, its retained `output.lines`, and its `signal`
 MUST be owner facts that child output cannot change. The runner MUST publish
 its own notices — retry scheduled with the next attempt number and cause,
-inactivity termination, runtime-limit termination, launch failure, shutdown
-refusal, and process-group cleanup diagnostics — to the session through a
-typed channel separate from the child's stdout/stderr, and the session MUST
-derive `attempt` only from that channel, never from the text of any output
-line. A child line that begins with `[Retry `, contains a PGID, or imitates
+attempt started after a successful spawn, inactivity termination, runtime-limit
+termination, launch failure, shutdown refusal, and process-group cleanup
+diagnostics — to the session through a typed channel separate from the child's
+stdout/stderr. The session MUST derive later `attempt` values only from
+`AttemptStarted` after the corresponding process spawned, never from
+`RetryScheduled` or the text of an output line. Before the first successful
+spawn, the legacy initial `attempt: 1` remains unchanged; stopping a scheduled
+retry during its delay does not increment `attempt` without a second spawn. A child line that begins with `[Retry `, contains a PGID, or imitates
 any runner notice MUST remain in `output.lines` verbatim (after
 control-sequence stripping) and MUST change no typed member. `output.lines`
 MUST contain only bytes the child wrote to its stdout or stderr; runner
@@ -109,6 +110,13 @@ that omits both MUST decode as before.
 - **THEN** `attempt` is `2` and `runner_notices` holds one `retry_scheduled` notice naming attempt `2`
 - **AND** no `[Retry ` line and no runner text appears in `output.lines`
 - **AND** the TUI terminal path for the same command still prints the `[Retry 1/1]` stderr notice
+
+#### Scenario: Stopping in the retry delay does not invent a new attempt
+
+- **GIVEN** the first process failed and retry attempt `2` was scheduled, but stop cancelled the delay before another spawn
+- **WHEN** the session settles
+- **THEN** `attempt` remains `1` although `runner_notices` records the scheduled retry
+- **AND** no second process was spawned
 
 #### Scenario: Observed signal follows the escalation
 
