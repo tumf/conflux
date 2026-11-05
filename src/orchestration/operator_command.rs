@@ -1708,7 +1708,18 @@ pub trait ManagedProcessTermination: Send + Sync {
     /// Immediately SIGKILL this change's managed process group, bypassing any
     /// graceful escalation window, and report whether it was proven reaped.
     async fn kill_managed_process(&self, change_id: &str) -> ImmediateKillEvidence;
+
+    /// Whether any owner-managed writer may be writing under `root`.
+    ///
+    /// Path-bound rather than change-bound, and tri-state rather than boolean:
+    /// a writer with no change ID, one retained from a previous run, and one
+    /// this port cannot account for at all must never read as "no writer". It
+    /// is a read only — it signals nothing and widens nothing the kill path may
+    /// reach.
+    async fn writer_coverage_under(&self, root: &std::path::Path) -> WriterCoverage;
 }
+
+pub use crate::ai_command_runner::WriterCoverage;
 
 /// Typed evidence from one immediate, target-scoped kill.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1769,6 +1780,14 @@ impl ManagedProcessTermination for NoManagedProcesses {
 
     async fn kill_managed_process(&self, _change_id: &str) -> ImmediateKillEvidence {
         ImmediateKillEvidence::nothing_to_kill()
+    }
+
+    /// Owning nothing to kill is not evidence that nothing writes: this port
+    /// accounts for no writer at all, so it can never answer `Clear`.
+    async fn writer_coverage_under(&self, _root: &std::path::Path) -> WriterCoverage {
+        WriterCoverage::Unknown {
+            detail: "this owner binds no managed writer ledger".to_string(),
+        }
     }
 }
 
@@ -3341,6 +3360,11 @@ where
     F: Fn() -> Option<crate::ai_command_runner::RunCommandScope> + Send + Sync,
 {
     current_scope: F,
+    /// The owner's account of every writer it can launch.
+    ///
+    /// `None` answers `Unknown` for every root: the absence of a ledger is
+    /// never evidence that no writer exists.
+    writer_ledger: Option<crate::ai_command_runner::ManagedWriterLedger>,
 }
 
 impl<F> LiveRunManagedProcesses<F>
@@ -3349,7 +3373,19 @@ where
 {
     /// Bind a reader for the live run's command scope.
     pub fn new(current_scope: F) -> Self {
-        Self { current_scope }
+        Self {
+            current_scope,
+            writer_ledger: None,
+        }
+    }
+
+    /// Answer writer coverage from this owner's ledger.
+    pub fn with_writer_ledger(
+        mut self,
+        ledger: crate::ai_command_runner::ManagedWriterLedger,
+    ) -> Self {
+        self.writer_ledger = Some(ledger);
+        self
     }
 }
 
@@ -3377,6 +3413,22 @@ where
         } else {
             ImmediateKillEvidence::unconfirmed(report.identities, report.diagnostics())
         }
+    }
+
+    async fn writer_coverage_under(&self, root: &std::path::Path) -> WriterCoverage {
+        let Some(ledger) = &self.writer_ledger else {
+            return WriterCoverage::Unknown {
+                detail: "managed writer coverage is unknown: no writer ledger is attached \
+                         to this owner"
+                    .to_string(),
+            };
+        };
+        // The live scope is accounted for even if nothing registered it, so a
+        // run is never invisible merely because of how it was installed.
+        if let Some(scope) = (self.current_scope)() {
+            ledger.register_scope(&scope);
+        }
+        ledger.coverage_under(root)
     }
 }
 

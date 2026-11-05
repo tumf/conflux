@@ -112,6 +112,19 @@ pub enum ErrorCode {
     /// itself refused — a moved ref, a dirty candidate, a hook. The record's
     /// `result` carries the stable reason and the effects re-read from Git.
     RefreshRefused,
+    /// A text write named content the file no longer holds.
+    ///
+    /// Nothing was written. The record's `result.current_content_id` carries the
+    /// identity the file holds now (`null` when it is absent), so a client keeps
+    /// its buffer and re-reads instead of being told to discard anything.
+    TextStale,
+    /// The addressed path is outside the bounded editable scope.
+    ///
+    /// The `reason` (on a read refusal's message, on a command's `result`) is
+    /// one stable token — `git_metadata`, `conflux_owned_path`, `unsafe_path`,
+    /// `nested_repository`, `not_regular_file`, `executable`, `too_large`,
+    /// `not_text`, or `root_missing`.
+    TextNotEditable,
     /// The configured-command session surface cannot launch here: no
     /// `worktree_command` is configured, the project is not a Git repository,
     /// or the owner is shutting down. Refused before any Git or process effect.
@@ -150,6 +163,8 @@ impl ErrorCode {
             | Self::MergeAbortFailed
             | Self::ExecutionBindingMismatch
             | Self::RefreshRefused
+            | Self::TextStale
+            | Self::TextNotEditable
             | Self::WorktreeSessionUnavailable
             | Self::WorktreeSessionBusy
             | Self::WorktreeSessionSetupFailed => StatusCode::CONFLICT,
@@ -185,6 +200,8 @@ impl ErrorCode {
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
+            Self::TextStale => "text_stale",
+            Self::TextNotEditable => "text_not_editable",
             Self::WorktreeSessionUnavailable => "worktree_session_unavailable",
             Self::WorktreeSessionBusy => "worktree_session_busy",
             Self::WorktreeSessionSetupFailed => "worktree_session_setup_failed",
@@ -194,7 +211,7 @@ impl ErrorCode {
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 26] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 28] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -217,6 +234,8 @@ pub const ALL_ERROR_CODES: [ErrorCode; 26] = [
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
+    ErrorCode::TextStale,
+    ErrorCode::TextNotEditable,
     ErrorCode::WorktreeSessionUnavailable,
     ErrorCode::WorktreeSessionBusy,
     ErrorCode::WorktreeSessionSetupFailed,
@@ -439,6 +458,58 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Replace or create one text file inside a change's own directory.
+    ///
+    /// The root is server-derived — `openspec/changes/<change_id>` of the
+    /// project — and `params.expected` must name what the caller read: there is
+    /// no unconditional write. Saving never commits, stages, or pushes.
+    WriteChangeText {
+        /// The change whose directory is the root.
+        target: ChangeTarget,
+        /// The relative path, the expected identity, and the new content.
+        params: TextWriteParams,
+    },
+    /// Replace or create one text file inside a worktree addressed by opaque ID.
+    ///
+    /// The root is the directory the ID is bound to, and nothing else: no path,
+    /// branch, or ref is accepted as identity.
+    WriteWorktreeText {
+        /// The worktree whose directory is the root.
+        target: WorktreeTarget,
+        /// The relative path, the expected identity, and the new content.
+        params: TextWriteParams,
+    },
+}
+
+/// Parameters of a bounded text write.
+///
+/// `deny_unknown_fields`, so a smuggled root, mode, or force flag is a schema
+/// error instead of a silently ignored member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextWriteParams {
+    /// Root-relative UTF-8 path, `/`-separated, at most 1024 bytes.
+    pub path: String,
+    /// What the caller read. A write proceeds only while it still holds.
+    pub expected: TextExpectation,
+    /// The complete new file content, at most 1 MiB of UTF-8 without NUL.
+    pub content: String,
+}
+
+/// The content a write expects the file to hold right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TextExpectation {
+    /// The file holds exactly these bytes, by `sha256:` identity from a read.
+    Content {
+        /// `sha256:` followed by 64 lowercase hexadecimal digits.
+        content_id: String,
+    },
+    /// The file does not exist yet; this write creates it.
+    ///
+    /// An empty struct variant rather than a unit one, so `deny_unknown_fields`
+    /// refuses a `content_id` smuggled next to `kind: absent`.
+    Absent {},
 }
 
 /// Change-addressed command target.
@@ -509,6 +580,8 @@ impl CommandSpec {
             Self::MergeWorktree { .. } => "merge_worktree",
             Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
             Self::RefreshProposal { .. } => "refresh_proposal",
+            Self::WriteChangeText { .. } => "write_change_text",
+            Self::WriteWorktreeText { .. } => "write_worktree_text",
             Self::RunWorktreeCommand { .. } => "run_worktree_command",
             Self::CreateSessionWorktree { .. } => "create_session_worktree",
             Self::StopWorktreeSession { .. } => "stop_worktree_session",
@@ -544,6 +617,18 @@ impl CommandSpec {
                     }
                 }
                 Ok(())
+            }
+            Self::WriteChangeText { target, params } => {
+                if target.change_id.trim().is_empty() {
+                    return Err("write_change_text requires a non-empty change_id".to_string());
+                }
+                params.validate()
+            }
+            Self::WriteWorktreeText { target, params } => {
+                if target.worktree_id.trim().is_empty() {
+                    return Err("write_worktree_text requires a non-empty worktree_id".to_string());
+                }
+                params.validate()
             }
             Self::RunWorktreeCommand { target, .. } => {
                 if is_opaque_id(&target.worktree_id) {
@@ -582,7 +667,9 @@ impl CommandSpec {
             | Self::ForceStopChange { change_id }
             | Self::ResolveMerge { change_id }
             | Self::RefreshProposal { change_id, .. } => Some(change_id),
-            Self::CreateWorktree { target, .. } => Some(&target.change_id),
+            Self::CreateWorktree { target, .. } | Self::WriteChangeText { target, .. } => {
+                Some(&target.change_id)
+            }
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
             // A process-wide mutation: it addresses the whole target set, never
@@ -591,7 +678,8 @@ impl CommandSpec {
             // Worktree mutations are addressed by opaque ID, not by change.
             Self::DeleteWorktree { .. }
             | Self::MergeWorktree { .. }
-            | Self::MergeWorktreeAbortOnConflict { .. } => None,
+            | Self::MergeWorktreeAbortOnConflict { .. }
+            | Self::WriteWorktreeText { .. } => None,
             // Sessions are addressed by opaque worktree or session ID, never by change.
             Self::RunWorktreeCommand { .. }
             | Self::CreateSessionWorktree { .. }
@@ -600,8 +688,36 @@ impl CommandSpec {
     }
 }
 
+impl TextWriteParams {
+    /// Lexical path rules, the size ceiling, NUL, and identity shape.
+    ///
+    /// Everything here is decided without touching the filesystem, so a
+    /// violation is a `validation_failed` envelope with no record.
+    pub fn validate(&self) -> Result<(), String> {
+        super::text_edit::validate_path(&self.path)?;
+        if self.content.len() as u64 > super::text_edit::MAX_TEXT_BYTES {
+            return Err(format!(
+                "content exceeds the {} byte text ceiling",
+                super::text_edit::MAX_TEXT_BYTES
+            ));
+        }
+        if self.content.contains('\0') {
+            return Err("content must not contain NUL".to_string());
+        }
+        if let TextExpectation::Content { content_id } = &self.expected {
+            if !super::text_edit::is_content_id(content_id) {
+                return Err(
+                    "expected.content_id must be `sha256:` followed by 64 lowercase hex digits"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 20] = [
+pub const SUPPORTED_COMMANDS: [&str; 22] = [
     "start",
     "stop",
     "cancel_stop",
@@ -619,6 +735,8 @@ pub const SUPPORTED_COMMANDS: [&str; 20] = [
     "merge_worktree",
     "refresh_proposal",
     "merge_worktree_abort_on_conflict",
+    "write_change_text",
+    "write_worktree_text",
     "run_worktree_command",
     "create_session_worktree",
     "stop_worktree_session",
@@ -822,6 +940,12 @@ pub struct CapabilitiesResponse {
     /// absent field means "not served".
     #[serde(default)]
     pub proposal_refresh: ProposalRefreshCapability,
+    /// The bounded remote text edit surface.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field decodes as unavailable — never as available.
+    #[serde(default)]
+    pub text_edit: TextEditCapability,
     /// The configured-command worktree session surface.
     ///
     /// `#[serde(default)]` so a client can still read an older owner, where the
@@ -2348,6 +2472,12 @@ pub enum CommandResult {
     /// `merge_abort_failed`), because a client must be able to tell a proven
     /// restoration from an unproven one without parsing prose.
     MergeAbort(Box<MergeAbortResult>),
+    /// Settlement evidence for `write_change_text` / `write_worktree_text`.
+    ///
+    /// Carried by refusals too (`text_stale`, `text_not_editable`,
+    /// `target_ineligible`), so a client reads `current_content_id` from the
+    /// record rather than re-observing the file.
+    TextWrite(Box<TextWriteResult>),
 }
 
 /// What a session launch (or a refused provisioning) produced.
@@ -2725,6 +2855,184 @@ pub struct ProposalRefreshCapability {
     /// Command type an apply is submitted as.
     pub command: String,
     /// Every stable refusal reason, lifecycle and command time.
+    pub reasons: Vec<String>,
+}
+
+// ============================================================================
+// Bounded text edit
+// ============================================================================
+
+/// Which root a text read or write addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextScope {
+    /// `openspec/changes/<change_id>` of the project.
+    Change {
+        /// Tracked, non-archived change.
+        change_id: String,
+    },
+    /// The directory a live opaque worktree ID is bound to.
+    Worktree {
+        /// Opaque process-local worktree ID.
+        worktree_id: String,
+    },
+}
+
+/// Why a target that holds editable text cannot be written right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextEditBlockedReason {
+    /// The change (for a worktree, its owning change) is in an active status.
+    ChangeActive,
+    /// The change is admitted: queue intent queued, or status `queued`/`blocked`.
+    ChangeAdmitted,
+    /// Managed writer coverage for the root is not `Clear`: a managed writer is
+    /// bound here, or the owner cannot prove that none is. `edit_blocked_detail`
+    /// tells the two apart.
+    ManagedProcessLive,
+    /// The repository root guard is held, a base merge is in progress, or a
+    /// resolve is running.
+    RootBusy,
+}
+
+impl TextEditBlockedReason {
+    /// Wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeActive => "change_active",
+            Self::ChangeAdmitted => "change_admitted",
+            Self::ManagedProcessLive => "managed_process_live",
+            Self::RootBusy => "root_busy",
+        }
+    }
+}
+
+/// The surface's fixed bounds, repeated on every read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextEditLimits {
+    /// Largest editable file, in bytes.
+    pub max_bytes: u64,
+    /// Longest accepted relative path, in bytes.
+    pub max_path_bytes: usize,
+    /// Algorithm of `content_id`; always `sha256`.
+    pub content_id_algorithm: String,
+}
+
+/// `GET /api/v2/changes/{change_id}/text` and
+/// `GET /api/v2/worktrees/{worktree_id}/text` body.
+///
+/// A read: no command record, no revision change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextReadResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the eligibility was read at.
+    pub state_revision: u64,
+    /// The addressed root.
+    pub scope: TextScope,
+    /// The root-relative path, as requested.
+    pub path: String,
+    /// False when the file does not exist; a write may then create it with
+    /// `expected.kind = absent`.
+    pub exists: bool,
+    /// The file's bytes as UTF-8; `null` when absent.
+    #[schema(required)]
+    pub content: Option<String>,
+    /// `sha256:<hex>` of the bytes; `null` when absent.
+    #[schema(required)]
+    pub content_id: Option<String>,
+    /// Byte length; `null` when absent.
+    #[schema(required)]
+    pub size_bytes: Option<u64>,
+    /// Octal permission bits, for example `0644`; `null` when absent.
+    #[schema(required)]
+    pub mode: Option<String>,
+    /// True when a write would pass writer exclusion right now.
+    pub editable: bool,
+    /// Why not, when `editable` is false.
+    #[schema(required)]
+    pub edit_blocked_reason: Option<TextEditBlockedReason>,
+    /// Bounded diagnostic for the refusal; never parsed by clients.
+    #[schema(required)]
+    pub edit_blocked_detail: Option<String>,
+    /// The surface's fixed bounds.
+    pub limits: TextEditLimits,
+}
+
+/// How a text write settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextWriteOutcome {
+    /// The bytes were replaced (or the file created).
+    Written,
+    /// The new content equals the file; nothing was opened for writing.
+    Unchanged,
+}
+
+/// What a text write actually did to the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextWriteEffects {
+    /// True only when the target file now holds the new bytes.
+    pub file_written: bool,
+}
+
+/// The settled body of a text write, successful or refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextWriteResult {
+    /// The addressed root.
+    pub scope: TextScope,
+    /// The root-relative path.
+    pub path: String,
+    /// `written` or `unchanged`; `null` when refused.
+    #[schema(required)]
+    pub outcome: Option<TextWriteOutcome>,
+    /// Stable refusal reason (a `text_not_editable` or `target_ineligible`
+    /// token, or `stale`); `null` on success.
+    #[schema(required)]
+    pub reason: Option<String>,
+    /// Bounded diagnostic; for `managed_process_live`, the coverage detail.
+    #[schema(required)]
+    pub detail: Option<String>,
+    /// Identity the file held before the write; `null` when it was absent.
+    #[schema(required)]
+    pub content_id_before: Option<String>,
+    /// Identity re-read after the write; `null` when nothing was written.
+    #[schema(required)]
+    pub content_id_after: Option<String>,
+    /// For `text_stale`: what the file holds now; `null` when it is absent.
+    #[schema(required)]
+    pub current_content_id: Option<String>,
+    /// Bytes written; `null` when nothing was written.
+    #[schema(required)]
+    pub bytes_written: Option<u64>,
+    /// Octal permission bits after the write; `null` when nothing was written.
+    #[schema(required)]
+    pub mode: Option<String>,
+    /// What the filesystem holds as a result.
+    pub effects: TextWriteEffects,
+}
+
+/// Whether the bounded text edit surface is served, and its bounds.
+///
+/// `Default` is the *unavailable* answer, which is what an older owner's
+/// omission decodes as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct TextEditCapability {
+    /// True when this build serves the text routes and commands.
+    pub available: bool,
+    /// Route templates of the two reads.
+    pub read_routes: Vec<String>,
+    /// Command types a write is submitted as.
+    pub commands: Vec<String>,
+    /// Largest editable file, in bytes.
+    pub max_bytes: u64,
+    /// Longest accepted relative path, in bytes.
+    pub max_path_bytes: usize,
+    /// Algorithm of `content_id`.
+    pub content_id_algorithm: String,
+    /// Paths and kinds that are never editable.
+    pub excluded: Vec<String>,
+    /// Every stable refusal reason, containment and writer exclusion.
     pub reasons: Vec<String>,
 }
 

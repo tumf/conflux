@@ -1428,6 +1428,19 @@ impl WorktreeService {
         self.acquire_root()
     }
 
+    /// Whether another operation holds the repository mutation guard now.
+    ///
+    /// A `try_lock` probe released immediately: callers that only need to
+    /// *refuse* while the root is busy never contend with the holder.
+    pub fn root_guard_is_held(&self) -> bool {
+        self.root_guard.try_lock().is_err()
+    }
+
+    /// Tell observers the worktree observation changed outside an operation.
+    pub async fn announce_refreshed(&self) {
+        self.events.emit(WorktreeOperationEvent::Refreshed).await;
+    }
+
     fn acquire_root(&self) -> WorktreeOpResult<tokio::sync::MutexGuard<'_, ()>> {
         self.root_guard.try_lock().map_err(|_| {
             WorktreeOpError::RootBusy(

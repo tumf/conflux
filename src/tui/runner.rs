@@ -542,8 +542,14 @@ async fn run_tui_loop(
     // Create shared stagger state for all AI commands (worktree, apply, archive, acceptance)
     use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
     let shared_stagger_state: SharedStaggerState = Arc::new(tokio::sync::Mutex::new(None));
-    let ai_runner =
+    // The one writer ledger of this owner process. Installed before anything
+    // can spawn, so every run scope and every unscoped runner the TUI builds —
+    // including this one, whose `worktree_command` sessions bypass every run
+    // scope — reports into it.
+    let writer_ledger = crate::ai_command_runner::ManagedWriterLedger::for_owner_process();
+    let mut ai_runner =
         AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
+    ai_runner.set_writer_ledger(writer_ledger.clone());
 
     // Two directions, deliberately not one channel.
     //
@@ -650,17 +656,20 @@ async fn run_tui_loop(
     // The TUI adapter and the `/api/v2` adapter drive it through the same
     // run-control service, so neither can start or cancel a run the other
     // cannot see.
-    let supervisor = Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
-        repo_root.clone(),
-        config.clone(),
-        dispatcher.clone(),
-        dynamic_queue.clone(),
-        shared_state.clone(),
-        manual_resolve_counter.clone(),
-        post_archive_action.clone(),
-        upstream_runtime.clone(),
-        graceful_stop_flag.clone(),
-    ));
+    let supervisor = Arc::new(
+        crate::tui::run_supervisor::TuiRunSupervisor::new(
+            repo_root.clone(),
+            config.clone(),
+            dispatcher.clone(),
+            dynamic_queue.clone(),
+            shared_state.clone(),
+            manual_resolve_counter.clone(),
+            post_archive_action.clone(),
+            upstream_runtime.clone(),
+            graceful_stop_flag.clone(),
+        )
+        .with_writer_ledger(writer_ledger.clone()),
+    );
 
     // External SIGINT/SIGTERM become a quit *request* the event loop drains, so
     // they leave through the same bounded shutdown boundary as a keypress
@@ -679,7 +688,10 @@ async fn run_tui_loop(
         Arc::new(
             crate::orchestration::operator_command::LiveRunManagedProcesses::new(move || {
                 scope_owner.run_command_scope()
-            }),
+            })
+            // Writer coverage for the remote editor: every scope the supervisor
+            // ever installed plus every unscoped spawn, never only the live run.
+            .with_writer_ledger(writer_ledger.clone()),
         )
     };
 

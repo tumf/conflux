@@ -754,6 +754,7 @@ async fn remote_worktree_capabilities_report_the_operations_and_recovery_boundar
             "delete",
             "merge",
             "merge_abort",
+            "text",
             "session"
         ]
     );

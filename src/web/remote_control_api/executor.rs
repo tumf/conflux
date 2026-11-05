@@ -637,10 +637,44 @@ impl SharedServiceExecutor {
             | CommandSpec::DeleteWorktree { .. }
             | CommandSpec::MergeWorktree { .. }
             | CommandSpec::MergeWorktreeAbortOnConflict { .. }
+            | CommandSpec::WriteChangeText { .. }
+            | CommandSpec::WriteWorktreeText { .. }
             | CommandSpec::RunWorktreeCommand { .. }
             | CommandSpec::CreateSessionWorktree { .. }
             | CommandSpec::StopWorktreeSession { .. } => return None,
         })
+    }
+
+    /// Run a bounded text write, if `command` is one.
+    ///
+    /// `None` for every other command. The caller decides what the gate does:
+    /// a text write runs while it is still held, so the eligibility snapshot
+    /// and the write it admits are serialized against every other command.
+    async fn text_write(
+        &self,
+        command: &CommandSpec,
+    ) -> Option<Result<ExecutionSummary, CommandFailure>> {
+        let (scope, params) = match command {
+            CommandSpec::WriteChangeText { target, params } => (
+                super::dto::TextScope::Change {
+                    change_id: target.change_id.clone(),
+                },
+                params,
+            ),
+            CommandSpec::WriteWorktreeText { target, params } => (
+                super::dto::TextScope::Worktree {
+                    worktree_id: target.worktree_id.clone(),
+                },
+                params,
+            ),
+            _ => return None,
+        };
+        let context = super::text_edit::TextEditContext {
+            projection: self.web_state.remote_control().projection(),
+            source: Some(self.web_state.clone()),
+            worktrees: self.worktrees.clone(),
+        };
+        Some(context.write(scope, params).await)
     }
 
     /// Run a worktree command and republish the monitoring snapshot.
@@ -753,6 +787,9 @@ pub fn summarize_application(
 #[async_trait]
 impl RemoteControlExecutor for SharedServiceExecutor {
     async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        if let Some(outcome) = self.text_write(command).await {
+            return outcome;
+        }
         match Self::intent(command) {
             Some(intent) => summarize_application(self.application.apply(intent).await),
             None => self.worktree(command).await,
@@ -769,6 +806,12 @@ impl RemoteControlExecutor for SharedServiceExecutor {
         command: &CommandSpec,
         gate: Option<GateGuard>,
     ) -> Result<ExecutionSummary, CommandFailure> {
+        // A text write settles under the gate it was admitted with, and only
+        // then releases it.
+        if let Some(outcome) = self.text_write(command).await {
+            drop(gate);
+            return outcome;
+        }
         match (Self::intent(command), gate) {
             (Some(intent), Some(gate)) => {
                 summarize_application(self.application.apply_held(intent, gate).await)

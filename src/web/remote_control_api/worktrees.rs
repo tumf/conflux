@@ -33,13 +33,14 @@ use super::dto::{
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 7] = [
+pub const WORKTREE_OPERATIONS: [&str; 8] = [
     "list",
     "detail",
     "create",
     "delete",
     "merge",
     "merge_abort",
+    "text",
     "session",
 ];
 
@@ -481,6 +482,24 @@ pub trait WorktreeOperations: Send + Sync {
         &self,
         worktree_id: &str,
     ) -> Result<ExecutionSummary, CommandFailure>;
+
+    /// The directory a live opaque ID is bound to, for the text surface.
+    ///
+    /// Registry-internal: the path is never serialized.
+    async fn text_root(&self, _worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Err(unbound())
+    }
+
+    /// Whether the repository root mutation guard is held right now.
+    ///
+    /// A port with no service behind it holds no guard.
+    async fn root_guard_is_held(&self) -> bool {
+        false
+    }
+
+    /// Refresh the worktree observation after a text write, so `dirty` and the
+    /// `Refreshed` worktree event follow from the file write alone.
+    async fn refresh_after_text_write(&self) {}
 }
 
 /// A complete worktree observation plus the repository it belongs to.
@@ -818,5 +837,18 @@ impl WorktreeOperations for RemoteWorktreeOperations {
                 )
             }
         }
+    }
+
+    async fn text_root(&self, worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Ok(self.resolve(worktree_id)?.path)
+    }
+
+    async fn root_guard_is_held(&self) -> bool {
+        self.service.root_guard_is_held()
+    }
+
+    async fn refresh_after_text_write(&self) {
+        let _ = self.observe().await;
+        self.service.announce_refreshed().await;
     }
 }

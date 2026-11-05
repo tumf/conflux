@@ -3003,6 +3003,15 @@ impl ManagedProcessTermination for FakeManagedProcesses {
             ImmediateKillEvidence::nothing_to_kill()
         }
     }
+
+    // Coverage is not what these doubles exercise; `Clear` keeps every
+    // force-stop case meaning what it meant before coverage existed.
+    async fn writer_coverage_under(
+        &self,
+        _root: &std::path::Path,
+    ) -> crate::orchestration::operator_command::WriterCoverage {
+        crate::orchestration::operator_command::WriterCoverage::Clear
+    }
 }
 
 /// A fixture whose managed-ownership answers the test controls.

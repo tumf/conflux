@@ -415,6 +415,122 @@ built before this command omits the block, which a client decodes as
 `validation_failed` before any effect, and serves `merge_worktree` exactly as
 before.
 
+#### Editing a text file remotely
+
+One bounded text surface lets a single operator read and save a file that
+belongs to a change or to a managed worktree, the way the TUI `e` key opens
+`$EDITOR` locally:
+
+```bash
+curl -H "$AUTH" "$BASE/changes/my-change/text?path=tasks.md"
+curl -H "$AUTH" "$BASE/worktrees/$WORKTREE_ID/text?path=src/lib.rs"
+
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "write_worktree_text",
+  "target": {"worktree_id": "'"$WORKTREE_ID"'"},
+  "params": {"path": "src/lib.rs",
+             "expected": {"kind": "content", "content_id": "sha256:…"},
+             "content": "…"},
+  "expected_revision": 41, "idempotency_key": "save-1"
+}'
+```
+
+- **Roots are server-derived.** `write_change_text` / the change read address
+  `openspec/changes/<change_id>` of the project for a tracked, non-archived
+  change; `write_worktree_text` / the worktree read address the directory an
+  opaque `worktree_id` is bound to. No root, absolute path, or ref is ever
+  accepted from the client.
+- **Limits.** A regular UTF-8 file of at most 1 MiB (1,048,576 bytes) without
+  NUL, addressed by a `/`-separated relative path of at most 1024 bytes. An
+  empty path, a leading `/`, `\`, an empty, `.` or `..` component, or a
+  trailing `/` is `validation_failed` (422) before anything is touched. A
+  missing intermediate directory is `not_found`; none is created.
+- **Excluded paths** are `text_not_editable` (409) with a stable `reason`:
+  `.git` as a file or a directory at any depth (`git_metadata`); anything under
+  top-level `.wt/` and the top-level `.conflux-inflight` (`conflux_owned_path`
+  — `sub/.conflux-inflight` is ordinary text); any symlink on the way, or a
+  non-directory used as one (`unsafe_path`); any directory below the root that
+  carries its own `.git` entry of any type — a nested worktree, a submodule, an
+  embedded repository (`nested_repository`); a non-regular file
+  (`not_regular_file`); a file with any execute bit (`executable`); more than
+  1 MiB (`too_large`); invalid UTF-8 or NUL (`not_text`); a root that is
+  missing or a symlink (`root_missing`). From the main worktree's ID, a file in
+  another change's worktree placed under the project root is
+  `nested_repository`: edit it through that worktree's own ID, where its own
+  eligibility applies.
+- **Content identity.** `content_id` is `sha256:` plus 64 lowercase hex digits
+  over the exact bytes. Every write names what it read —
+  `{"kind":"content","content_id":…}`, or `{"kind":"absent"}` to create a file
+  that must not exist yet. There is no unconditional write. A mismatch is
+  `text_stale`: nothing is written, and the record's
+  `result.current_content_id` carries what the file holds now (`null` when it
+  is absent), so a client keeps its buffer and re-reads. Identical content
+  settles `no_op` with `outcome: unchanged` and opens nothing for writing.
+- **The write itself** goes through a same-directory temporary file
+  `.<leaf>.cflx-tmp-<16 hex>`, `fsync`, and `rename`, keeping the existing
+  permission bits (a new file is `0644` subject to the umask). Every path
+  component is re-walked with `O_NOFOLLOW` on the write, so a symlink
+  substituted after a read is still refused. Any failure the process survives
+  removes the temporary file and reports `effects.file_written: false`. A
+  process killed between creating it and the rename can leave that
+  `.cflx-tmp-` file behind: it is reported by Git and by every Conflux
+  cleanliness check as ordinary untracked dirt, it is never ignored or swept,
+  and you delete it by hand.
+- **Saving never commits, stages, or pushes.** Git dirty state follows from the
+  file write alone. After a successful worktree write the ordinary worktree
+  observation is refreshed; when that changes what the owner observes, the
+  state revision advances like any other refresh. **A save can therefore
+  require a reload**: re-read `state_revision` before the next fenced command
+  instead of reusing the pre-save value.
+
+Writer exclusion is published, not hoped for. Every read reports `editable`,
+`edit_blocked_reason`, and a bounded, diagnostic-only `edit_blocked_detail`
+from the same classifier the command uses, and a write refused by it is
+`target_ineligible` with the same reason on its `result`. Reasons, in the order
+they are checked:
+
+| reason | refused while |
+|---|---|
+| `change_active` | the change — for a worktree, the change that owns it — is in an active status (`preparing`, `applying`, `accepting`, `rejecting`, `archiving`, `resolving`) |
+| `change_admitted` | it is admitted: queue intent `queued`, or display status `queued` or `blocked` — the scheduler may dispatch it at any moment, so a save would race the agent's first write |
+| `managed_process_live` | the owner's managed writer coverage for the root is not `Clear` |
+| `root_busy` | the repository root guard is held, a base merge is in progress, or a resolve is running |
+
+Through the main worktree's ID, a path inside `openspec/changes/<id>/` of a
+tracked change is judged by that change's own status, exactly as the change
+scope is, so the project root is not a way around `change_active` or
+`change_admitted`.
+
+`managed_process_live` has two meanings, and `edit_blocked_detail` tells them
+apart: *a managed writer is bound here* (a run-scoped command, an unscoped
+shell, or a configured `worktree_command` session runs in this directory, in
+one below it, or in one above it such as the project root), or *the owner
+cannot prove that none is* (an identity it never proved quiescent, a writer
+whose working directory could not be canonicalized, or no coverage source at
+all). A previous run's processes that were never proven quiescent keep their
+root blocked until existing lifecycle paths prove them quiescent; starting a
+new run does not forget them. An owner restart is neither quiescence evidence
+nor an authorized workaround — the coverage of a restarted owner says nothing
+about processes it did not launch. The editor never kills, signals, sweeps, or
+resets anything to make a root editable, and `force_stop_change` keeps its
+exact target and rights.
+
+What the compare-and-swap does **not** promise: the compare and the rename are
+not one atomic step against external writers. An editor or tool outside
+Conflux that writes between them is overwritten, and such external,
+uncooperative editors are not excluded — nothing is locked with `flock`,
+because no external editor honours it. The eligibility snapshot is taken once,
+at the start of a write; a scheduler dispatch or a new writer that appears
+after it and before the rename falls into the same window.
+
+Discover the surface through `capabilities.text_edit` (`available`,
+`read_routes`, `commands`, `max_bytes`, `max_path_bytes`,
+`content_id_algorithm`, `excluded`, `reasons`) and the `text` entry in
+`worktrees.operations`. An owner built before it omits the block, which a
+client decodes as `available: false`; such an owner refuses either command
+type with `validation_failed` before any effect and serves every other route
+and command unchanged. `cflx client` and `cflx client mcp` have no text verb.
+
 The full schema is generated at runtime rather than tracked in the repository.
 Export it with `cflx openapi > openapi.yaml`, or fetch it from a running
 instance at `GET /api/v2/openapi.yaml`; both return the same document.

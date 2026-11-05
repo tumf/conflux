@@ -38,9 +38,11 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/proposals/{change_id}/refresh-preview",
     "/api/v2/changes",
     "/api/v2/changes/{change_id}",
+    "/api/v2/changes/{change_id}/text",
     "/api/v2/logs",
     "/api/v2/worktrees",
     "/api/v2/worktrees/{worktree_id}",
+    "/api/v2/worktrees/{worktree_id}/text",
     "/api/v2/worktree-sessions",
     "/api/v2/worktree-sessions/{session_id}",
     "/api/v2/commands",
@@ -141,6 +143,19 @@ extended — and reads a versioned JSON file holding `schema_version`,
 bounded `evidence` string. It never carries prompts, terminal contents,
 environment dumps, credentials, or unrestricted error bodies.
 
+**Bounded text edit.** `GET /api/v2/changes/{change_id}/text?path=` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=` read one regular UTF-8 file of
+at most 1 MiB under a server-derived root, with a `sha256:` `content_id`. The
+`write_change_text` and `write_worktree_text` commands replace or create one
+only while `expected` still holds (`content` identity or `absent`), through a
+same-directory temporary file and rename that keeps the permission bits; a
+stale expectation is `text_stale` with the current identity on the record.
+`.git`, top-level `.wt/` and `.conflux-inflight`, nested repositories,
+symlinks, and executable files are `text_not_editable`. Writer exclusion
+(`change_active`, `change_admitted`, `managed_process_live`, `root_busy`) is
+published on every read as `editable` and enforced as `target_ineligible`.
+External editors are not excluded, and a save never commits, stages, or pushes.
+
 **Worktree safety.** Worktrees are addressed only by the opaque process-local
 `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
 server-derived and are rejected as mutation input, so no client can steer where a
@@ -188,9 +203,11 @@ expanded command, environment values, or absolute paths. Session state events
         crate::web::remote_control_api::proposal_refresh::preview,
         crate::web::remote_control_api::reads::list_changes,
         crate::web::remote_control_api::reads::get_change,
+        crate::web::remote_control_api::text_edit::read_change_text,
         crate::web::remote_control_api::reads::logs,
         crate::web::remote_control_api::reads::list_worktrees,
         crate::web::remote_control_api::reads::get_worktree,
+        crate::web::remote_control_api::text_edit::read_worktree_text,
         crate::web::remote_control_api::worktree_sessions::list_sessions,
         crate::web::remote_control_api::worktree_sessions::get_session,
         crate::web::remote_control_api::commands::submit_command,
@@ -242,6 +259,18 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::RefreshEffects,
             crate::web::remote_control_api::dto::RefreshPreviewResponse,
             crate::web::remote_control_api::dto::RefreshProposalResult,
+            // Bounded remote text edit: two reads, two fenced commands, and a
+            // result that says what the filesystem actually holds.
+            crate::web::remote_control_api::dto::TextEditBlockedReason,
+            crate::web::remote_control_api::dto::TextEditCapability,
+            crate::web::remote_control_api::dto::TextEditLimits,
+            crate::web::remote_control_api::dto::TextExpectation,
+            crate::web::remote_control_api::dto::TextReadResponse,
+            crate::web::remote_control_api::dto::TextScope,
+            crate::web::remote_control_api::dto::TextWriteEffects,
+            crate::web::remote_control_api::dto::TextWriteOutcome,
+            crate::web::remote_control_api::dto::TextWriteParams,
+            crate::web::remote_control_api::dto::TextWriteResult,
             crate::web::remote_control_api::dto::ProposalSubscriptionRequest,
             crate::web::remote_control_api::dto::ProposalSubscriptionResponse,
             crate::web::remote_control_api::dto::OwnerExecutionContract,
