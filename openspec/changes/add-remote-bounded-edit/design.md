@@ -223,12 +223,16 @@ sources, and every source is required — the ledger does not know how to say
    `execute_streaming` and the `run_command_scope == None` branch of
    `execute_streaming_with_retry`, which is also the configured
    `worktree_command` session's path — take a `WriterLease { cwd }` from the
-   ledger immediately before `Command::spawn` and release it only at the
-   point where the child's exit status is reaped (the streaming task's wait,
-   or `ManagedChild::wait`). A lease whose reap never happens — a dropped
-   handle, a failed wait — stays in the ledger as `Unknown` with the lease's
-   own detail; it is never dropped on a timer. A spawn that fails returns the
-   lease on the error path before the error is reported.
+   ledger immediately before `Command::spawn`. A running lease with a known
+   cwd is `Busy` for its bound root, not globally `Unknown` merely because
+   the child has not exited. Release requires both a reaped direct child
+   (the streaming task's wait or `ManagedChild::wait`) and positive proof of
+   quiescence of its managed process group/retained descendants using the
+   existing identity semantics. Reaping a shell alone is not proof that its
+   writers exited. If that proof is unavailable, or a handle is dropped or
+   wait fails, retain the lease as `Unknown` with bounded detail; no timer
+   expires it. A spawn that fails returns the lease on the error path before
+   the error is reported.
 3. **The owner's own working directory.** `OwnerCwd` entries are spawns with
    no `cwd`, which run in the process's working directory. The ledger
    canonicalizes `std::env::current_dir()` once at creation; an `OwnerCwd`
@@ -238,7 +242,8 @@ sources, and every source is required — the ledger does not know how to say
 Decision for a root `R` (canonical, as the scope root already is):
 
 - `Unknown` if the ledger has any entry whose `cwd` is `Unknown`, or any
-  unreaped lease, or if no ledger is attached to the port at all (an owner
+  lease whose completion/group quiescence is unresolved (not an ordinary
+  running lease with known cwd), or if no ledger is attached to the port at all (an owner
   wired without one answers `Unknown` for every root, never `Clear`);
 - else `Busy` if any entry's canonical `cwd` satisfies `cwd.starts_with(R)`
   (component-wise `Path::starts_with`, so `/w/alpha2` is not under
@@ -278,8 +283,10 @@ ledger and whatever processes outlived it are outside its coverage by
 definition); no sweep or reset of retained entries to make a root editable;
 no SIGTERM or SIGKILL sent to anything to clear coverage; no change to what
 `force_stop_change` may signal. An operator facing `Unknown` resolves it
-through the existing paths — the retained-identity escalation on shutdown, or
-restarting the owner — not through the editor.
+only through positive quiescence evidence from existing lifecycle paths,
+not through the editor. Owner restart is neither a safety proof nor an
+authorized remedy: this extension does not stop or restart owners, and
+process-local coverage after a restart does not certify surviving writers.
 
 `WorktreeService` gains `pub fn root_guard_is_held(&self) -> bool`
 (a `try_lock` probe released immediately). The read response publishes
@@ -565,7 +572,10 @@ linked worktree). Required cases:
   child is alive the ledger answers `Busy` for `wt` and `Clear` for a sibling
   directory; the test terminates the child and, after the reap is observed
   through the handle, the ledger answers `Clear`. Liveness is proven by the
-  reap event, not by elapsed time; a generous timeout is the hang guard only.
+  reap plus confirmed group-quiescence evidence, not by elapsed time; a
+  generous timeout is the hang guard only. A shell that exits while a managed
+  descendant remains alive MUST retain coverage and refuse the write, until
+  positive quiescence is observed; unavailable proof stays `Unknown`.
 - `remote_text_edit_session_owned_writer_blocks_target`: a ledger entry with
   `change_id: None` and `operation: None` bound to the worktree path (the
   session shape) refuses the worktree row and the owning change's worktree

@@ -48,16 +48,21 @@ installed, retained until each of its identities is proven quiescent and
 never dropped because a later run replaced it, a shutdown took it, or a
 quiescence budget expired; every spawn that bypasses the scope, including
 the shell command path and the configured worktree session, held as a lease
-from before the spawn until the child's exit is reaped; and spawns with no
+from before spawn until both direct-child reap and managed process-group /
+retained-descendant quiescence are positively confirmed (shell exit alone
+MUST NOT release coverage); and spawns with no
 working directory, bound to the owner's own canonical working directory.
 Each writer's working directory MUST be canonicalized at registration and
 compared to the canonical root by component-wise path containment, so a
 symlink alias binds the real path and a sibling whose name shares a prefix
-is not bound. A failed canonicalization, an unreaped lease, or an owner with
+is not bound. A failed canonicalization, an unresolved completion/quiescence lease, or an owner with
 no ledger attached MUST be `Unknown`; the absence of a current scope, of a
 termination port, or of a ledger MUST NOT be read as `Clear`. `Clear` MUST be
 provable by an owner — a headless `cflx run` included — whose ledger exists
-and is empty. The coverage MUST be read once, as part of the eligibility
+and is empty. A running lease with known cwd MUST be `Busy` for the bound
+root and MUST NOT block unrelated siblings as `Unknown` solely because the
+child has not exited. Owner restart MUST NOT be presented as quiescence
+evidence or performed to bypass an unknown result. The coverage MUST be read once, as part of the eligibility
 snapshot at the start of a write, and the contract MUST state that a writer
 admitted after that snapshot and before the rename is in the same window as
 an external writer. Reaching `Clear` MUST NOT kill, sweep, or reset any
@@ -154,9 +159,10 @@ gain no verb.
 #### Scenario: Unscoped and session writers are covered
 
 - **GIVEN** a child spawned through the shell command path or through the configured worktree session with `alpha`'s worktree as its working directory and no change ID
-- **WHEN** a client reads a file in `alpha`'s worktree while the child is alive, and again after its exit was reaped
+- **WHEN** a client reads a file in `alpha`'s worktree while the child is alive, and again after direct-child reap and confirmed process-group quiescence
 - **THEN** the first read reports `editable: false` with `managed_process_live` and a sibling directory is `Clear`
 - **AND** the second read reports `editable: true`
+- **AND** shell exit with a surviving managed descendant does not clear coverage or allow a write
 
 #### Scenario: Canonical containment decides a binding
 

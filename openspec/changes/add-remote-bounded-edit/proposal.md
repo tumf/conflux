@@ -154,7 +154,7 @@ OpenAPI document publishes the two routes, two command variants, the
    including one that carries no change ID, one from a previous run whose
    identities were never proven quiescent, and one spawned through the shell
    or configured-session path — or `Unknown` — no ledger attached, an
-   unreaped lease, or a `cwd` that could not be canonicalized — and any
+   lease with unresolved completion or descendant quiescence, or a `cwd` that could not be canonicalized — and any
    target while the root guard is held, a base merge is in progress, or a
    resolve is running, refuse with `target_ineligible` and a stable reason
    (`change_active`, `change_admitted`, `managed_process_live`, `root_busy`),
