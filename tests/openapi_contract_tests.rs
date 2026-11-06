@@ -3606,3 +3606,79 @@ fn remote_contract_gap_contract_old_owner_payloads_decode() {
     .expect("an older preview decodes");
     assert!(!preview.is_detached, "absent decodes as attached");
 }
+
+// ============================================================================
+// Session stop during a retry delay: one more notice kind, nothing else
+// ============================================================================
+
+/// The generated notice description names the refusal kind and its detail.
+#[test]
+fn session_retry_stop_contract_documents_the_refusal_kind() {
+    let doc = generated();
+    let notice = &schemas(&doc)["SessionRunnerNotice"]["properties"];
+    let kind = notice["kind"]["description"].as_str().unwrap_or_default();
+    assert!(
+        kind.contains("stop_refused_attempt"),
+        "SessionRunnerNotice.kind must document stop_refused_attempt: {kind}"
+    );
+    for existing in ["retry_scheduled", "shutdown_refused"] {
+        assert!(
+            kind.contains(existing),
+            "{existing} is still documented: {kind}"
+        );
+    }
+    let detail = notice["detail"]["description"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("stage=retry"),
+        "SessionRunnerNotice.detail documents the refusal stage: {detail}"
+    );
+    assert_eq!(
+        notice["kind"]["type"], "string",
+        "kind stays a free string, not an enum"
+    );
+}
+
+/// A session resource in the shape an owner built at `f64f34d7b` serializes
+/// decodes unchanged and re-serializes to the same value: no member was added
+/// or moved, only a documented notice kind.
+#[test]
+fn session_retry_stop_contract_old_owner_session_decodes() {
+    use conflux::web::remote_control_api::dto::WorktreeSessionResource;
+
+    let published = json!({
+        "session_id": "a".repeat(32),
+        "instance_id": "instance-1",
+        "kind": "existing",
+        "worktree_id": "b".repeat(32),
+        "path": "../ws/alpha",
+        "branch": "alpha",
+        "state": "stopped",
+        "attempt": 2,
+        "started_at": "2026-11-05T00:00:00Z",
+        "finished_at": "2026-11-05T00:00:05Z",
+        "exit_code": null,
+        "signal": "SIGTERM",
+        "stop_requested": true,
+        "setup": null,
+        "cleanup": null,
+        "output": {
+            "lines": [{"stream": "stdout", "text": "first"}],
+            "retained_bytes": 5,
+            "truncated_bytes": 0
+        },
+        "runner_notices": [{
+            "kind": "retry_scheduled",
+            "attempt": 2,
+            "detail": "cause=crash, max_attempts=3, delay_ms=60000"
+        }],
+        "runner_notices_dropped": 0
+    });
+    let session: WorktreeSessionResource =
+        serde_json::from_value(published.clone()).expect("an f64f34d7b session decodes");
+    assert_eq!(session.attempt, 2);
+    assert_eq!(
+        serde_json::to_value(&session).unwrap(),
+        published,
+        "nothing else moved"
+    );
+}

@@ -313,9 +313,14 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
   show up as `attempt`; they never create a second session. `attempt` starts at
   `1` and moves only when the runner reports, on its own typed channel, that a
   later attempt was actually spawned; a retry merely scheduled (a
-  `retry_scheduled` notice) is not counted. The runner observes a stop at its
-  next check, so a stop that arrives during a retry delay is honoured right
-  after the scheduled attempt spawns, and `attempt` then counts that spawn.
+  `retry_scheduled` notice) is not counted. A stop received while no attempt
+  runs — before or during a retry delay, during the stagger wait, or at spawn
+  admission — refuses the next attempt: nothing further is spawned, a
+  `stop_refused_attempt` notice is recorded, and `attempt` stays at the last
+  attempt that actually started. The one remaining window is a stop that lands
+  after spawn admission let an attempt through: that attempt has already been
+  spawned, so it is terminated like any running attempt and `attempt` counts
+  it.
 - **Single flight.** An exact replay of an idempotency key returns the original
   record and launches nothing. A new request for a worktree whose session is
   still running is `worktree_session_busy` with `reason=worktree_busy`. At most
@@ -334,7 +339,13 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
   result's `session_kind` is `existing` or `session`.
 - **Stop.** `stop_worktree_session` cancels through the runner's own handle:
   SIGTERM to the session's process group, SIGKILL after 5 seconds, verified
-  group cleanup, and no further attempt even with retries configured. The
+  group cleanup, and no further attempt even with retries configured. A stop
+  that finds no attempt running (a retry delay, the stagger wait, or spawn
+  admission) signals nothing and spawns nothing: it records
+  `stop_refused_attempt` with `stage=retry`, `stage=stagger`, or `stage=spawn`,
+  and `exit_code`/`signal` stay those of the attempt that last ran (`null` when
+  none ever did). `result.terminated` then reflects that last attempt's
+  process-group cleanup. The
   record settles only after the leader is reaped and the cleanup report is read,
   with `result.terminated` and `result.state_after`; a session that had already
   finished settles `no_op`. Descendants that left the process group (`setsid`,
@@ -364,12 +375,16 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
   32 (`capabilities.worktree_sessions.max_runner_notices`; the excess is counted
   in `runner_notices_dropped`), what the runner itself observed:
   `retry_scheduled` (with the attempt scheduled next), `inactivity_terminated`,
-  `runtime_limit_reached`, `launch_failed`, `shutdown_refused`, and
-  `process_group_cleanup_unconfirmed`. Each has `kind`, `attempt`, and a
-  `detail` of numbers and fixed tokens only — never the template, the expanded
-  command, environment values, or a path. The text the TUI terminal, the
-  parallel executor, and shell commands print for the same events (`[Retry
-  N/M] ...`) is unchanged; only sessions read the typed channel.
+  `runtime_limit_reached`, `launch_failed`, `shutdown_refused`,
+  `process_group_cleanup_unconfirmed`, and `stop_refused_attempt` (with the
+  refused attempt and `stage=retry|stagger|spawn`). Each has `kind`, `attempt`,
+  and a `detail` of numbers and fixed tokens only — never the template, the
+  expanded command, environment values, or a path. The text the TUI terminal,
+  the parallel executor, and shell commands print for the same events (`[Retry
+  N/M] ...`) is unchanged; only sessions read the typed channel. Refusing the
+  next attempt on a stop is likewise a session-only policy: those text
+  consumers keep their existing stop timing, where a stop received during a
+  retry delay cancels the next attempt after it spawns.
 - **`signal` is observed, not requested.** For a stopped or runtime-limited
   session, `signal` and `exit_code` come from the leader as it was reaped:
   `SIGTERM` when the command honoured it, `SIGKILL` when it ignored SIGTERM and

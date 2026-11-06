@@ -203,7 +203,10 @@ retries inside one session (`attempt`, counted from the runner's typed
 report of each successful spawn), an exact idempotent replay launches
 nothing, and a second request for a running worktree or a fifth concurrent
 session is `worktree_session_busy`. `stop_worktree_session` cancels through the
-runner's own path and settles after the reap. `GET /api/v2/worktree-sessions`
+runner's own path and settles after the reap; a stop that arrives while no
+attempt runs — during a retry delay, the stagger wait, or at spawn admission —
+spawns nothing further and is recorded as the `stop_refused_attempt` notice,
+leaving `attempt` at the last one started. `GET /api/v2/worktree-sessions`
 publishes each session with a bounded output tail: that tail is only the
 command's own stdout/stderr with control sequences stripped, **not redacted**,
 readable by every authenticated client. The runner's own retry, launch-failure,

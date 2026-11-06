@@ -548,7 +548,12 @@ any of it.
   template, outside Git, or during owner shutdown, launches are
   `worktree_session_unavailable`.
 - Stop goes through `StreamingChildHandle::terminate` (SIGTERM, SIGKILL after
-  5 s, verified cleanup, no further attempt) and settles after the reap. Never
+  5 s, verified cleanup, no further attempt) and settles after the reap. A stop
+  received while no attempt runs — a retry delay, the stagger wait, or spawn
+  admission — spawns nothing further and records `stop_refused_attempt`
+  (`stage=retry|stagger|spawn`); `attempt` stays at the last one started and
+  `terminated` reflects that attempt's group cleanup. Only a stop landing after
+  admission let an attempt spawn terminates that attempt instead. Never
   `killpg` a session yourself: the retry policy reads that as a crash and
   relaunches. Descendants that left the process group (`setsid`, daemonization)
   are outside the guarantee. Owner shutdown closes the registry's own
@@ -570,7 +575,11 @@ any of it.
   cleanup facts arrive on a typed channel as `runner_notices` (`kind`,
   `attempt`, `detail`; at most 32, overflow in `runner_notices_dropped`), so a
   child printing `[Retry N/M]` or a fake `pgid=` line changes no typed member.
-  The TUI terminal and every other text consumer still print `[Retry N/M]`.
+  Kinds: `retry_scheduled`, `inactivity_terminated`, `runtime_limit_reached`,
+  `launch_failed`, `shutdown_refused`, `process_group_cleanup_unconfirmed`,
+  and `stop_refused_attempt`. The TUI terminal and every other text consumer
+  still print `[Retry N/M]` and keep their existing stop timing (a stop during
+  a retry delay cancels the next attempt after it spawns).
 - `signal`/`exit_code` of a stopped or runtime-limited session are the leader's
   as reaped — `SIGTERM`, or `SIGKILL` after the 5 s escalation — and both are
   `null` when the leader was not reaped. An older owner omits `runner_notices`
