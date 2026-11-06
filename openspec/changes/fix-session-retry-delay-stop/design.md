@@ -188,7 +188,7 @@ Checkpoints, all `RefuseBeforeSpawn`-only:
 
 | site | today | after |
 |---|---|---|
-| (a) before `RetryScheduled` in the inactivity branch (`:2666`) and the crash branch (`:2735`) | `is_shutdown` only | `is_shutdown` **and** `cancel_check(..) == Proceed`; a `Refuse` publishes `StopRefusedAttempt { next_attempt: attempt + 1, stage: "retry" }` with no `RetryScheduled` and settles |
+| (a) immediately after the existing `terminate()` / 100 ms grace / `force_kill()` sequence and before `RetryScheduled` in both retry branches | scope shutdown is checked at the existing branch predicate | preserve the existing scope predicate and cleanup sequence, then run `cancel_check(..)` after `force_kill()`; a `Refuse` publishes `StopRefusedAttempt { next_attempt: attempt + 1, stage: "retry" }` with no `RetryScheduled` and settles. Never skip the previous group's cleanup because cancellation is ready |
 | (b) `sleep(retry_delay_ms)` at `:2704` and `:2772` | unconditional | `race_with_cancel(sleep, ..)`; `Refuse` → `StopRefusedAttempt { next_attempt: attempt + 1, stage: "retry" }` and settle |
 | (c) `wait_for_stagger_slot()` at `:1909` | unconditional | `race_with_cancel(stagger, ..)`; `Refuse` → `StopRefusedAttempt { next_attempt: attempt, stage: "stagger" }` and settle. Dropping the stagger future mid-wait releases the shared lock without claiming the slot, which is correct: no spawn happens |
 | (d) immediately before `admit_spawn` / `cmd.spawn()` (`:1910`) | none | `cancel_check(..)`; `Refuse` → `StopRefusedAttempt { next_attempt: attempt, stage: "spawn" }` and settle |
@@ -377,7 +377,10 @@ Real-process runner tests (heavy, `#[cfg(unix)]`), on a scoped runner through
   assert `StopRefusedAttempt { 2, "stagger" }`, one PID.
 - `session_retry_stop_observed_refuses_spawn_at_held_boundary`: the barrier —
   the test holds the shared stagger lock before launch; attempt 1 is admitted
-  only after the test releases it once, then re-takes it; attempt 1 crashes;
+  only after the test releases it once. Observe `AttemptStarted { 1 }` or
+  the first PID file before re-taking the lock (never race the first spawn
+  for that lock); arrange the first crash behind a fixture barrier so the
+  re-take precedes its exit. Then release the crash barrier; attempt 1 crashes;
   `retry_delay_ms: 0`; the runner blocks on the lock; `terminate()`; release;
   assert `StopRefusedAttempt { 2, "stagger" | "spawn" }` and one PID.
 - `session_retry_stop_observed_running_child_still_escalates`: `trap '' TERM;
@@ -438,7 +441,11 @@ All heavy, real `sh` children through the API, `Options` extended as above:
   lock before attempt 1; stop; release; assert no PID file, `attempt: 1`,
   `state: stopped`, `exit_code: null`, `signal: null`, notices
   `[stop_refused_attempt(1, stage=stagger|spawn)]`, `process_group_confirmed`
-  reflects `not_applicable` as the registry publishes it today.
+  is `true` and `terminated` is `true`: the initial cleanup is
+  `ProcessGroupCleanupReport::not_applicable`, whose `is_confirmed()` accepts
+  `NotApplicable` (`src/process_manager.rs`). This means cancellation settled
+  with no group needing cleanup, not that a process was spawned or killed.
+  Keep `pgid` absent and assert no PID file so that distinction is explicit.
 - `session_retry_stop_running_leader_stop_is_unchanged`: `sleeper` fixture
   with `retries(3)`; stop while running; assert the same facts as
   `remote_worktree_session_stop_kills_the_process_group_and_reaps` plus the
