@@ -703,13 +703,63 @@ enum LeaseState {
     Unresolved { detail: String },
 }
 
+/// What the runner positively knows about a lease's latest spawn.
+///
+/// Only `NotAttempted` and `Failed` prove that the latest spawn created no
+/// writer, and only for a lease that never bound a process group: a retry
+/// whose spawn failed still accounts for the earlier attempt's group. An
+/// attempted spawn whose result was never reported, and a spawn without a
+/// process-group identity, are retained: nothing can prove such a writer
+/// quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnOutcome {
+    /// `Command::spawn` was not called.
+    NotAttempted,
+    /// `Command::spawn` was called and its result was never reported.
+    Attempted,
+    /// `Command::spawn` returned an error: no process exists.
+    Failed,
+    /// A process was spawned; `pgid` is its owned process group, if known.
+    Spawned { pgid: Option<u32> },
+}
+
+impl SpawnOutcome {
+    /// Whether the latest spawn positively created no process.
+    fn created_no_process(self) -> bool {
+        matches!(self, SpawnOutcome::NotAttempted | SpawnOutcome::Failed)
+    }
+
+    /// The typed detail of a retained lease whose writer has no group to probe.
+    fn identityless_detail(self) -> Option<&'static str> {
+        match self {
+            SpawnOutcome::Attempted => {
+                Some("spawn was attempted and its outcome was never reported")
+            }
+            SpawnOutcome::Spawned { pgid: None } => {
+                Some("spawned without a process-group identity")
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LeaseEntry {
     cwd: WriterCwd,
     operation: String,
     /// Process groups this lease's spawn owns.
     pgids: Vec<u32>,
+    /// What is known about the spawn this lease accounts for.
+    spawn: SpawnOutcome,
     state: LeaseState,
+}
+
+impl LeaseEntry {
+    /// Whether this lease positively accounts for no writer: its latest spawn
+    /// created no process and no earlier attempt bound a process group.
+    fn proves_no_writer(&self) -> bool {
+        self.spawn.created_no_process() && self.pgids.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -818,6 +868,7 @@ impl ManagedWriterLedger {
                 cwd,
                 operation: operation.to_string(),
                 pgids: Vec::new(),
+                spawn: SpawnOutcome::NotAttempted,
                 state: LeaseState::Running,
             },
         );
@@ -983,12 +1034,34 @@ pub struct WriterLease {
 }
 
 impl WriterLease {
-    /// Record the process group the spawn now owns.
-    fn bind_pgid(&self, pgid: u32) {
-        if pgid == 0 {
-            return;
-        }
+    /// Record that `Command::spawn` is about to be called.
+    pub(crate) fn mark_attempted(&self) {
+        self.ledger
+            .update_lease(self.id, |entry| entry.spawn = SpawnOutcome::Attempted);
+    }
+
+    /// Record that `Command::spawn` returned an error: no process exists.
+    pub(crate) fn mark_failed(&self) {
         self.ledger.update_lease(self.id, |entry| {
+            if entry.spawn == SpawnOutcome::Attempted {
+                entry.spawn = SpawnOutcome::Failed;
+            }
+        });
+    }
+
+    /// Record the process group the spawn now owns.
+    ///
+    /// `0` is a spawn without a process-group identity: it is recorded as
+    /// spawned, and nothing can ever prove that writer quiescent.
+    pub(crate) fn bind_pgid(&self, pgid: u32) {
+        self.ledger.update_lease(self.id, |entry| {
+            if pgid == 0 {
+                if !matches!(entry.spawn, SpawnOutcome::Spawned { pgid: Some(_) }) {
+                    entry.spawn = SpawnOutcome::Spawned { pgid: None };
+                }
+                return;
+            }
+            entry.spawn = SpawnOutcome::Spawned { pgid: Some(pgid) };
             if !entry.pgids.contains(&pgid) {
                 entry.pgids.push(pgid);
             }
@@ -996,9 +1069,24 @@ impl WriterLease {
     }
 
     /// Nothing was spawned after all: the lease accounts for no writer.
-    pub(crate) fn release_unspawned(mut self) {
-        self.settled = true;
-        self.ledger.remove_lease(self.id);
+    ///
+    /// Honoured only while the outcome proves it (`NotAttempted` or `Failed`,
+    /// with no group ever bound). After an attempted or successful spawn this
+    /// is a no-op that leaves the lease accounting for its writer.
+    pub(crate) fn release_unspawned(self) {
+        if self.proves_no_writer() {
+            let mut lease = self;
+            lease.settled = true;
+            lease.ledger.remove_lease(lease.id);
+        }
+    }
+
+    fn proves_no_writer(&self) -> bool {
+        self.ledger
+            .lock()
+            .leases
+            .get(&self.id)
+            .is_some_and(LeaseEntry::proves_no_writer)
     }
 
     /// Keep accounting for the writer: the caller lost the proof it needed.
@@ -1014,16 +1102,27 @@ impl WriterLease {
     /// positively observed empty, otherwise retain the lease as unresolved.
     fn settle_after_reap(mut self) {
         self.settled = true;
-        let pgids = self
+        let Some((proves_no_writer, spawn, pgids)) = self
             .ledger
             .lock()
             .leases
             .get(&self.id)
-            .map(|entry| entry.pgids.clone())
-            .unwrap_or_default();
-        if pgids.is_empty() {
-            // No group was ever recorded, so no process was ever spawned.
+            .map(|entry| (entry.proves_no_writer(), entry.spawn, entry.pgids.clone()))
+        else {
+            return;
+        };
+        if proves_no_writer {
+            // The runner positively knows no process exists.
             self.ledger.remove_lease(self.id);
+            return;
+        }
+        if let Some(detail) = spawn.identityless_detail() {
+            // A writer may exist and has no group to probe: retain it.
+            self.ledger.update_lease(self.id, |entry| {
+                entry.state = LeaseState::Unresolved {
+                    detail: detail.to_string(),
+                }
+            });
             return;
         }
         if pgids
@@ -1049,12 +1148,27 @@ impl Drop for WriterLease {
             return;
         }
         // A handle dropped or a wait that failed proved nothing about the
-        // writer: keep accounting for it.
-        self.ledger.update_lease(self.id, |entry| {
+        // writer: keep accounting for it, unless the runner positively knows
+        // no process was ever created.
+        let ledger = self.ledger.clone();
+        let id = self.id;
+        let mut release = false;
+        ledger.update_lease(id, |entry| {
+            if entry.proves_no_writer() {
+                release = true;
+                return;
+            }
+            let detail = entry
+                .spawn
+                .identityless_detail()
+                .unwrap_or("the spawn's handle was released without a reap");
             entry.state = LeaseState::Unresolved {
-                detail: "the spawn's handle was released without a reap".to_string(),
+                detail: detail.to_string(),
             }
         });
+        if release {
+            ledger.remove_lease(id);
+        }
     }
 }
 
@@ -1276,6 +1390,120 @@ pub enum OutputLine {
     Stderr(String),
 }
 
+/// Why the retry loop scheduled another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The command exited non-zero and the retry policy admitted another attempt.
+    Crash,
+    /// The inactivity timeout terminated the attempt and its retry budget remains.
+    InactivityTimeout,
+}
+
+/// One fact the retry loop itself observed, as opposed to a line the child wrote.
+///
+/// Published only by [`AiCommandRunner::execute_streaming_with_retry_observed`],
+/// on a channel of its own, so no child output can forge one. The text entry
+/// point formats the same facts as the stderr lines it always emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerNotice {
+    /// Another attempt was scheduled; it starts only after the delay, if admitted.
+    RetryScheduled {
+        next_attempt: u32,
+        /// The configured retry bound for `cause`, as the text form prints it.
+        max_attempts: u32,
+        cause: RetryCause,
+        delay_ms: u64,
+    },
+    /// `attempt` was spawned successfully.
+    AttemptStarted { attempt: u32 },
+    /// The inactivity timeout terminated `attempt`.
+    InactivityTerminated { attempt: u32, timeout_secs: u64 },
+    /// The absolute runtime limit terminated `attempt`.
+    RuntimeLimitReached { attempt: u32 },
+    /// `attempt` could not be launched at `stage`.
+    LaunchFailed { attempt: u32, stage: &'static str },
+    /// Scope shutdown refused the execution at `stage`.
+    ShutdownRefused { stage: &'static str },
+    /// The owned process group could not be proven empty.
+    ProcessGroupCleanupUnconfirmed { pgid: u32, force_killed: bool },
+    /// The leader of `attempt` was reaped with this status.
+    LeaderReaped {
+        attempt: u32,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// The leader of `attempt` was not reaped; its status is unknown.
+    LeaderNotReaped { attempt: u32 },
+}
+
+impl RunnerNotice {
+    /// The reaped notice for one attempt's real wait status.
+    fn reaped(attempt: u32, status: &std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self::LeaderReaped {
+            attempt,
+            exit_code: status.code(),
+            signal,
+        }
+    }
+
+    /// The leader notice for a termination that waited for the leader.
+    fn from_termination(
+        attempt: u32,
+        outcome: &std::io::Result<crate::process_manager::TerminationOutcome>,
+    ) -> Self {
+        use crate::process_manager::TerminationOutcome;
+        match outcome {
+            Ok(TerminationOutcome::Exited(status))
+            | Ok(TerminationOutcome::ForceKilled(status)) => Self::reaped(attempt, status),
+            Ok(TerminationOutcome::TimedOut) | Err(_) => Self::LeaderNotReaped { attempt },
+        }
+    }
+}
+
+/// Where the retry loop's own notices go.
+#[derive(Clone)]
+enum NoticeSink {
+    /// The existing stderr lines on the output channel, byte for byte.
+    Text,
+    /// Typed notices on their own channel; nothing runner-generated reaches output.
+    Typed(mpsc::UnboundedSender<RunnerNotice>),
+}
+
+impl NoticeSink {
+    /// Publish `notice`; in text mode, `text` is the line that carries it.
+    async fn emit(
+        &self,
+        out_tx: &mpsc::Sender<OutputLine>,
+        notice: RunnerNotice,
+        text: Option<String>,
+    ) {
+        match self {
+            Self::Text => {
+                if let Some(text) = text {
+                    let _ = out_tx.send(OutputLine::Stderr(text)).await;
+                }
+            }
+            Self::Typed(tx) => {
+                let _ = tx.send(notice);
+            }
+        }
+    }
+
+    /// A line with no typed equivalent: emitted in text mode only.
+    async fn text_only(&self, out_tx: &mpsc::Sender<OutputLine>, text: String) {
+        if matches!(self, Self::Text) {
+            let _ = out_tx.send(OutputLine::Stderr(text)).await;
+        }
+    }
+}
+
 /// Common AI command runner with shared stagger state.
 ///
 /// This runner wraps CommandQueue and provides streaming execution
@@ -1460,6 +1688,56 @@ impl AiCommandRunner {
         operation_type: Option<&str>,
         change_id: Option<&str>,
     ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
+        self.execute_streaming_with_retry_sink(
+            command,
+            cwd,
+            operation_type,
+            change_id,
+            NoticeSink::Text,
+        )
+        .await
+    }
+
+    /// [`Self::execute_streaming_with_retry`] with the runner's own notices on
+    /// a typed channel.
+    ///
+    /// The output receiver carries only what the child wrote; every retry,
+    /// launch-failure, shutdown, limit, cleanup, and leader-reap fact is a
+    /// [`RunnerNotice`] on the third receiver instead. The notice channel
+    /// closes when the runner task ends, after the last notice. Behaviour is
+    /// otherwise identical, retry policy and escalation included.
+    pub async fn execute_streaming_with_retry_observed(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        mpsc::UnboundedReceiver<RunnerNotice>,
+    )> {
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let (handle, out_rx) = self
+            .execute_streaming_with_retry_sink(
+                command,
+                cwd,
+                operation_type,
+                change_id,
+                NoticeSink::Typed(notice_tx),
+            )
+            .await?;
+        Ok((handle, out_rx, notice_rx))
+    }
+
+    async fn execute_streaming_with_retry_sink(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
+        sink: NoticeSink,
+    ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
         // Admission is reserved before anything is launched. A scope that is
         // already closing refuses the execution outright, so a command that
         // raced shutdown never reaches stagger, retry, or `Command::spawn`.
@@ -1471,6 +1749,7 @@ impl AiCommandRunner {
                         "run command admission is closed",
                         operation_type,
                         change_id,
+                        &sink,
                     ));
                 }
             },
@@ -1578,14 +1857,17 @@ impl AiCommandRunner {
                 // attempt, so the counter never advances after closure.
                 if let Some(execution) = &scope_execution {
                     if execution.is_shutdown() {
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::ShutdownRefused { stage: "retry" },
+                            Some(shutdown_refusal_line(
                                 "retry",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt + 1,
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                     execution.mark_waiting_to_spawn();
@@ -1627,23 +1909,46 @@ impl AiCommandRunner {
                 command_queue.wait_for_stagger_slot().await;
                 let spawned = match &scope_execution {
                     Some(execution) => execution.admit_spawn(|| cmd.spawn()),
-                    None => Some(cmd.spawn()),
+                    None => {
+                        // Marked immediately before the call, so a task that
+                        // dies between spawn and its report keeps the lease.
+                        if let Some(lease) = &writer_lease {
+                            lease.mark_attempted();
+                        }
+                        let spawned = cmd.spawn();
+                        if let Some(lease) = &writer_lease {
+                            match &spawned {
+                                Ok(child) => lease.bind_pgid(child.id().unwrap_or(0)),
+                                Err(_) => lease.mark_failed(),
+                            }
+                        }
+                        Some(spawned)
+                    }
                 };
                 let child = match spawned {
                     None => {
                         // Admission closed between registration and spawn: the
                         // command body never runs.
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::ShutdownRefused { stage: "spawn" },
+                            Some(shutdown_refusal_line(
                                 "spawn",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
-                    Some(Ok(c)) => c,
+                    Some(Ok(c)) => {
+                        // Published only once the process exists, so a retry
+                        // that was scheduled but never spawned is not counted.
+                        sink.emit(&out_tx, RunnerNotice::AttemptStarted { attempt }, None)
+                            .await;
+                        c
+                    }
                     Some(Err(e)) => {
                         error!(
                             op = ?operation_type_owned,
@@ -1658,15 +1963,21 @@ impl AiCommandRunner {
                         // launch failure into Apply history, the Acceptance
                         // command diagnostic, and the cleanup-review diagnosis
                         // instead of leaving them with a bare exit code.
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(launch_failure_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::LaunchFailed {
+                                attempt,
+                                stage: "spawn",
+                            },
+                            Some(launch_failure_line(
                                 "spawn",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
                                 &e.to_string(),
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                 };
@@ -1680,15 +1991,21 @@ impl AiCommandRunner {
                             "Failed to wrap child in ManagedChild: {}",
                             e
                         );
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(launch_failure_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::LaunchFailed {
+                                attempt,
+                                stage: "process-manager",
+                            },
+                            Some(launch_failure_line(
                                 "process-manager",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
                                 &e.to_string(),
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                 };
@@ -1696,9 +2013,6 @@ impl AiCommandRunner {
                 // Publish the real PID so StreamingChildHandle.id() is accurate.
                 let pid = managed_child.id().unwrap_or(0);
                 pid_arc.store(pid, Ordering::SeqCst);
-                if let Some(lease) = &writer_lease {
-                    lease.bind_pgid(pid);
-                }
 
                 // The absolute deadline starts here — at successful child spawn
                 // — not at admission, stagger, or retry-delay time, so queueing
@@ -1805,15 +2119,22 @@ impl AiCommandRunner {
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -1856,9 +2177,15 @@ impl AiCommandRunner {
                                     if let Some(execution) = &scope_execution {
                                         execution.mark_cleaning();
                                     }
-                                    let _ = managed_child
+                                    let outcome = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    sink.emit(
+                                        &out_tx,
+                                        RunnerNotice::from_termination(attempt, &outcome),
+                                        None,
+                                    )
+                                    .await;
                                     // Reaping the leader is not proof that the
                                     // group is empty: verify quiescence before
                                     // the caller may touch the worktree.
@@ -1868,6 +2195,7 @@ impl AiCommandRunner {
                                         operation_type_owned.as_deref(),
                                         change_id_owned.as_deref(),
                                         &out_tx,
+                                        &sink,
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
@@ -1904,26 +2232,36 @@ impl AiCommandRunner {
                                      (pid={}, limit={}s)",
                                     pid, max_runtime_secs
                                 );
-                                let _ = out_tx
-                                    .send(OutputLine::Stderr(runtime_limit_line(
-                                        max_runtime_secs,
-                                        operation_type_owned.as_deref(),
-                                        change_id_owned.as_deref(),
-                                        pid,
-                                    )))
-                                    .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::RuntimeLimitReached { attempt },
+                                    Some(runtime_limit_line(
+                                    max_runtime_secs,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    pid,
+                                    )),
+                                )
+                                .await;
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -2001,7 +2339,15 @@ impl AiCommandRunner {
                                     pid,
                                     last_activity_age_secs,
                                 );
-                                let _ = out_tx.send(OutputLine::Stderr(timeout_msg)).await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::InactivityTerminated {
+                                        attempt,
+                                        timeout_secs: inactivity_timeout_secs,
+                                    },
+                                    Some(timeout_msg),
+                                )
+                                .await;
 
                                 tokio::time::sleep(Duration::from_secs(kill_grace_secs)).await;
                                 if managed_child.id().is_some() {
@@ -2094,15 +2440,22 @@ impl AiCommandRunner {
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -2141,15 +2494,22 @@ impl AiCommandRunner {
                                     if let Some(execution) = &scope_execution {
                                         execution.mark_cleaning();
                                     }
-                                    let _ = managed_child
+                                    let outcome = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    sink.emit(
+                                        &out_tx,
+                                        RunnerNotice::from_termination(attempt, &outcome),
+                                        None,
+                                    )
+                                    .await;
                                     let report = verify_owned_process_group(
                                         pid,
                                         cleanup_timeout_ms,
                                         operation_type_owned.as_deref(),
                                         change_id_owned.as_deref(),
                                         &out_tx,
+                                        &sink,
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
@@ -2184,26 +2544,36 @@ impl AiCommandRunner {
                                      (pid={}, limit={}s)",
                                     pid, max_runtime_secs
                                 );
-                                let _ = out_tx
-                                    .send(OutputLine::Stderr(runtime_limit_line(
-                                        max_runtime_secs,
-                                        operation_type_owned.as_deref(),
-                                        change_id_owned.as_deref(),
-                                        pid,
-                                    )))
-                                    .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::RuntimeLimitReached { attempt },
+                                    Some(runtime_limit_line(
+                                    max_runtime_secs,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    pid,
+                                    )),
+                                )
+                                .await;
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -2247,9 +2617,13 @@ impl AiCommandRunner {
                             change_id = ?change_id_owned,
                             "Failed to wait for child process: {}", e
                         );
+                        sink.emit(&out_tx, RunnerNotice::LeaderNotReaped { attempt }, None)
+                            .await;
                         break 'retry;
                     }
                 };
+                sink.emit(&out_tx, RunnerNotice::reaped(attempt, &status), None)
+                    .await;
 
                 pid_arc.store(0, Ordering::SeqCst);
                 if let Some(execution) = &scope_execution {
@@ -2266,6 +2640,7 @@ impl AiCommandRunner {
                         operation_type_owned.as_deref(),
                         change_id_owned.as_deref(),
                         &out_tx,
+                        &sink,
                     )
                     .await
                 } else {
@@ -2315,7 +2690,17 @@ impl AiCommandRunner {
                             operation_type_owned.as_deref().unwrap_or("unknown"),
                             change_id_owned.as_deref().unwrap_or("none"),
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(retry_msg)).await;
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::RetryScheduled {
+                                next_attempt: attempt + 1,
+                                max_attempts: inactivity_timeout_max_retries,
+                                cause: RetryCause::InactivityTimeout,
+                                delay_ms: retry_delay_ms,
+                            },
+                            Some(retry_msg),
+                        )
+                        .await;
                         tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
                         continue 'retry;
                     }
@@ -2329,7 +2714,7 @@ impl AiCommandRunner {
                             operation_type_owned.as_deref().unwrap_or("unknown"),
                             change_id_owned.as_deref().unwrap_or("none"),
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(exhausted_msg)).await;
+                        sink.text_only(&out_tx, exhausted_msg).await;
                     }
 
                     // Do not fall through to the crash/pattern retry check.
@@ -2373,7 +2758,17 @@ impl AiCommandRunner {
                             "[Retry {}/{}] Command crashed, retrying in {}ms...",
                             attempt, max_retries, retry_delay_ms
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(retry_msg)).await;
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::RetryScheduled {
+                                next_attempt: attempt + 1,
+                                max_attempts: max_retries,
+                                cause: RetryCause::Crash,
+                                delay_ms: retry_delay_ms,
+                            },
+                            Some(retry_msg),
+                        )
+                        .await;
                         tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
                         continue 'retry;
                     }
@@ -2452,9 +2847,14 @@ impl AiCommandRunner {
             .effective_writer_ledger()
             .map(|ledger| ledger.take_lease("shell", cwd));
 
+        let attempted = lease.as_ref();
         let spawned = self
             .command_queue
             .execute_with_stagger(move || {
+                // The closure runs immediately before `Command::spawn`.
+                if let Some(lease) = attempted {
+                    lease.mark_attempted();
+                }
                 let mut cmd = Command::new("sh");
                 cmd.arg("-c")
                     .arg(command)
@@ -2477,6 +2877,7 @@ impl AiCommandRunner {
                 // Nothing was launched, so the lease goes back before the error
                 // is reported.
                 if let Some(lease) = lease {
+                    lease.mark_failed();
                     lease.release_unspawned();
                 }
                 return Err(error);
@@ -2491,7 +2892,8 @@ impl AiCommandRunner {
                 Some(lease)
             }
             None => {
-                lease.retain_unresolved("the spawned shell reported no process id");
+                lease.bind_pgid(0);
+                lease.retain_unresolved("spawned without a process-group identity");
                 None
             }
         });
@@ -2610,6 +3012,7 @@ fn refused_after_shutdown(
     reason: &str,
     operation_type: Option<&str>,
     change_id: Option<&str>,
+    sink: &NoticeSink,
 ) -> (StreamingChildHandle, mpsc::Receiver<OutputLine>) {
     let (out_tx, out_rx) = mpsc::channel::<OutputLine>(1);
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2617,12 +3020,19 @@ fn refused_after_shutdown(
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
     let (termination_tx, termination_rx) = tokio::sync::oneshot::channel::<CommandTermination>();
 
-    let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
-        "admission",
-        operation_type,
-        change_id,
-        1,
-    )));
+    match sink {
+        NoticeSink::Text => {
+            let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
+                "admission",
+                operation_type,
+                change_id,
+                1,
+            )));
+        }
+        NoticeSink::Typed(tx) => {
+            let _ = tx.send(RunnerNotice::ShutdownRefused { stage: "admission" });
+        }
+    }
     let _ = cleanup_tx.send(ProcessGroupCleanupReport::not_applicable(reason));
     let _ = termination_tx.send(CommandTermination::NotStarted);
     let _ = status_tx.send(make_fail_status());
@@ -2700,6 +3110,7 @@ async fn verify_owned_process_group(
     op: Option<&str>,
     change_id: Option<&str>,
     out_tx: &mpsc::Sender<OutputLine>,
+    sink: &NoticeSink,
 ) -> ProcessGroupCleanupReport {
     if pid == 0 {
         return ProcessGroupCleanupReport::not_applicable(
@@ -2717,7 +3128,15 @@ async fn verify_owned_process_group(
     .await;
 
     if !report.is_confirmed() {
-        let _ = out_tx.send(OutputLine::Stderr(report.diagnostics())).await;
+        sink.emit(
+            out_tx,
+            RunnerNotice::ProcessGroupCleanupUnconfirmed {
+                pgid: report.pgid().unwrap_or(pid),
+                force_killed: report.force_killed(),
+            },
+            Some(report.diagnostics()),
+        )
+        .await;
     }
 
     report
@@ -4468,7 +4887,9 @@ mod writer_coverage_tests {
     fn remote_text_edit_dropped_lease_stays_unresolved_without_a_timer() {
         let dirs = dirs();
         let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
-        drop(ledger.take_lease("shell", Some(&dirs.wt)));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        drop(lease);
         for _ in 0..3 {
             assert!(matches!(
                 ledger.coverage_under(&dirs.sibling),
@@ -4499,5 +4920,180 @@ mod writer_coverage_tests {
 
         retained.release_proven(4_000_000);
         assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+    fn unknown_detail(ledger: &ManagedWriterLedger, root: &Path) -> String {
+        match ledger.coverage_under(root) {
+            WriterCoverage::Unknown { detail } => detail,
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_not_attempted_lease_releases_on_drop() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt),
+            WriterCoverage::Busy { .. }
+        ));
+        drop(lease);
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_attempted_lease_stays_unknown() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        drop(lease);
+        let detail = "spawn was attempted and its outcome was never reported";
+        assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        // No timer releases it: a generous wait and repeated reads change nothing.
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        }
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_failed_spawn_releases() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        drop(lease);
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+
+        // Settlement after a failed spawn releases too.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        lease.settle_after_reap();
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+
+        // So does an explicit release.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        lease.release_unspawned();
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_spawned_without_pgid_stays_unknown() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let detail = "spawned without a process-group identity";
+        // Settled after a reap: the removed "no pgids means never spawned" rule.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(0);
+        lease.settle_after_reap();
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        }
+
+        // Dropped without settlement.
+        let other = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = other.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(0);
+        drop(lease);
+        assert!(unknown_detail(&other, &dirs.wt).contains(detail));
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_release_unspawned_after_attempt_is_noop() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.release_unspawned();
+        assert!(unknown_detail(&ledger, &dirs.wt)
+            .contains("spawn was attempted and its outcome was never reported"));
+
+        // A spawned lease is not released either; it keeps its group (this
+        // test's own, which is never empty while it runs).
+        let other = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = other.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        // SAFETY: `getpgrp` has no preconditions.
+        lease.bind_pgid(unsafe { libc::getpgrp() } as u32);
+        lease.release_unspawned();
+        assert!(matches!(
+            other.coverage_under(&dirs.wt),
+            WriterCoverage::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_failed_retry_keeps_the_earlier_bound_group() {
+        let dirs = dirs();
+        // SAFETY: `getpgrp` has no preconditions. This test's own group is
+        // never empty while it runs: it stands in for attempt 1's survivors.
+        let survivors = unsafe { libc::getpgrp() } as u32;
+        for settle in [true, false] {
+            let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+            let lease = ledger.take_lease("shell", Some(&dirs.wt));
+            lease.mark_attempted();
+            lease.bind_pgid(survivors);
+            // Attempt 2: the spawn fails outright.
+            lease.mark_attempted();
+            lease.mark_failed();
+            if settle {
+                lease.settle_after_reap();
+            } else {
+                drop(lease);
+            }
+            let detail = unknown_detail(&ledger, &dirs.wt);
+            assert!(
+                detail.contains(&survivors.to_string()),
+                "settle={settle}: the earlier group is still accounted for: {detail}"
+            );
+        }
+
+        // A retry whose outcome was never reported is identity-less, never
+        // released either.
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(survivors);
+        lease.mark_attempted();
+        lease.release_unspawned();
+        assert!(unknown_detail(&ledger, &dirs.wt)
+            .contains("spawn was attempted and its outcome was never reported"));
+    }
+
+    #[tokio::test]
+    async fn remote_contract_gap_ledger_bound_group_drop_is_probe_clearable() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 30").current_dir(&dirs.wt);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().expect("sh spawns");
+        let pgid = child.id();
+        lease.bind_pgid(pgid);
+        // Released without a reap: the group is alive, so coverage is unknown.
+        drop(lease);
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(&pgid.to_string()));
+        }
+        // The ledger killed nothing: the group is still alive.
+        assert_eq!(
+            crate::process_manager::process_group_is_empty(pgid),
+            Some(false)
+        );
+
+        // The test itself ends the group; coverage clears only once the group
+        // is observed empty.
+        unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+        child.wait().expect("the leader is reaped");
+        until_clear(&ledger, &dirs.wt).await;
     }
 }

@@ -315,6 +315,33 @@ pub enum WorktreeOpError {
         /// The verified abort report.
         abort: Box<crate::vcs::git::commands::AbortReport>,
     },
+    /// An abort-on-conflict merge landed and its `on_merged` hook then failed.
+    ///
+    /// The base moved. `landing` is re-read from the repository after the
+    /// failure; nothing re-merges, aborts, resets, or re-runs the hook.
+    /// `Display` is exactly the untyped text this replaced.
+    MergedHookFailed {
+        /// The change whose `on_merged` hook failed.
+        change_id: String,
+        /// `HEAD` read before the merge; `None` when it could not be read.
+        premerge_head: Option<String>,
+        /// Landing evidence re-read after the failure.
+        landing: Box<crate::vcs::git::commands::LandingReport>,
+        /// The hook's own failure text.
+        hook_detail: String,
+    },
+    /// An abort-on-conflict merge failed after eligibility with a Git error
+    /// that was not a conflict (a dirty base, an unmergeable ref).
+    ///
+    /// `Display` is exactly the untyped text this replaced.
+    MergeFailed {
+        /// `HEAD` read before the merge; `None` when it could not be read.
+        premerge_head: Option<String>,
+        /// Landing evidence re-read after the failure.
+        landing: Box<crate::vcs::git::commands::LandingReport>,
+        /// The Git failure text.
+        detail: String,
+    },
     /// Sanitized failure from the underlying boundary.
     Internal(String),
 }
@@ -330,6 +357,15 @@ impl fmt::Display for WorktreeOpError {
             | Self::Ineligible(message)
             | Self::RootBusy(message)
             | Self::Internal(message) => write!(f, "{message}"),
+            Self::MergedHookFailed {
+                change_id,
+                hook_detail,
+                ..
+            } => write!(
+                f,
+                "on_merged hook failed for '{change_id}'; branch merged transition blocked: {hook_detail}"
+            ),
+            Self::MergeFailed { detail, .. } => write!(f, "{detail}"),
             Self::MergeConflict { files, recovery } => write!(
                 f,
                 "base merge conflicted in {} file(s) [{}]; intermediate merge state was preserved, recovery: {}",
@@ -862,6 +898,18 @@ pub trait WorktreeBackend: Send + Sync {
     ) -> WorktreeOpResult<MergeAttempt>;
     /// Run the `on_merged` hook exactly once for a completed merge.
     async fn run_on_merged(&self, change_id: &str, worktree_path: &Path) -> WorktreeOpResult<()>;
+    /// Re-read whether a base merge landed. Reads only; never mutates.
+    ///
+    /// Defaults to an unknown report: a backend that cannot re-read the
+    /// repository never claims a merge landed or did not.
+    async fn merge_landing(
+        &self,
+        _premerge_head: Option<&str>,
+    ) -> crate::vcs::git::commands::LandingReport {
+        crate::vcs::git::commands::LandingReport::unknown(
+            "this backend cannot re-read merge landing",
+        )
+    }
     /// True when `change_id` is a managed, non-archived change eligible for a worktree.
     async fn change_is_eligible(&self, change_id: &str) -> WorktreeOpResult<()>;
     /// Bind a worktree's discardable and ignored content for a confirmed delete.
@@ -993,6 +1041,20 @@ pub struct WorktreeOpOutcome {
     /// unqualified success would be hiding a resource the operator still owns.
     /// `detail` carries the reason.
     pub branch_retained: bool,
+    /// Landing and hook evidence of an abort-on-conflict merge; `None` for
+    /// every other operation.
+    pub merge_evidence: Option<MergeEvidence>,
+}
+
+/// What an abort-on-conflict merge that succeeded did, re-read afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeEvidence {
+    /// `HEAD` read before the merge; `None` when it could not be read.
+    pub premerge_head: Option<String>,
+    /// Landing evidence re-read after the merge.
+    pub landing: crate::vcs::git::commands::LandingReport,
+    /// Whether `on_merged` ran (it is skipped when no change ID is derivable).
+    pub hook_ran: bool,
 }
 
 /// The shared operation service.
@@ -1230,6 +1292,7 @@ impl WorktreeService {
             branch: after.branch,
             path: after.path,
             branch_retained,
+            merge_evidence: None,
         })
     }
 
@@ -1390,8 +1453,34 @@ impl WorktreeService {
             })
             .await;
 
+        // The abort-on-conflict merge reports typed landing evidence, so it
+        // needs the pre-merge HEAD it is compared against. Read under the root
+        // guard, immediately before the merge; the preserving merge is
+        // unchanged and reads nothing extra.
+        let typed = policy == ConflictPolicy::AbortOnConflict;
+        let premerge_head = if typed {
+            self.backend.base_head().await.ok()
+        } else {
+            None
+        };
+
         let attempt = match self.backend.merge_into_base(&facts.branch, policy).await {
             Ok(attempt) => attempt,
+            Err(WorktreeOpError::Internal(detail)) if typed => {
+                let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+                let error = WorktreeOpError::MergeFailed {
+                    premerge_head,
+                    landing: Box::new(landing),
+                    detail,
+                };
+                self.events
+                    .emit(WorktreeOperationEvent::MergeFailed {
+                        branch: facts.branch.clone(),
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
             Err(error) => {
                 self.events
                     .emit(WorktreeOperationEvent::MergeFailed {
@@ -1438,20 +1527,35 @@ impl WorktreeService {
 
         // `on_merged` runs after the merge and before completion is announced, so
         // a hook failure blocks the merged transition exactly as it does in TUI.
+        let mut hook_ran = false;
         if let Some(change_id) =
             crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(&facts.branch)
         {
+            hook_ran = true;
             if let Err(error) = self.backend.run_on_merged(&change_id, &facts.path).await {
-                let message = format!(
-                    "on_merged hook failed for '{change_id}'; branch merged transition blocked: {error}"
-                );
+                let hook_detail = error.to_string();
+                let error = if typed {
+                    // The stage is what decides the outcome; whether the merge
+                    // really landed is re-read, never assumed.
+                    let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+                    WorktreeOpError::MergedHookFailed {
+                        change_id,
+                        premerge_head,
+                        landing: Box::new(landing),
+                        hook_detail,
+                    }
+                } else {
+                    WorktreeOpError::Internal(format!(
+                        "on_merged hook failed for '{change_id}'; branch merged transition blocked: {hook_detail}"
+                    ))
+                };
                 self.events
                     .emit(WorktreeOperationEvent::MergeFailed {
                         branch: facts.branch.clone(),
-                        error: message.clone(),
+                        error: error.to_string(),
                     })
                     .await;
-                return Err(WorktreeOpError::Internal(message));
+                return Err(error);
             }
         } else {
             debug!(
@@ -1467,11 +1571,23 @@ impl WorktreeService {
             .await;
         self.events.emit(WorktreeOperationEvent::Refreshed).await;
 
+        let merge_evidence = if typed {
+            let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+            Some(MergeEvidence {
+                premerge_head,
+                landing,
+                hook_ran,
+            })
+        } else {
+            None
+        };
+
         Ok(WorktreeOpOutcome {
             detail: format!("branch '{}' was merged into base", facts.branch),
             branch: facts.branch,
             path: facts.path,
             branch_retained: false,
+            merge_evidence,
         })
     }
 

@@ -92,6 +92,12 @@ pub enum ErrorCode {
     /// was not proven: the abort failed or a verification could not be read.
     /// Recovery is local or TUI; nothing claims state was preserved on purpose.
     MergeAbortFailed,
+    /// `merge_worktree_abort_on_conflict` merged into base and the `on_merged`
+    /// hook then failed. The base moved; the record's `result.merge` says
+    /// whether the merge commit is confirmed on base, re-read from Git, and
+    /// `result.hook` what the hook did. Nothing re-merged, aborted, reset, or
+    /// re-ran the hook; recovery is local or TUI.
+    MergeHookFailed,
     /// The addressed execution exists, but the presented instance/change
     /// binding is not the one it belongs to.
     ///
@@ -166,6 +172,7 @@ impl ErrorCode {
             | Self::MergeConflictPredicted
             | Self::MergeConflictAborted
             | Self::MergeAbortFailed
+            | Self::MergeHookFailed
             | Self::ExecutionBindingMismatch
             | Self::RefreshRefused
             | Self::DeleteConsentStale
@@ -203,6 +210,7 @@ impl ErrorCode {
             Self::MergeConflictPredicted => "merge_conflict_predicted",
             Self::MergeConflictAborted => "merge_conflict_aborted",
             Self::MergeAbortFailed => "merge_abort_failed",
+            Self::MergeHookFailed => "merge_hook_failed",
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
@@ -218,7 +226,7 @@ impl ErrorCode {
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 29] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 30] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -248,6 +256,7 @@ pub const ALL_ERROR_CODES: [ErrorCode; 29] = [
     ErrorCode::WorktreeSessionBusy,
     ErrorCode::WorktreeSessionSetupFailed,
     ErrorCode::InternalError,
+    ErrorCode::MergeHookFailed,
 ];
 
 /// Structured error body returned by every non-success v2 response.
@@ -1076,6 +1085,10 @@ pub struct WorktreeSessionCapability {
     pub max_retained: usize,
     /// Retained output tail per session, in bytes.
     pub max_output_bytes: usize,
+    /// Retained runner notices per session, oldest dropped first. `null` from
+    /// an older owner, which publishes no notices.
+    #[serde(default)]
+    pub max_runner_notices: Option<usize>,
     /// What the command's stdin is. Always `null`: there is no stdin relay.
     pub stdin: String,
     /// Every stable refusal reason.
@@ -2636,7 +2649,11 @@ pub struct SessionCleanupFacts {
     pub reason: Option<String>,
 }
 
-/// One retained output line of a session.
+/// One retained output line of a session: bytes the child wrote.
+///
+/// Never a runner diagnostic: retry, launch-failure, shutdown, limit, and
+/// cleanup facts are `runner_notices`, so a line here cannot change any
+/// owner-generated member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SessionOutputLine {
     /// `stdout` or `stderr`.
@@ -2644,6 +2661,29 @@ pub struct SessionOutputLine {
     /// The command's own text after control-sequence stripping and the 8 KiB
     /// line bound. Not redacted.
     pub text: String,
+}
+
+/// One runner-generated fact about a session, from a typed runner channel.
+///
+/// Never derived from child output. `detail` carries numbers and fixed tokens
+/// only — never the template, the expanded command, environment values, or a
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionRunnerNotice {
+    /// `retry_scheduled`, `inactivity_terminated`, `runtime_limit_reached`,
+    /// `launch_failed`, `shutdown_refused`, or
+    /// `process_group_cleanup_unconfirmed`.
+    pub kind: String,
+    /// The attempt the notice concerns (for `retry_scheduled`, the attempt
+    /// scheduled next); `null` when it concerns none.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub attempt: Option<u32>,
+    /// Sanitized facts, for example `cause=crash, max_attempts=1, delay_ms=0`
+    /// or `pgid=4242, force_killed=true`; `null` when the kind has none.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
 }
 
 /// Bounded, sanitized output tail of a session.
@@ -2678,15 +2718,21 @@ pub struct WorktreeSessionResource {
     pub branch: String,
     /// `running`, `succeeded`, `failed`, or `stopped`.
     pub state: String,
-    /// Runner attempts inside this one session (configured retries).
+    /// Runner attempts started inside this one session (configured retries):
+    /// `1` at launch, then the attempt of each later successful spawn the
+    /// runner reported on its typed channel. A retry merely scheduled does not
+    /// count, and no output line can change it.
     pub attempt: u32,
     /// Launch instant (RFC 3339).
     pub started_at: String,
     /// Settlement instant (RFC 3339), once settled.
     pub finished_at: Option<String>,
-    /// Exit code of the final attempt, when it exited on its own.
+    /// Exit code of the final attempt as reaped; `null` when a signal ended
+    /// it or the leader was not reaped.
     pub exit_code: Option<i32>,
-    /// Terminating signal name, when a signal ended it.
+    /// The signal that terminated the leader as reaped (`SIGTERM`, or
+    /// `SIGKILL` after escalation); `null` when unknown or when it exited on
+    /// its own.
     pub signal: Option<String>,
     /// A stop or owner shutdown was requested.
     pub stop_requested: bool,
@@ -2694,8 +2740,16 @@ pub struct WorktreeSessionResource {
     pub setup: Option<SessionSetupFacts>,
     /// Setup-failure cleanup facts; always `null` for a launched session.
     pub cleanup: Option<SessionCleanupFacts>,
-    /// Bounded sanitized output tail.
+    /// Bounded sanitized output tail: only bytes the child wrote.
     pub output: SessionOutput,
+    /// Bounded runner-generated notices, oldest first. `null` from an older
+    /// owner, which publishes none ("unpublished", not "empty").
+    #[serde(default)]
+    pub runner_notices: Option<Vec<SessionRunnerNotice>>,
+    /// Runner notices dropped to stay within `max_runner_notices`; `null`
+    /// from an older owner.
+    #[serde(default)]
+    pub runner_notices_dropped: Option<u64>,
 }
 
 /// `GET /api/v2/worktree-sessions` body.
@@ -2779,6 +2833,97 @@ pub enum MergeAbortOutcome {
     ConflictAborted,
     /// Conflicted, and restoration was not confirmed.
     AbortFailed,
+    /// Merged into base, then the `on_merged` hook failed. Decided by the
+    /// operation stage; `merge.landed` is re-read separately.
+    MergedHookFailed,
+    /// A Git failure after eligibility and before any merge commit (a dirty
+    /// base, an unmergeable ref). `merge.landed` is re-read separately.
+    MergeFailed,
+}
+
+/// Whether a base merge commit landed, re-read from the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeLanded {
+    /// `HEAD` moved off `premerge_head`, descends from it, and no `MERGE_HEAD` exists.
+    Confirmed,
+    /// `HEAD` is still `premerge_head` and no `MERGE_HEAD` exists.
+    NotLanded,
+    /// A fact could not be read, or the facts support neither verdict; `detail` names which.
+    Unknown,
+}
+
+impl From<crate::vcs::git::commands::Landing> for MergeLanded {
+    fn from(value: crate::vcs::git::commands::Landing) -> Self {
+        use crate::vcs::git::commands::Landing;
+        match value {
+            Landing::Confirmed => Self::Confirmed,
+            Landing::NotLanded => Self::NotLanded,
+            Landing::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Whether the merge commit landed on base, re-read from Git after the command stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeLandingEvidence {
+    /// The verdict derived from the facts below, never from the attempt.
+    pub landed: MergeLanded,
+    /// Base `HEAD` as re-read; `null` when it could not be read.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean; informational, never changes `landed`. `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub clean_after: Option<bool>,
+    /// Which verification failed or contradicted when `landed` is `unknown`; else `null`.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
+}
+
+impl MergeLandingEvidence {
+    /// Project the VCS landing report onto the wire.
+    pub fn from_report(report: &crate::vcs::git::commands::LandingReport) -> Self {
+        Self {
+            landed: report.landed.into(),
+            head_after: report.head_after.clone(),
+            merge_head_present: report.merge_head_present,
+            clean_after: report.clean_after,
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// What the `on_merged` hook did during an abort-on-conflict merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeHookEvidence {
+    /// True when the hook was invoked (exactly once).
+    pub ran: bool,
+    /// Whether the hook succeeded; `null` when it did not run.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub exit_ok: Option<bool>,
+    /// Bounded, sanitized hook failure text; `null` unless the hook failed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
+}
+
+impl MergeHookEvidence {
+    /// The hook was not invoked.
+    pub fn not_run() -> Self {
+        Self {
+            ran: false,
+            exit_ok: None,
+            detail: None,
+        }
+    }
 }
 
 /// How far the root was proven restored after `git merge --abort`.
@@ -2860,10 +3005,19 @@ pub struct MergeAbortResult {
     // Published as required: always written, `null` when it does not apply.
     #[schema(required)]
     pub abort: Option<MergeAbortEvidence>,
-    /// `local_or_tui_required` when restoration was not confirmed; else `null`.
+    /// `local_or_tui_required` when restoration was not confirmed or a hook
+    /// failed after a landed merge; else `null`.
     // Published as required: always written, `null` when it does not apply.
     #[schema(required)]
     pub recovery: Option<String>,
+    /// Whether the merge commit landed on base, re-read from Git; `null` when
+    /// not reported. Omitted by older owners, which decodes as `null`.
+    #[serde(default)]
+    pub merge: Option<MergeLandingEvidence>,
+    /// What the `on_merged` hook did; `null` when not reported. Omitted by
+    /// older owners, which decodes as `null`.
+    #[serde(default)]
+    pub hook: Option<MergeHookEvidence>,
 }
 
 /// What a candidate proposal refresh actually did, re-read from Git.

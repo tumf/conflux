@@ -895,6 +895,7 @@ async fn remote_confirmed_delete_unbounded_observation_fails_closed() {
     let fixture = Fixture::with_limits(ConsentLimits {
         max_records: 4,
         max_hashed_bytes: 1024,
+        ..ConsentLimits::PRODUCTION
     });
     let path = fixture.add("change-a");
     for index in 0..8 {
@@ -1145,5 +1146,140 @@ fn remote_confirmed_delete_stale_consent_has_its_own_conflict_code() {
     assert_eq!(
         ErrorCode::DeleteConsentStale.http_status(),
         StatusCode::CONFLICT
+    );
+}
+
+// ============================================================================
+// Contract gaps: listing budget and detached HEAD
+// ============================================================================
+
+const OPTIONS: [&str; 4] = [
+    "ordinary",
+    "skip_teardown",
+    "discard_known_dirty",
+    "discard_commits_ahead",
+];
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_delete_listing_name_bytes_are_bounded_in_the_preview() {
+    let fixture = Fixture::with_limits(ConsentLimits {
+        max_listing_name_bytes: 16,
+        ..ConsentLimits::PRODUCTION
+    });
+    let path = fixture.add("change-a");
+    for index in 0..20 {
+        write(&path.join(format!("target/f{index}.o")), "x");
+    }
+    let id = fixture.id("change-a").await;
+
+    let (_, preview) = fixture.preview(&id).await;
+    assert_eq!(preview["content_observation"], "unbounded", "{preview}");
+    assert_eq!(preview["consent"]["discardable_content_id"], Value::Null);
+    assert_eq!(preview["consent"]["ignored_content_id"], Value::Null);
+    for option in OPTIONS {
+        assert_eq!(preview["options"][option]["eligible"], false, "{option}");
+        assert_eq!(
+            preview["options"][option]["blocked_reason"], "content_unbounded",
+            "{option}"
+        );
+    }
+}
+
+/// The opaque ID of the one detached worktree.
+async fn detached_id(fixture: &Fixture) -> String {
+    fixture
+        .port
+        .list()
+        .await
+        .expect("listed")
+        .worktrees
+        .into_iter()
+        .find(|w| w.branch.is_empty() && !w.is_main)
+        .expect("the detached worktree is listed")
+        .worktree_id
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_delete_detached_preview_is_ineligible() {
+    let fixture = Fixture::new();
+    let path = fixture.add_ahead("change-a");
+    git(&path, &["checkout", "-q", "--detach"]);
+    let id = detached_id(&fixture).await;
+
+    let (status, preview) = fixture.preview(&id).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["is_detached"], true, "{preview}");
+    assert_eq!(preview["branch"], "");
+    assert_eq!(preview["consent"]["branch"], "");
+    for option in OPTIONS {
+        assert_eq!(preview["options"][option]["eligible"], false, "{option}");
+        assert_eq!(
+            preview["options"][option]["blocked_reason"], "detached_head",
+            "{option}: {preview}"
+        );
+    }
+
+    // The published consent can never be accepted: no detached destructive
+    // support exists remotely.
+    let (status, error) = fixture
+        .confirm(&id, &preview["consent"], true, true, true)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["error_code"], "validation_failed");
+    assert!(path.exists());
+    assert!(fixture.still_listed(&id).await);
+    assert_eq!(fixture.teardown_runs("change-a"), 0);
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_delete_detach_after_preview_is_refused_under_guard() {
+    let fixture = Fixture::new();
+    let path = fixture.add("change-a");
+    let id = fixture.id("change-a").await;
+    let (_, preview) = fixture.preview(&id).await;
+    assert_eq!(preview["is_detached"], false);
+    assert_eq!(
+        preview["options"]["skip_teardown"]["eligible"], true,
+        "{preview}"
+    );
+
+    git(&path, &["checkout", "-q", "--detach"]);
+    let (_, record) = fixture
+        .confirm(&id, &preview["consent"], true, false, false)
+        .await;
+    assert_refused(&record, "target_ineligible", "detached_head");
+    assert_eq!(record["result"]["refusal"]["teardown_ran"], false);
+    assert!(path.exists(), "nothing was removed");
+    assert!(fixture.still_listed(&id).await, "the ID is retained");
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_delete_attached_ahead_unknown_is_unchanged() {
+    let fixture = Fixture::new();
+    let path = fixture.add("change-a");
+    // An attached branch with history unrelated to base: no merge base.
+    git(&path, &["checkout", "-q", "--orphan", "change-a-orphan"]);
+    git(&path, &["commit", "-q", "-m", "orphan"]);
+    let id = fixture.id("change-a-orphan").await;
+
+    let (_, preview) = fixture.preview(&id).await;
+    assert_eq!(preview["is_detached"], false);
+    assert_eq!(
+        preview["options"]["discard_commits_ahead"]["blocked_reason"], "ahead_unknown",
+        "{preview}"
+    );
+}
+
+#[test]
+fn remote_contract_gap_delete_capability_lists_detached_head() {
+    let capability = WorktreeCapabilities::default().confirmed_delete;
+    assert!(capability.reasons.iter().any(|r| r == "detached_head"));
+    assert_eq!(
+        crate::worktree_ops::consent::ConfirmedDeleteReason::ALL.len(),
+        20
     );
 }

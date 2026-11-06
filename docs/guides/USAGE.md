@@ -310,7 +310,12 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
 - **Same runner as the TUI.** `sh -c`, stdin from `/dev/null` (there is no
   stdin relay and no PTY), its own process group, the stagger slot, and the
   configured retry policy. Configured retries happen *inside* one session and
-  show up as `attempt`; they never create a second session.
+  show up as `attempt`; they never create a second session. `attempt` starts at
+  `1` and moves only when the runner reports, on its own typed channel, that a
+  later attempt was actually spawned; a retry merely scheduled (a
+  `retry_scheduled` notice) is not counted. The runner observes a stop at its
+  next check, so a stop that arrives during a retry delay is honoured right
+  after the scheduled attempt spawns, and `attempt` then counts that spawn.
 - **Single flight.** An exact replay of an idempotency key returns the original
   record and launches nothing. A new request for a worktree whose session is
   still running is `worktree_session_busy` with `reason=worktree_busy`. At most
@@ -350,13 +355,27 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
   configured command prints its arguments, its environment, or its cwd, every
   bearer-authenticated reader of the session resource sees them. Choosing a
   `worktree_command` that does not print secrets is the operator's
-  responsibility. The runner's own stderr notices (a `[Retry N/M]` line before
-  each configured retry, from which `attempt` is counted, and process-group
-  cleanup diagnostics) are interleaved in the same tail. A stopped session
-  reports `signal: "SIGTERM"`, the signal the cancellation path sends first;
-  its SIGKILL escalation is not reported separately. The tail is published
-  nowhere else: never as an event, a log
-  entry, or a snapshot field. Owner-generated members (`path`, `branch`,
+  responsibility. The tail holds **only** what the child wrote: the runner's
+  own facts never appear in it, and nothing a child prints — a `[Retry N/M]`
+  prefix, a fake `pgid=` cleanup line — changes `attempt`, `signal`, or
+  `runner_notices`. The tail is published nowhere else: never as an event, a
+  log entry, or a snapshot field.
+- **Runner notices are typed.** `runner_notices` lists, oldest first and at most
+  32 (`capabilities.worktree_sessions.max_runner_notices`; the excess is counted
+  in `runner_notices_dropped`), what the runner itself observed:
+  `retry_scheduled` (with the attempt scheduled next), `inactivity_terminated`,
+  `runtime_limit_reached`, `launch_failed`, `shutdown_refused`, and
+  `process_group_cleanup_unconfirmed`. Each has `kind`, `attempt`, and a
+  `detail` of numbers and fixed tokens only — never the template, the expanded
+  command, environment values, or a path. The text the TUI terminal, the
+  parallel executor, and shell commands print for the same events (`[Retry
+  N/M] ...`) is unchanged; only sessions read the typed channel.
+- **`signal` is observed, not requested.** For a stopped or runtime-limited
+  session, `signal` and `exit_code` come from the leader as it was reaped:
+  `SIGTERM` when the command honoured it, `SIGKILL` when it ignored SIGTERM and
+  the runner escalated after 5 seconds, or a real exit code when a trap exited
+  on its own. When the leader was not reaped, both are `null` — unknown, never
+  the signal the runner merely sent. Owner-generated members (`path`, `branch`,
   results, error detail, events) never contain the template, the expanded
   command, environment values, or an absolute path.
 - **Events.** `worktree_session_started` and `worktree_session_finished` carry
@@ -365,7 +384,9 @@ curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
   `process.worktree_sessions_running`.
 - **Older owners.** An owner built before this surface omits
   `capabilities.worktree_sessions` (decode it as unavailable) and answers each
-  of the three commands with `validation_failed` before any effect. `cflx client`
+  of the three commands with `validation_failed` before any effect. An owner built
+  before typed runner notices omits `runner_notices`, `runner_notices_dropped`,
+  and `max_runner_notices`; decode them as unpublished, not as empty. `cflx client`
   and `cflx client mcp` have no session verb.
 
 #### Merging a worktree remotely
@@ -398,17 +419,42 @@ Restoration is reported from those reads, never from the abort attempt:
 | `failed` | `merge_abort_failed` | every read answered and at least one failed — for example the abort exited non-zero and `MERGE_HEAD` is still there |
 | `unknown` | `merge_abort_failed` | at least one read could not be answered |
 
-The settled record's `result` has `kind: merge_abort` on success and on each
-of those three refusals: `outcome` (`merged`, `predicted_conflict`,
-`conflict_aborted`, `abort_failed`), `premerge_head`, `conflict_files`,
-`abort` (`exit_ok`, `head_after`, `merge_head_present`, `clean_after`,
-`restored`, `detail`), and `recovery`, which is `local_or_tui_required` only
-for `merge_abort_failed`. A `merge_abort_failed` record never claims the state
+The settled record's `result` has `kind: merge_abort` on success and on every
+refusal after eligibility: `outcome` (`merged`, `predicted_conflict`,
+`conflict_aborted`, `abort_failed`, `merged_hook_failed`, `merge_failed`),
+`premerge_head`, `conflict_files`, `abort` (`exit_ok`, `head_after`,
+`merge_head_present`, `clean_after`, `restored`, `detail`), `recovery`, which is
+`local_or_tui_required` for `merge_abort_failed` and `merge_hook_failed`, and two
+evidence objects:
+
+- `merge` — whether the merge commit landed on base, re-read from Git after the
+  command stopped: `landed` (`confirmed` when `HEAD` moved off `premerge_head`,
+  descends from it, and no `MERGE_HEAD` exists; `not_landed` when `HEAD` is still
+  `premerge_head` with no `MERGE_HEAD`; `unknown` when a read failed or the facts
+  support neither, with `detail` naming the failed verification), `head_after`,
+  `merge_head_present`, and an informational `clean_after`.
+- `hook` — what `on_merged` did: `ran`, `exit_ok`, and a bounded `detail` when
+  it failed.
+
+Two failures that used to be an untyped `internal_error` with no result are now
+typed. When the merge landed and `on_merged` then failed, the base **has
+moved**: the record is `merge_hook_failed` (HTTP 409) with
+`outcome: merged_hook_failed`, `hook.ran: true`, `hook.exit_ok: false`, and
+`merge.landed` as re-read — `confirmed` normally, never invented when the
+re-read cannot prove it. A Git failure after eligibility and before any merge
+commit (a dirty base, an unmergeable ref) stays `internal_error` but carries
+`outcome: merge_failed`, `hook.ran: false`, and `merge.landed` (`not_landed` or
+`unknown`). Nothing re-merges, aborts, resets, reverts, or re-runs the hook,
+and the operator text is the same as before. Refusals before eligibility
+(`worktree_not_found`, `root_busy`, `target_ineligible`) still carry
+`result: null`. `merge_worktree` is unchanged: the same hook or Git failure
+there is `internal_error` with `result: null`. A `merge_abort_failed` record never claims the state
 was preserved on purpose; it reports what was observed. While `MERGE_HEAD`
 remains, incompatible mutations are `root_busy` until local or TUI recovery.
 If `MERGE_HEAD` is gone but the root is dirty, the next merge is refused by the
-ordinary clean-working-directory check (`internal_error`, "Working directory
-is not clean"), not reported as `root_busy`. The owner never retries the abort
+ordinary clean-working-directory check (`internal_error` with
+`outcome: merge_failed`, "Working directory is not clean"), not reported as
+`root_busy`. The owner never retries the abort
 and never runs `git reset` or any other compensation, and a server relaying
 these commands performs none either. `on_merged` runs only after a completed
 merge, exactly once.
@@ -419,7 +465,8 @@ Discover the command through `capabilities.worktrees.merge_abort`
 built before this command omits the block, which a client decodes as
 `available: false`; such an owner refuses the command type with
 `validation_failed` before any effect, and serves `merge_worktree` exactly as
-before.
+before. An owner built before the landing and hook evidence omits `merge`
+and `hook` (decode both as `null`) and never sends `merge_hook_failed`.
 
 #### Deleting a worktree remotely
 
@@ -490,7 +537,7 @@ confirmation:
 |---|---|
 | `delete_consent_stale` | `branch_changed`, `identity_changed`, `head_moved`, `base_moved`, `dirty_changed`, `ahead_changed`, `ignored_changed`, `content_changed` |
 | `worktree_dirty_unknown` | `dirty_unknown`, `content_unobservable`, `content_unbounded` |
-| `target_ineligible` | `ahead_unknown`, `nested_repository`, `main_worktree`, `commits_ahead` |
+| `target_ineligible` | `ahead_unknown`, `nested_repository`, `main_worktree`, `commits_ahead`, `detached_head` |
 | `worktree_dirty` | `dirty`, `ignored_content` |
 | `root_busy` | `root_busy` (a held root guard or a base merge in progress) |
 | `internal_error` | `teardown_failed` |
@@ -501,8 +548,13 @@ An actual nested repository — a `.git` entry at any depth, untracked or inside
 an ignored directory, or a status-reported submodule — is `nested_repository`;
 a plain ignored `target/` is walked, not refused. And one combined budget
 covers tracked, untracked, and ignored content together, each path counted
-once: more than 500,000 records (status records plus walked entries) or
-256 MiB of hashed bytes is `content_unbounded`, with both identities `null`.
+once: more than 500,000 records (status records plus walked entries),
+256 MiB of hashed bytes, or 64 MiB of directory-entry names in one listing
+(`max_listing_name_bytes`) is `content_unbounded`, with both identities `null`.
+Every directory entry is charged as it is read — as a record, and by its name
+bytes — before its name is kept, so a single directory with millions of
+entries stops at the budget instead of being read into memory, and every
+directory stream is closed on every path.
 No metadata-only, partial, or ignored-excluding identity is ever substituted to
 keep the command available. A worktree past the budget — typically a large
 `target/` or other build output — is **not deletable remotely**: reduce that
@@ -527,7 +579,19 @@ nothing. Nothing is stashed, committed, backed up, or pushed first.
 
 **Guarantee boundary.** Nothing is locked between the preview and the command.
 The deletion proceeds only if every consented fact still matches under the root
-guard immediately before teardown and immediately before removal. A write from
+guard immediately before teardown and immediately before removal.
+
+**Detached HEAD.** A worktree with a detached HEAD has no branch to consent
+to. Its preview publishes `is_detached: true`, an empty `consent.branch`, and
+every one of the four options ineligible with `blocked_reason: detached_head`,
+checked before every other fact; echoing that consent is `validation_failed`,
+because a blank `consent.branch` is never accepted. A worktree that is detached
+*after* an attached preview is refused under the guard as `target_ineligible`
+with `refusal.reason: detached_head`, nothing removed and the ID retained.
+There is no remote detached destructive delete; detach it back onto a branch or
+delete it through the TUI. An attached worktree without a merge base still
+reports `ahead_unknown`. An older owner omits `is_detached`, which decodes as
+`false`. A write from
 outside Conflux that lands after that final comparison and before
 `git worktree remove --force` is not detected — the same window the TUI has.
 Empty directories and lone special files that lie under no reported directory
@@ -630,6 +694,15 @@ Through the main worktree's ID, a path inside `openspec/changes/<id>/` of a
 tracked change is judged by that change's own status, exactly as the change
 scope is, so the project root is not a way around `change_active` or
 `change_admitted`.
+
+Unscoped writers are released only on positive knowledge of their spawn: a
+lease is cleared when `Command::spawn` was never attempted or returned an
+error, and a lease whose process group was bound is cleared once that group is
+observed empty. A spawn that was attempted but whose outcome was never reported
+(`spawn was attempted and its outcome was never reported`), or that produced a
+process without a process-group identity (`spawned without a process-group
+identity`), stays `managed_process_live` — unknown for every root — with that
+typed detail. No timer, owner restart, or repeated read releases it.
 
 `managed_process_live` has two meanings, and `edit_blocked_detail` tells them
 apart: *a managed writer is bound here* (a run-scoped command, an unscoped

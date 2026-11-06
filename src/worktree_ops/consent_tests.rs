@@ -436,6 +436,7 @@ fn remote_confirmed_delete_bound_exceeded_fails_closed() {
     let fits = ConsentLimits {
         max_records: 100,
         max_hashed_bytes: 1000,
+        ..ConsentLimits::PRODUCTION
     };
     assert!(observe_with(root, &fits).has_ignored_content);
 
@@ -443,6 +444,7 @@ fn remote_confirmed_delete_bound_exceeded_fails_closed() {
     let few_records = ConsentLimits {
         max_records: 5,
         max_hashed_bytes: 1000,
+        ..ConsentLimits::PRODUCTION
     };
     assert_eq!(
         observe_discardable_content(root, &few_records),
@@ -454,6 +456,7 @@ fn remote_confirmed_delete_bound_exceeded_fails_closed() {
     let few_bytes = ConsentLimits {
         max_records: 100,
         max_hashed_bytes: 50,
+        ..ConsentLimits::PRODUCTION
     };
     assert_eq!(
         observe_discardable_content(root, &few_bytes),
@@ -466,6 +469,7 @@ fn remote_confirmed_delete_bound_exceeded_fails_closed() {
     let one_big = ConsentLimits {
         max_records: 100,
         max_hashed_bytes: 150,
+        ..ConsentLimits::PRODUCTION
     };
     assert_eq!(
         observe_discardable_content(root, &one_big),
@@ -479,6 +483,7 @@ fn remote_confirmed_delete_bound_exceeded_fails_closed() {
     let combined = ConsentLimits {
         max_records: 100,
         max_hashed_bytes: 60,
+        ..ConsentLimits::PRODUCTION
     };
     assert!(observe_with(root, &combined).has_ignored_content);
     write(root, "README", &"t".repeat(40));
@@ -622,5 +627,161 @@ fn remote_confirmed_delete_walk_depth_is_bounded() {
         observe_discardable_content(root, &ConsentLimits::PRODUCTION),
         ContentObservation::Unbounded,
         "a tree deeper than the walk bound fails closed"
+    );
+}
+
+// ── Contract gaps: budgeted listing ─────────────────────────────────────────
+
+/// Open descriptors of this process that point inside `dir`.
+///
+/// Scoped to one fixture's directory, so descriptors other tests hold while
+/// running in parallel never count.
+#[cfg(target_os = "linux")]
+fn fds_under(dir: &Path) -> usize {
+    let dir = std::fs::canonicalize(dir).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&dir))
+        .count()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fds_under(_dir: &Path) -> usize {
+    0
+}
+
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn remote_contract_gap_delete_single_directory_is_bounded_before_materialization() {
+    let dir = repo();
+    let root = dir.path();
+    for index in 0..20 {
+        write(root, &format!("target/f{index:02}.o"), "x");
+    }
+    let limits = ConsentLimits {
+        max_records: 5,
+        ..ConsentLimits::PRODUCTION
+    };
+    let before = fds_under(root);
+    let counters = observe_counters(root, &limits);
+    assert_eq!(counters.observation, ContentObservation::Unbounded);
+    assert!(
+        counters.records <= limits.max_records + 1,
+        "records charged: {}",
+        counters.records
+    );
+    assert!(
+        counters.last_listing_retained <= limits.max_records + 1,
+        "names retained: {}",
+        counters.last_listing_retained
+    );
+    assert_eq!(fds_under(root), before, "no directory descriptor leaked");
+
+    // The same tree fits a budget that holds it.
+    let fits = ConsentLimits {
+        max_records: 100,
+        ..ConsentLimits::PRODUCTION
+    };
+    let counters = observe_counters(root, &fits);
+    assert!(matches!(
+        counters.observation,
+        ContentObservation::Observed(_)
+    ));
+    assert_eq!(counters.last_listing_retained, 20);
+}
+
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn remote_contract_gap_delete_listing_name_bytes_are_bounded() {
+    let dir = repo();
+    let root = dir.path();
+    // Twenty names of five bytes each: 100 listing bytes in one directory.
+    for index in 0..20 {
+        write(root, &format!("target/f{index:02}.o"), "x");
+    }
+    let limits = ConsentLimits {
+        max_listing_name_bytes: 30,
+        ..ConsentLimits::PRODUCTION
+    };
+    let before = fds_under(root);
+    let counters = observe_counters(root, &limits);
+    assert_eq!(counters.observation, ContentObservation::Unbounded);
+    assert!(
+        counters.last_listing_retained * 5 <= 30,
+        "names retained past the byte budget: {}",
+        counters.last_listing_retained
+    );
+    assert_eq!(fds_under(root), before);
+
+    let fits = ConsentLimits {
+        max_listing_name_bytes: 100,
+        ..ConsentLimits::PRODUCTION
+    };
+    assert!(observe_with(root, &fits).has_ignored_content);
+}
+
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn remote_contract_gap_delete_dir_stream_closes_on_nested_and_unobservable() {
+    let dir = repo();
+    let root = dir.path();
+    write(root, "target/a.o", "x");
+    write(root, "target/wt/.git", "gitdir: /nowhere\n");
+    let before = fds_under(root);
+    assert_eq!(
+        observe_discardable_content(root, &ConsentLimits::PRODUCTION),
+        ContentObservation::NestedRepository
+    );
+    assert_eq!(fds_under(root), before, "nested path closes every stream");
+    std::fs::remove_dir_all(root.join("target/wt")).unwrap();
+
+    // An unreadable directory below a walked one. Root reads it anyway, so
+    // the unobservable half only runs unprivileged.
+    use std::os::unix::fs::PermissionsExt;
+    let locked = root.join("target/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    write(root, "target/locked/inner.o", "x");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            observe_discardable_content(root, &ConsentLimits::PRODUCTION),
+            ContentObservation::Unobservable
+        );
+        assert_eq!(
+            fds_under(root),
+            before,
+            "unobservable path closes every stream"
+        );
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn remote_contract_gap_delete_production_limits_name_the_listing_budget() {
+    assert_eq!(
+        ConsentLimits::PRODUCTION.max_listing_name_bytes,
+        64 * 1024 * 1024
+    );
+    assert_eq!(ConsentLimits::default(), ConsentLimits::PRODUCTION);
+    assert_eq!(ConsentLimits::PRODUCTION.max_records, 500_000);
+    assert_eq!(
+        ConsentLimits::PRODUCTION.max_hashed_bytes,
+        256 * 1024 * 1024
+    );
+}
+
+#[test]
+fn remote_contract_gap_delete_detached_head_is_a_closed_reason() {
+    assert_eq!(ConfirmedDeleteReason::ALL.len(), 20);
+    assert_eq!(
+        ConfirmedDeleteReason::DetachedHead.as_str(),
+        "detached_head"
+    );
+    assert!(!ConfirmedDeleteReason::DetachedHead.is_stale());
+    assert_eq!(
+        serde_json::to_value(ConfirmedDeleteReason::DetachedHead).unwrap(),
+        serde_json::json!("detached_head")
     );
 }

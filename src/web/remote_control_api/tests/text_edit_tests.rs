@@ -1159,7 +1159,11 @@ async fn remote_text_edit_unbound_lifecycle_activity_refuses() {
                 fx.set_port(Arc::new(LiveRunManagedProcesses::new(|| None)))
                     .await
             }
-            _ => drop(fx.ledger.take_lease("shell", Some(&fx.alpha))),
+            _ => {
+                let lease = fx.ledger.take_lease("shell", Some(&fx.alpha));
+                lease.mark_attempted();
+                drop(lease);
+            }
         }
         let alpha = fx.id(ALPHA).await;
         let main = fx.id("main").await;
@@ -1181,6 +1185,69 @@ async fn remote_text_edit_unbound_lifecycle_activity_refuses() {
                 .all(|change| !change.actions.force_stop_change.allowed),
             "coverage does not feed force_stop_change"
         );
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_ledger_text_edit_reports_typed_unknown_details() {
+    // Leases the runner cannot prove writer-free stay blocked with the typed
+    // detail; leases it positively knows never produced a process release.
+    for (arrangement, detail) in [
+        (
+            "attempted",
+            Some("spawn was attempted and its outcome was never reported"),
+        ),
+        (
+            "identity-less",
+            Some("spawned without a process-group identity"),
+        ),
+        ("not-attempted", None),
+        ("failed", None),
+    ] {
+        let fx = Fx::new().await;
+        let lease = fx.ledger.take_lease("shell", Some(&fx.alpha));
+        match arrangement {
+            "attempted" => lease.mark_attempted(),
+            "identity-less" => {
+                lease.mark_attempted();
+                lease.bind_pgid(0);
+            }
+            "failed" => {
+                lease.mark_attempted();
+                lease.mark_failed();
+            }
+            _ => {}
+        }
+        drop(lease);
+        let alpha = fx.id(ALPHA).await;
+        let beta = fx.id(BETA).await;
+        match detail {
+            Some(detail) => {
+                // An unresolved lease is unknown coverage for every root, its
+                // sibling's included: `coverage_under` is unchanged.
+                for id in [&alpha, &alpha, &alpha, &beta] {
+                    let (_, read) = fx.read_wt(id, "README.md").await;
+                    assert_eq!(read["editable"], json!(false), "{arrangement}: {read}");
+                    assert_eq!(
+                        blocked(&read).as_deref(),
+                        Some("managed_process_live"),
+                        "{arrangement}"
+                    );
+                    assert!(
+                        read["edit_blocked_detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains(detail),
+                        "{arrangement}: {read}"
+                    );
+                }
+            }
+            None => {
+                assert_editable(&fx, Some(&alpha), None).await;
+                assert_editable(&fx, Some(&beta), None).await;
+            }
+        }
     }
 }
 
