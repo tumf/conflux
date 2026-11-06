@@ -55,10 +55,3 @@ decision with its own completion-grace tests. The empty `RunDispatched` clock
 difference, NAME_MAX handling in text edit, the two known baseline failures,
 and Server-side relay are separate changes. Release, install, and owner
 replacement are separate operational decisions.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] Declared change-blocking verification failed under runtime supervision against candidate 537c50e9db4e.
-  evidence: the only failing gate was regression-merge (ETXTBSY shim race, see Notes); fixed in both merge-abort shim fixtures; remote_merge_abort now 22/22 pass in 10 of 10 consecutive runs.
-- [x] session-retry-stop-regression-merge: FAILED with exit code 101 (artifact gates/session-retry-stop-regression-merge.log)
-  evidence: `TMPDIR=.../evidence/tmp/eb31b2ee-6706-43a2-a993-aa4d9c1f7108 cargo test --lib --features web-monitoring,heavy-tests remote_merge_abort` selected 22, passed 22, 0 ignored, exit 0, repeated 10 times; clippy -D warnings and fmt --check clean.
