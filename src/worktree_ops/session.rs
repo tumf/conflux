@@ -10,8 +10,9 @@
 //!   call sequence both the TUI tests and the provisioner tests assert, which
 //!   is what keeps the two from drifting.
 //! * [`WorktreeSessionRegistry`] — process-local sessions of the configured
-//!   `worktree_command`. Each session is one `execute_streaming_with_retry`
-//!   invocation on a runner bound to the registry's own [`RunCommandScope`]: the
+//!   `worktree_command`. Each session is one
+//!   `execute_streaming_with_retry_observed` invocation on a runner bound to
+//!   the registry's own [`RunCommandScope`]: the
 //!   configured retry policy retries *inside* the session, a stop goes through
 //!   the runner's own cancellation handle (never an external `killpg`, which the
 //!   retry policy would read as a crash and relaunch), and owner shutdown closes
@@ -22,6 +23,12 @@
 //! everything, and no scheduling, resume, acceptance, or archive decision reads
 //! it. Output is retained in memory only, never written to a file, never sent
 //! to the log ring, the event stream, or the snapshot.
+//!
+//! Provenance is typed. The output tail holds only what the child wrote; the
+//! runner's own facts — retries, launch failures, limits, cleanup, and the
+//! reaped leader status — arrive as [`RunnerNotice`]s on a separate channel,
+//! so `attempt`, `signal`, and `runner_notices` can never be forged by a line
+//! the child prints.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -33,7 +40,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use crate::ai_command_runner::{AiCommandRunner, OutputLine, RunCommandScope};
+use crate::ai_command_runner::{
+    AiCommandRunner, OutputLine, RetryCause, RunCommandScope, RunnerNotice,
+};
 use crate::process_manager::{CommandTermination, StreamingChildHandle};
 
 use super::service::{SessionProbe, WorktreeBackend};
@@ -46,6 +55,9 @@ pub const MAX_RETAINED_FINISHED: usize = 32;
 
 /// Retained output tail per session, in bytes of sanitized line text.
 pub const MAX_OUTPUT_BYTES: usize = 65_536;
+
+/// Retained runner notices per session, oldest dropped first.
+pub const MAX_RUNNER_NOTICES: usize = 32;
 
 /// Bounded deadline owner shutdown gives the registry scope.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
@@ -610,6 +622,51 @@ impl OutputRing {
     }
 }
 
+/// One runner-generated fact retained for a session.
+///
+/// Never derived from child output. `detail` carries numbers and fixed tokens
+/// only — never the template, the expanded command, the environment, or a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerNoticeRecord {
+    /// Stable kind token.
+    pub kind: &'static str,
+    /// The attempt the notice concerns, when it concerns one.
+    pub attempt: Option<u32>,
+    /// `sanitize_detail`-ed facts, when the kind has any.
+    pub detail: Option<String>,
+}
+
+/// Retained runner notices, oldest dropped first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunnerNotices {
+    /// Retained notices, oldest first, at most [`MAX_RUNNER_NOTICES`].
+    pub notices: Vec<RunnerNoticeRecord>,
+    /// Notices dropped to stay within [`MAX_RUNNER_NOTICES`].
+    pub dropped: u64,
+}
+
+impl RunnerNotices {
+    fn push(&mut self, record: RunnerNoticeRecord) {
+        self.notices.push(record);
+        while self.notices.len() > MAX_RUNNER_NOTICES {
+            self.notices.remove(0);
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+
+/// The final leader fact the runner reported for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderFact {
+    /// The leader was reaped with this status.
+    Reaped {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// The leader was not reaped; its status is unknown.
+    NotReaped,
+}
+
 /// A coherent read of one session.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
@@ -625,7 +682,9 @@ pub struct SessionSnapshot {
     pub branch: String,
     /// Lifecycle state.
     pub state: SessionState,
-    /// Runner attempts started inside this one session.
+    /// Runner attempts started inside this one session: `1` at launch, then
+    /// the attempt of each later successful spawn the runner reported. A retry
+    /// merely scheduled does not count.
     pub attempt: u32,
     /// Launch instant.
     pub started_at: DateTime<Utc>,
@@ -633,12 +692,12 @@ pub struct SessionSnapshot {
     pub finished_at: Option<DateTime<Utc>>,
     /// Exit code of the final attempt, when it exited on its own.
     pub exit_code: Option<i32>,
-    /// Terminating signal, when one ended it.
+    /// The signal that terminated the leader as reaped; `None` when it exited
+    /// on its own or when its status is unknown.
     ///
-    /// For a stopped (or runtime-limited) session this is the signal the
-    /// runner's cancellation path sends first, `SIGTERM`: the runner's status
-    /// for a cancelled invocation is synthetic, and its SIGKILL escalation after
-    /// 5 s is not reported back.
+    /// For a stopped (or runtime-limited) session this is the reaped leader's
+    /// real signal — `SIGTERM`, or `SIGKILL` after the runner's escalation —
+    /// and both this and `exit_code` are `None` when the leader was not reaped.
     pub signal: Option<String>,
     /// A stop or owner shutdown was requested.
     pub stop_requested: bool,
@@ -648,8 +707,10 @@ pub struct SessionSnapshot {
     pub cleanup: Option<CleanupOutcome>,
     /// Whether the runner proved the process group quiescent; `None` while running.
     pub process_group_confirmed: Option<bool>,
-    /// Bounded sanitized output tail.
+    /// Bounded sanitized output tail: only what the child wrote.
     pub output: OutputTail,
+    /// Bounded runner-generated notices.
+    pub runner_notices: RunnerNotices,
 }
 
 /// Everything a launch needs. `path` and `command` are internal.
@@ -727,6 +788,8 @@ struct Entry {
     path: PathBuf,
     output: OutputRing,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The last leader fact the runner reported.
+    leader: Option<LeaderFact>,
 }
 
 #[derive(Default)]
@@ -968,24 +1031,26 @@ impl WorktreeSessionRegistry {
                     cleanup: None,
                     process_group_confirmed: None,
                     output: OutputTail::default(),
+                    runner_notices: RunnerNotices::default(),
                 },
                 path: canonical(&spec.path),
                 output: OutputRing::default(),
                 stop_tx: Some(stop_tx),
+                leader: None,
             });
         }
 
         let launched = self
             .runner
-            .execute_streaming_with_retry(
+            .execute_streaming_with_retry_observed(
                 &spec.command,
                 Some(&spec.path),
                 Some(SESSION_OPERATION),
                 None,
             )
             .await;
-        let (handle, rx) = match launched {
-            Ok(pair) => pair,
+        let (handle, rx, notices) = match launched {
+            Ok(launched) => launched,
             Err(error) => {
                 let detail = error.to_string();
                 let mut inner = self.lock();
@@ -1010,7 +1075,9 @@ impl WorktreeSessionRegistry {
         let registry = self.clone();
         let supervised = session_id.clone();
         tokio::spawn(async move {
-            registry.supervise(supervised, handle, rx, stop_rx).await;
+            registry
+                .supervise(supervised, handle, rx, notices, stop_rx)
+                .await;
         });
 
         Ok(self
@@ -1018,21 +1085,27 @@ impl WorktreeSessionRegistry {
             .expect("a just-launched session is running and never evicted"))
     }
 
-    /// Drain output, forward a stop to the runner, then settle from the
-    /// runner's own exit, termination, and cleanup evidence.
+    /// Drain output and notices, forward a stop to the runner, then settle
+    /// from the runner's own exit, termination, cleanup, and leader evidence.
     async fn supervise(
         self: Arc<Self>,
         session_id: String,
         mut handle: StreamingChildHandle,
         mut rx: tokio::sync::mpsc::Receiver<OutputLine>,
+        mut notices: tokio::sync::mpsc::UnboundedReceiver<RunnerNotice>,
         mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         let mut stop_pending = true;
+        let mut notices_open = true;
         loop {
             tokio::select! {
                 line = rx.recv() => match line {
                     Some(line) => self.record_output(&session_id, line),
                     None => break,
+                },
+                notice = notices.recv(), if notices_open => match notice {
+                    Some(notice) => self.record_notice(&session_id, notice),
+                    None => notices_open = false,
                 },
                 requested = &mut stop_rx, if stop_pending => {
                     stop_pending = false;
@@ -1044,6 +1117,12 @@ impl WorktreeSessionRegistry {
                     }
                 }
             }
+        }
+
+        // The runner closes the notice channel only when its task ends, after
+        // its last notice, so classification never races a late leader fact.
+        while let Some(notice) = notices.recv().await {
+            self.record_notice(&session_id, notice);
         }
 
         let status = handle.wait().await;
@@ -1064,7 +1143,8 @@ impl WorktreeSessionRegistry {
                 return;
             };
             let stop_requested = entry.snapshot.stop_requested;
-            let (state, exit_code, signal) = classify(&status, termination, stop_requested);
+            let (state, exit_code, signal) =
+                classify(&status, termination, stop_requested, entry.leader);
             entry.snapshot.state = state;
             entry.snapshot.exit_code = exit_code;
             entry.snapshot.signal = signal;
@@ -1090,16 +1170,22 @@ impl WorktreeSessionRegistry {
         let Some(entry) = inner.entry_mut(session_id) else {
             return;
         };
+        // Every line on this channel is child data: the runner publishes its
+        // own facts on the notice channel, so nothing here changes a typed
+        // member.
         let (stream, text) = match &line {
             OutputLine::Stdout(text) => (OutputStream::Stdout, text),
             OutputLine::Stderr(text) => (OutputStream::Stderr, text),
         };
-        // The runner announces each retry on stderr before the next attempt:
-        // that line is the one retry notification it publishes.
-        if stream == OutputStream::Stderr && is_retry_notification(text) {
-            entry.snapshot.attempt += 1;
-        }
         entry.output.push(stream, text);
+    }
+
+    fn record_notice(&self, session_id: &str, notice: RunnerNotice) {
+        let mut inner = self.lock();
+        let Some(entry) = inner.entry_mut(session_id) else {
+            return;
+        };
+        apply_notice(entry, notice);
     }
 
     /// Every retained session, newest first.
@@ -1210,25 +1296,110 @@ impl SessionProbe for WorktreeSessionRegistry {
     }
 }
 
-/// True for the runner's `[Retry N/M] ...` notification line.
-fn is_retry_notification(line: &str) -> bool {
-    line.starts_with("[Retry ")
+/// Fold one runner notice into a session.
+///
+/// `AttemptStarted` is the only source of `attempt`, and the leader facts the
+/// only source of a cancelled run's `exit_code`/`signal`; the rest is retained
+/// as bounded, sanitized records.
+fn apply_notice(entry: &mut Entry, notice: RunnerNotice) {
+    let current = entry.snapshot.attempt;
+    let record =
+        |kind: &'static str, attempt: Option<u32>, detail: Option<String>| RunnerNoticeRecord {
+            kind,
+            attempt,
+            detail: detail.map(|d| crate::events::sanitize_detail(&d)),
+        };
+    let retained = match notice {
+        RunnerNotice::AttemptStarted { attempt } => {
+            entry.snapshot.attempt = attempt;
+            entry.leader = None;
+            None
+        }
+        RunnerNotice::LeaderReaped {
+            exit_code, signal, ..
+        } => {
+            entry.leader = Some(LeaderFact::Reaped { exit_code, signal });
+            None
+        }
+        RunnerNotice::LeaderNotReaped { .. } => {
+            entry.leader = Some(LeaderFact::NotReaped);
+            None
+        }
+        RunnerNotice::RetryScheduled {
+            next_attempt,
+            max_attempts,
+            cause,
+            delay_ms,
+        } => Some(record(
+            "retry_scheduled",
+            Some(next_attempt),
+            Some(format!(
+                "cause={}, max_attempts={max_attempts}, delay_ms={delay_ms}",
+                match cause {
+                    RetryCause::Crash => "crash",
+                    RetryCause::InactivityTimeout => "inactivity_timeout",
+                }
+            )),
+        )),
+        RunnerNotice::InactivityTerminated {
+            attempt,
+            timeout_secs,
+        } => Some(record(
+            "inactivity_terminated",
+            Some(attempt),
+            Some(format!("timeout_secs={timeout_secs}")),
+        )),
+        RunnerNotice::RuntimeLimitReached { attempt } => {
+            Some(record("runtime_limit_reached", Some(attempt), None))
+        }
+        RunnerNotice::LaunchFailed { attempt, stage } => Some(record(
+            "launch_failed",
+            Some(attempt),
+            Some(format!("stage={stage}")),
+        )),
+        RunnerNotice::ShutdownRefused { stage } => Some(record(
+            "shutdown_refused",
+            None,
+            Some(format!("stage={stage}")),
+        )),
+        RunnerNotice::ProcessGroupCleanupUnconfirmed { pgid, force_killed } => Some(record(
+            "process_group_cleanup_unconfirmed",
+            Some(current),
+            Some(format!("pgid={pgid}, force_killed={force_killed}")),
+        )),
+    };
+    if let Some(record) = retained {
+        entry.snapshot.runner_notices.push(record);
+    }
 }
 
 /// Classify a settled runner invocation.
 ///
-/// A cancelled invocation's status is synthetic, so its exit code is not
-/// reported; the stop signal the runner's cancellation path sends first is.
+/// A cancelled or runtime-limited invocation's status is synthetic, so its
+/// `exit_code` and `signal` come from the reaped leader the runner reported —
+/// the real signal, `SIGKILL` included after escalation — and are both `None`
+/// when the leader was not reaped.
 fn classify(
     status: &std::io::Result<std::process::ExitStatus>,
     termination: CommandTermination,
     stop_requested: bool,
+    leader: Option<LeaderFact>,
 ) -> (SessionState, Option<i32>, Option<String>) {
+    let reaped = || match leader {
+        Some(LeaderFact::Reaped { exit_code, signal }) => (exit_code, signal.map(signal_name)),
+        Some(LeaderFact::NotReaped) | None => (None, None),
+    };
     match termination {
-        CommandTermination::Cancelled => (SessionState::Stopped, None, Some("SIGTERM".into())),
+        CommandTermination::Cancelled => {
+            let (exit_code, signal) = reaped();
+            (SessionState::Stopped, exit_code, signal)
+        }
         CommandTermination::NotStarted if stop_requested => (SessionState::Stopped, None, None),
         CommandTermination::NotStarted => (SessionState::Failed, None, None),
-        CommandTermination::RuntimeLimit => (SessionState::Failed, None, Some("SIGTERM".into())),
+        CommandTermination::RuntimeLimit => {
+            let (exit_code, signal) = reaped();
+            (SessionState::Failed, exit_code, signal)
+        }
         CommandTermination::Exited | CommandTermination::InactivityTimeout => match status {
             Ok(status) => {
                 let state = if status.success() {
@@ -1246,16 +1417,24 @@ fn classify(
 #[cfg(unix)]
 fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
-    status.signal().map(|number| {
-        nix::sys::signal::Signal::try_from(number)
-            .map(|signal| signal.as_str().to_string())
-            .unwrap_or_else(|_| format!("SIG{number}"))
-    })
+    status.signal().map(signal_name)
 }
 
 #[cfg(not(unix))]
 fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
     None
+}
+
+#[cfg(unix)]
+fn signal_name(number: i32) -> String {
+    nix::sys::signal::Signal::try_from(number)
+        .map(|signal| signal.as_str().to_string())
+        .unwrap_or_else(|_| format!("SIG{number}"))
+}
+
+#[cfg(not(unix))]
+fn signal_name(number: i32) -> String {
+    format!("SIG{number}")
 }
 
 #[cfg(test)]

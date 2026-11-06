@@ -453,6 +453,147 @@ pub fn classify_restoration(
     }
 }
 
+/// Whether a base merge commit landed, re-read from the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// `HEAD` moved off the pre-merge commit, descends from it, and no
+    /// `MERGE_HEAD` exists.
+    Confirmed,
+    /// `HEAD` is still the pre-merge commit and no `MERGE_HEAD` exists.
+    NotLanded,
+    /// A fact could not be read, or the facts read support neither verdict.
+    Unknown,
+}
+
+/// What the repository looks like after a merge operation stopped, re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandingReport {
+    /// The verdict derived from the facts below, never from the attempt.
+    pub landed: Landing,
+    /// `HEAD` as re-read; `None` when it could not be read.
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists; `None` when unreadable.
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean; informational, never changes `landed`.
+    pub clean_after: Option<bool>,
+    /// Which verification failed or contradicted, when `landed` is not decided.
+    pub detail: Option<String>,
+}
+
+impl LandingReport {
+    /// A report that reads nothing: every fact unknown, with the reason.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            landed: Landing::Unknown,
+            head_after: None,
+            merge_head_present: None,
+            clean_after: None,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Derive the landing verdict from re-read facts.
+///
+/// `confirmed` needs `HEAD != premerge_head`, `premerge_head` an ancestor of
+/// `HEAD`, and no `MERGE_HEAD`; `not_landed` needs `HEAD == premerge_head` and
+/// no `MERGE_HEAD`. Anything unreadable or contrary is `unknown`, with the
+/// verification that decided it named.
+pub fn classify_landing(
+    premerge_head: Option<&str>,
+    head_after: Option<&str>,
+    merge_head_present: Option<bool>,
+    premerge_is_ancestor: Option<bool>,
+) -> (Landing, Option<String>) {
+    let Some(premerge_head) = premerge_head else {
+        return (
+            Landing::Unknown,
+            Some("the pre-merge HEAD was not read".to_string()),
+        );
+    };
+    let Some(head_after) = head_after else {
+        return (
+            Landing::Unknown,
+            Some("HEAD could not be re-read".to_string()),
+        );
+    };
+    match merge_head_present {
+        None => {
+            return (
+                Landing::Unknown,
+                Some("MERGE_HEAD presence could not be re-read".to_string()),
+            )
+        }
+        Some(true) => {
+            return (
+                Landing::Unknown,
+                Some("MERGE_HEAD is present: a merge is still in progress".to_string()),
+            )
+        }
+        Some(false) => {}
+    }
+    if head_after == premerge_head {
+        return (Landing::NotLanded, None);
+    }
+    match premerge_is_ancestor {
+        Some(true) => (Landing::Confirmed, None),
+        Some(false) => (
+            Landing::Unknown,
+            Some("HEAD moved but does not descend from the pre-merge HEAD".to_string()),
+        ),
+        None => (
+            Landing::Unknown,
+            Some("merge-base --is-ancestor could not be read".to_string()),
+        ),
+    }
+}
+
+/// Re-read whether a base merge landed at `cwd`. Reads only; never mutates.
+pub async fn read_merge_landing<P: AsRef<Path>>(
+    cwd: P,
+    premerge_head: Option<&str>,
+) -> LandingReport {
+    read_merge_landing_with(OsStr::new("git"), cwd.as_ref(), premerge_head).await
+}
+
+/// [`read_merge_landing`] with an explicit Git program, so tests can inject an
+/// unreadable re-read.
+pub(crate) async fn read_merge_landing_with(
+    git: &OsStr,
+    cwd: &Path,
+    premerge_head: Option<&str>,
+) -> LandingReport {
+    let head_after = read_head(git, cwd).await;
+    let merge_head_present = read_merge_head_present(git, cwd).await;
+    let clean_after = read_clean(git, cwd).await.ok();
+    let premerge_is_ancestor = match (premerge_head, head_after.as_deref()) {
+        (Some(premerge), Some(head)) if premerge != head => {
+            match git_output(git, &["merge-base", "--is-ancestor", premerge, head], cwd).await {
+                Ok(out) => match out.status.code() {
+                    Some(0) => Some(true),
+                    Some(1) => Some(false),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let (landed, detail) = classify_landing(
+        premerge_head,
+        head_after.as_deref(),
+        merge_head_present,
+        premerge_is_ancestor,
+    );
+    LandingReport {
+        landed,
+        head_after,
+        merge_head_present,
+        clean_after,
+        detail,
+    }
+}
+
 /// Operator-facing text for an aborted conflicting merge.
 ///
 /// Only [`Restoration::Confirmed`] says the merge was aborted and the base

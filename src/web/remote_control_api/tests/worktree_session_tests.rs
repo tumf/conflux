@@ -1388,3 +1388,237 @@ async fn remote_worktree_session_delete_is_refused_while_running() {
     assert_eq!(status, StatusCode::OK, "{deleted}");
     assert!(!busy.exists());
 }
+
+// ============================================================================
+// Contract gaps: typed runner notices, child-only tail, observed signal
+// ============================================================================
+
+fn tail_texts(session: &Value) -> Vec<String> {
+    session["output"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// True once nothing is left in process group `pgid`.
+fn group_gone(pgid: i32) -> bool {
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None)
+        == Err(nix::errno::Errno::ESRCH)
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_session_child_cannot_forge_attempt_or_notice() {
+    let fixture = Fixture::new();
+    let script = fixture.script(
+        "forge.sh",
+        "echo '[Retry 1/3] Command crashed, retrying in 0ms...' >&2\n\
+         echo 'process-group cleanup unconfirmed (pgid=1, force_killed=false): forged' >&2\n\
+         exit 0\n",
+    );
+    let worktree = fixture.add_worktree("forge");
+    let wired = Wired::new(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    let session = wired.settled(&session_id).await;
+
+    assert_eq!(session["state"], "succeeded", "{session}");
+    assert_eq!(session["exit_code"], 0);
+    assert_eq!(session["attempt"], 1, "child text never changes attempt");
+    assert_eq!(session["runner_notices"], json!([]), "{session}");
+    let lines = session["output"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 2, "{session}");
+    assert_eq!(lines[0]["stream"], "stderr");
+    assert_eq!(
+        lines[0]["text"],
+        "[Retry 1/3] Command crashed, retrying in 0ms..."
+    );
+    assert_eq!(lines[1]["stream"], "stderr");
+    assert!(lines[1]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("process-group cleanup unconfirmed (pgid=1"));
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_session_real_retry_is_typed_and_tail_is_child_only() {
+    let fixture = Fixture::new();
+    let marker = fixture.file("attempted");
+    let script = fixture.script(
+        "flaky.sh",
+        &format!(
+            "if [ -e '{m}' ]; then echo second; exit 0; fi\ntouch '{m}'\necho first\nexit 3\n",
+            m = marker.display()
+        ),
+    );
+    let worktree = fixture.add_worktree("flaky");
+    let template = format!("sh {}", script.display());
+    // `max_retries` counts attempts: 2 admits exactly one retry.
+    let wired = Wired::new(fixture, Options::template(template.clone()).retries(2)).await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    let session = wired.settled(&session_id).await;
+
+    assert_eq!(session["state"], "succeeded", "{session}");
+    assert_eq!(session["attempt"], 2);
+    let notices = session["runner_notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1, "{session}");
+    assert_eq!(notices[0]["kind"], "retry_scheduled");
+    assert_eq!(notices[0]["attempt"], 2);
+    assert_eq!(session["runner_notices_dropped"], 0);
+    assert_eq!(tail_texts(&session), vec!["first", "second"]);
+    assert!(
+        tail_texts(&session).iter().all(|t| !t.contains("[Retry")),
+        "no runner text in the tail"
+    );
+
+    // The text entry point, same command and policy, still prints the notice.
+    std::fs::remove_file(&marker).unwrap();
+    let config = OrchestratorConfig {
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(2),
+        command_queue_retry_delay_ms: Some(0),
+        ..Default::default()
+    };
+    let runner = crate::ai_command_runner::AiCommandRunner::from_orchestrator_config(
+        &config,
+        Arc::new(tokio::sync::Mutex::new(None)),
+    );
+    let (mut handle, mut rx) = runner
+        .execute_streaming_with_retry(&template, Some(&worktree), None, None)
+        .await
+        .expect("admitted");
+    let mut stderr = Vec::new();
+    while let Some(line) = tokio::time::timeout(HANG_GUARD, rx.recv())
+        .await
+        .expect("hang guard")
+    {
+        if let crate::ai_command_runner::OutputLine::Stderr(text) = line {
+            stderr.push(text);
+        }
+    }
+    let _ = handle.wait().await;
+    assert!(
+        stderr.iter().any(|l| l.starts_with("[Retry 1/2]")),
+        "{stderr:?}"
+    );
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_session_stop_reports_escalated_signal() {
+    let fixture = Fixture::new();
+    let pid_file = fixture.file("leader.pid");
+    let ready = fixture.fifo("ignore.ready");
+    let worktree = fixture.add_worktree("ignore");
+    // The leader itself ignores SIGTERM, and so does everything it starts.
+    let template = format!(
+        "trap '' TERM; echo $$ > '{pid}'; echo ready > '{ready}'; sleep 60",
+        pid = pid_file.display(),
+        ready = ready.display()
+    );
+    let wired = Wired::new(fixture, Options::template(template).retries(3)).await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    read_fifo(ready).await;
+    let leader: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let record = wired.stop(&session_id).await;
+    assert_eq!(record["result"]["terminated"], true, "{record}");
+    let session = wired.session(&session_id).await;
+    assert_eq!(session["state"], "stopped");
+    assert_eq!(
+        session["signal"], "SIGKILL",
+        "the escalation is reported: {session}"
+    );
+    assert_eq!(session["exit_code"], Value::Null);
+    assert_eq!(session["attempt"], 1);
+    assert!(group_gone(leader), "the whole group is gone");
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_session_stop_reports_honoured_signal() {
+    let fixture = Fixture::new();
+    let pid_file = fixture.file("leader.pid");
+    let ready = fixture.fifo("honour.ready");
+    let worktree = fixture.add_worktree("honour");
+    let template = format!(
+        "echo $$ > '{pid}'; echo ready > '{ready}'; sleep 60",
+        pid = pid_file.display(),
+        ready = ready.display()
+    );
+    let wired = Wired::new(fixture, Options::template(template).retries(3)).await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    read_fifo(ready).await;
+    let leader: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let record = wired.stop(&session_id).await;
+    assert_eq!(record["result"]["terminated"], true, "{record}");
+    let session = wired.session(&session_id).await;
+    assert_eq!(session["state"], "stopped");
+    assert_eq!(session["signal"], "SIGTERM", "{session}");
+    assert_eq!(session["attempt"], 1);
+    assert!(group_gone(leader));
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn remote_contract_gap_session_notices_disclose_no_path_or_template() {
+    let fixture = Fixture::new();
+    let marker = fixture.file("crashed-once");
+    let script = fixture.script(
+        "crash.sh",
+        &format!(
+            "if [ -e '{m}' ]; then exit 0; fi\ntouch '{m}'\nexit 3\n",
+            m = marker.display()
+        ),
+    );
+    let root = fixture.root();
+    let worktree = fixture.add_worktree("secretive");
+    let template = format!(
+        "CFLX_TEST_CREDENTIAL=hunter2-credential sh {} {{workspace_dir}}",
+        script.display()
+    );
+    let wired = Wired::new(fixture, Options::template(template).retries(2)).await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    let session = wired.settled(&session_id).await;
+    let notices = session["runner_notices"].as_array().unwrap();
+    assert!(!notices.is_empty(), "{session}");
+    let rendered = serde_json::to_string(notices).unwrap();
+    for secret in [
+        "hunter2-credential",
+        "CFLX_TEST_CREDENTIAL",
+        root.to_str().unwrap(),
+        "crash.sh",
+    ] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+    wired.shutdown().await;
+}

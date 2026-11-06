@@ -9,6 +9,7 @@ mod auth_tests;
 mod command_tests;
 mod compatibility_tests;
 mod confirmed_delete_tests;
+mod contract_gap_merge_tests;
 mod dto_tests;
 mod event_ownership_tests;
 mod execution_mark_event_tests;

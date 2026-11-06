@@ -498,7 +498,9 @@ mod legacy_owner_shape {
                 "predicted_conflict",
                 "conflict_aborted",
                 "abort_failed",
-                "restore_unknown"
+                "restore_unknown",
+                "merge_failed",
+                "merged_hook_failed"
             ]
         );
         assert!(current.merge_conflict_preserves_state);

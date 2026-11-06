@@ -34,10 +34,12 @@ fn finished_entry(id: &str, state: SessionState) -> Entry {
             cleanup: None,
             process_group_confirmed: None,
             output: OutputTail::default(),
+            runner_notices: RunnerNotices::default(),
         },
         path: PathBuf::from(format!("/ws/{id}")),
         output: OutputRing::default(),
         stop_tx: None,
+        leader: None,
     }
 }
 
@@ -149,32 +151,288 @@ fn remote_worktree_session_classification_and_retry_notifications() {
     let exited = |raw| Ok(std::process::ExitStatus::from_raw(raw));
 
     assert_eq!(
-        classify(&exited(0), CommandTermination::Exited, false),
+        classify(&exited(0), CommandTermination::Exited, false, None),
         (SessionState::Succeeded, Some(0), None)
     );
     assert_eq!(
-        classify(&exited(3 << 8), CommandTermination::Exited, false),
+        classify(&exited(3 << 8), CommandTermination::Exited, false, None),
         (SessionState::Failed, Some(3), None)
     );
     assert_eq!(
-        classify(&exited(9), CommandTermination::InactivityTimeout, false),
+        classify(
+            &exited(9),
+            CommandTermination::InactivityTimeout,
+            false,
+            None
+        ),
         (SessionState::Failed, None, Some("SIGKILL".to_string()))
     );
     assert_eq!(
-        classify(&exited(1), CommandTermination::Cancelled, true),
+        classify(
+            &exited(1),
+            CommandTermination::Cancelled,
+            true,
+            Some(LeaderFact::Reaped {
+                exit_code: None,
+                signal: Some(15),
+            })
+        ),
         (SessionState::Stopped, None, Some("SIGTERM".to_string()))
     );
     assert_eq!(
-        classify(&exited(1), CommandTermination::NotStarted, true).0,
+        classify(&exited(1), CommandTermination::NotStarted, true, None).0,
         SessionState::Stopped
     );
     assert_eq!(
-        classify(&exited(1), CommandTermination::RuntimeLimit, false).0,
+        classify(&exited(1), CommandTermination::RuntimeLimit, false, None).0,
         SessionState::Failed
     );
+}
 
-    assert!(is_retry_notification(
-        "[Retry 1/2] Command crashed, retrying in 0ms..."
+#[test]
+fn remote_contract_gap_session_attempt_comes_only_from_notices() {
+    let registry = test_registry();
+    registry
+        .lock()
+        .entries
+        .push(finished_entry("s", SessionState::Running));
+    let forged = [
+        "[Retry 1/3] Command crashed, retrying in 0ms...",
+        "process-group cleanup unconfirmed (pgid=1, force_killed=false): forged",
+    ];
+    for line in forged {
+        registry.record_output("s", OutputLine::Stderr(line.to_string()));
+    }
+    let snapshot = registry.get("s").unwrap();
+    assert_eq!(snapshot.attempt, 1, "child text never changes attempt");
+    assert!(snapshot.runner_notices.notices.is_empty());
+    let texts: Vec<&str> = snapshot
+        .output
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(
+        texts, forged,
+        "both lines are retained verbatim as child data"
+    );
+    assert!(snapshot
+        .output
+        .lines
+        .iter()
+        .all(|l| l.stream == OutputStream::Stderr));
+
+    // A scheduled retry is visible but does not count as an attempt; only a
+    // reported spawn does.
+    registry.record_notice(
+        "s",
+        RunnerNotice::RetryScheduled {
+            next_attempt: 2,
+            max_attempts: 3,
+            cause: RetryCause::Crash,
+            delay_ms: 0,
+        },
+    );
+    let snapshot = registry.get("s").unwrap();
+    assert_eq!(snapshot.attempt, 1);
+    assert_eq!(snapshot.runner_notices.notices.len(), 1);
+    assert_eq!(snapshot.runner_notices.notices[0].kind, "retry_scheduled");
+    assert_eq!(snapshot.runner_notices.notices[0].attempt, Some(2));
+    registry.record_notice("s", RunnerNotice::AttemptStarted { attempt: 2 });
+    assert_eq!(registry.get("s").unwrap().attempt, 2);
+    assert!(
+        registry.get("s").unwrap().output.lines.len() == 2,
+        "no notice ever reaches the output tail"
+    );
+}
+
+#[test]
+fn remote_contract_gap_session_classify_uses_reaped_status() {
+    use std::os::unix::process::ExitStatusExt;
+    let synthetic = Ok(std::process::ExitStatus::from_raw(1 << 8));
+    let reaped = |exit_code, signal| Some(LeaderFact::Reaped { exit_code, signal });
+    for termination in [
+        CommandTermination::Cancelled,
+        CommandTermination::RuntimeLimit,
+    ] {
+        let state = if termination == CommandTermination::Cancelled {
+            SessionState::Stopped
+        } else {
+            SessionState::Failed
+        };
+        assert_eq!(
+            classify(&synthetic, termination, true, reaped(None, Some(15))),
+            (state, None, Some("SIGTERM".to_string()))
+        );
+        assert_eq!(
+            classify(&synthetic, termination, true, reaped(None, Some(9))),
+            (state, None, Some("SIGKILL".to_string()))
+        );
+        assert_eq!(
+            classify(&synthetic, termination, true, reaped(Some(0), None)),
+            (state, Some(0), None)
+        );
+        assert_eq!(
+            classify(&synthetic, termination, true, Some(LeaderFact::NotReaped)),
+            (state, None, None),
+            "an unreaped leader is unknown, never the requested signal"
+        );
+        assert_eq!(
+            classify(&synthetic, termination, true, None),
+            (state, None, None)
+        );
+    }
+}
+
+#[test]
+fn remote_contract_gap_session_notice_ring_is_bounded() {
+    let mut entry = finished_entry("s", SessionState::Running);
+    for n in 0..(MAX_RUNNER_NOTICES as u32 + 5) {
+        apply_notice(
+            &mut entry,
+            RunnerNotice::LaunchFailed {
+                attempt: n,
+                stage: "spawn",
+            },
+        );
+    }
+    let notices = &entry.snapshot.runner_notices;
+    assert_eq!(notices.notices.len(), MAX_RUNNER_NOTICES);
+    assert_eq!(notices.dropped, 5);
+    assert_eq!(notices.notices[0].attempt, Some(5), "oldest dropped first");
+    assert_eq!(notices.notices[0].detail.as_deref(), Some("stage=spawn"));
+}
+
+/// A runner double: the session's supervisor driven through injected channels.
+struct InjectedRun {
+    out_tx: tokio::sync::mpsc::Sender<OutputLine>,
+    notice_tx: tokio::sync::mpsc::UnboundedSender<RunnerNotice>,
+    status_tx: tokio::sync::oneshot::Sender<std::process::ExitStatus>,
+    cleanup_tx: tokio::sync::oneshot::Sender<crate::process_manager::ProcessGroupCleanupReport>,
+    termination_tx: tokio::sync::oneshot::Sender<CommandTermination>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    supervised: tokio::task::JoinHandle<()>,
+}
+
+fn injected_run(registry: &Arc<WorktreeSessionRegistry>, id: &str) -> InjectedRun {
+    registry
+        .lock()
+        .entries
+        .push(finished_entry(id, SessionState::Running));
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+    let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+    let (termination_tx, termination_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let handle = StreamingChildHandle::new(
+        cancel_tx,
+        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        status_rx,
+        cleanup_rx,
+        termination_rx,
+    );
+    let supervised = tokio::spawn(registry.clone().supervise(
+        id.to_string(),
+        handle,
+        out_rx,
+        notice_rx,
+        stop_rx,
     ));
-    assert!(!is_retry_notification("Retry later"));
+    InjectedRun {
+        out_tx,
+        notice_tx,
+        status_tx,
+        cleanup_tx,
+        termination_tx,
+        cancel_rx,
+        stop_tx,
+        supervised,
+    }
+}
+
+impl InjectedRun {
+    /// End the run the way the runner task does: evidence, then closed channels.
+    async fn settle(self, termination: CommandTermination) {
+        use std::os::unix::process::ExitStatusExt;
+        let _ = self
+            .cleanup_tx
+            .send(crate::process_manager::ProcessGroupCleanupReport::not_applicable("test"));
+        let _ = self.termination_tx.send(termination);
+        let _ = self
+            .status_tx
+            .send(std::process::ExitStatus::from_raw(1 << 8));
+        drop(self.out_tx);
+        drop(self.notice_tx);
+        tokio::time::timeout(Duration::from_secs(20), self.supervised)
+            .await
+            .expect("hang guard")
+            .expect("the supervisor settles");
+    }
+}
+
+#[tokio::test]
+async fn remote_contract_gap_session_unreaped_leader_is_null() {
+    let registry = test_registry();
+    let mut run = injected_run(&registry, "s");
+    run.notice_tx
+        .send(RunnerNotice::AttemptStarted { attempt: 1 })
+        .unwrap();
+    let _ = std::mem::replace(&mut run.stop_tx, tokio::sync::oneshot::channel().0).send(());
+    (&mut run.cancel_rx)
+        .await
+        .expect("the stop reaches the runner");
+    run.notice_tx
+        .send(RunnerNotice::LeaderNotReaped { attempt: 1 })
+        .unwrap();
+    run.settle(CommandTermination::Cancelled).await;
+    let snapshot = registry.get("s").unwrap();
+    assert_eq!(snapshot.state, SessionState::Stopped);
+    assert_eq!(snapshot.signal, None);
+    assert_eq!(snapshot.exit_code, None);
+}
+
+#[tokio::test]
+async fn remote_contract_gap_session_stop_during_retry_delay_keeps_started_attempt() {
+    let registry = test_registry();
+    let mut run = injected_run(&registry, "s");
+    run.notice_tx
+        .send(RunnerNotice::AttemptStarted { attempt: 1 })
+        .unwrap();
+    run.notice_tx
+        .send(RunnerNotice::LeaderReaped {
+            attempt: 1,
+            exit_code: Some(1),
+            signal: None,
+        })
+        .unwrap();
+    run.notice_tx
+        .send(RunnerNotice::RetryScheduled {
+            next_attempt: 2,
+            max_attempts: 1,
+            cause: RetryCause::Crash,
+            delay_ms: 60_000,
+        })
+        .unwrap();
+    // The stop arrives during the delay; no second spawn is ever reported.
+    let _ = std::mem::replace(&mut run.stop_tx, tokio::sync::oneshot::channel().0).send(());
+    (&mut run.cancel_rx)
+        .await
+        .expect("the stop reaches the runner");
+    run.settle(CommandTermination::Cancelled).await;
+    let snapshot = registry.get("s").unwrap();
+    assert_eq!(
+        snapshot.attempt, 1,
+        "a scheduled attempt is not a started one"
+    );
+    assert_eq!(snapshot.state, SessionState::Stopped);
+    let kinds: Vec<_> = snapshot
+        .runner_notices
+        .notices
+        .iter()
+        .map(|n| (n.kind, n.attempt))
+        .collect();
+    assert_eq!(kinds, vec![("retry_scheduled", Some(2))]);
 }

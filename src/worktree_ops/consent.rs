@@ -64,13 +64,19 @@ pub const CONTENT_ID_ALGORITHM: &str = "sha256";
 /// The oracle's combined budget over tracked, untracked, and ignored content.
 ///
 /// Each path counts once. `records` counts status records plus every walked
-/// entry; `hashed_bytes` counts regular-file bytes and symlink target bytes.
+/// entry; `hashed_bytes` counts regular-file bytes and symlink target bytes;
+/// `listing_name_bytes` bounds the entry names one directory listing retains.
+/// Every walked entry is charged as it is read, before its name is kept, so a
+/// single huge directory stops at the budget instead of being materialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsentLimits {
     /// More records than this is [`ContentObservation::Unbounded`].
     pub max_records: usize,
     /// More hashed bytes than this is [`ContentObservation::Unbounded`].
     pub max_hashed_bytes: u64,
+    /// More directory-entry name bytes in one listing than this is
+    /// [`ContentObservation::Unbounded`].
+    pub max_listing_name_bytes: u64,
 }
 
 impl ConsentLimits {
@@ -78,6 +84,7 @@ impl ConsentLimits {
     pub const PRODUCTION: Self = Self {
         max_records: 500_000,
         max_hashed_bytes: 256 * 1024 * 1024,
+        max_listing_name_bytes: 64 * 1024 * 1024,
     };
 }
 
@@ -254,6 +261,41 @@ impl Bound {
             entries,
             ignored_entries,
         }
+    }
+}
+
+/// What an observation consumed, for tests that assert the budget held.
+#[cfg(all(test, unix))]
+struct ObservationCounters {
+    observation: ContentObservation,
+    /// Records the oracle charged, the stopping one included.
+    records: usize,
+    /// Names the last directory listing had retained when it returned.
+    last_listing_retained: usize,
+}
+
+#[cfg(all(test, unix))]
+fn observe_counters(worktree: &Path, limits: &ConsentLimits) -> ObservationCounters {
+    let output = std::process::Command::new("git")
+        .args(read_only_status_argv(CONSENT_STATUS_ARGS))
+        .current_dir(worktree)
+        .output()
+        .expect("git status runs");
+    assert!(output.status.success(), "git status succeeds");
+    let records = parse_status(&output.stdout).expect("status parses");
+    let mut oracle = unix::Oracle::new(limits, &records);
+    let result = oracle.bind_into(worktree, &records);
+    let (counted, last_listing_retained) = oracle.counters();
+    let observation = match result {
+        Ok(()) => ContentObservation::Observed(oracle.into_bound().finish()),
+        Err(Stop::Unobservable) => ContentObservation::Unobservable,
+        Err(Stop::Unbounded) => ContentObservation::Unbounded,
+        Err(Stop::Nested) => ContentObservation::NestedRepository,
+    };
+    ObservationCounters {
+        observation,
+        records: counted,
+        last_listing_retained,
     }
 }
 
@@ -454,6 +496,8 @@ mod unix {
         limits: &'a ConsentLimits,
         records: usize,
         hashed_bytes: u64,
+        /// Names the most recent directory listing retained, for tests.
+        last_listing_retained: usize,
         discardable: Vec<(Vec<u8>, Vec<u8>)>,
         ignored: Vec<(Vec<u8>, Vec<u8>)>,
         /// Ignored paths (no trailing `/`) that a `?` directory walk must skip:
@@ -474,6 +518,7 @@ mod unix {
                 limits,
                 records: 0,
                 hashed_bytes: 0,
+                last_listing_retained: 0,
                 discardable: Vec::new(),
                 ignored: Vec::new(),
                 ignored_paths,
@@ -481,6 +526,24 @@ mod unix {
         }
 
         pub(super) fn bind(mut self, worktree: &Path, records: &[StatusRecord]) -> Step<Bound> {
+            self.bind_into(worktree, records)?;
+            Ok(self.into_bound())
+        }
+
+        pub(super) fn into_bound(self) -> Bound {
+            Bound {
+                discardable: self.discardable,
+                ignored: self.ignored,
+            }
+        }
+
+        /// Records charged so far and the size of the latest listing.
+        #[cfg(test)]
+        pub(super) fn counters(&self) -> (usize, usize) {
+            (self.records, self.last_listing_retained)
+        }
+
+        pub(super) fn bind_into(&mut self, worktree: &Path, records: &[StatusRecord]) -> Step<()> {
             let root = open_root(worktree).map_err(|_| Stop::Unobservable)?;
             for record in records {
                 if record.submodule {
@@ -510,14 +573,11 @@ mod unix {
                     }
                 }
             }
-            Ok(Bound {
-                discardable: self.discardable,
-                ignored: self.ignored,
-            })
+            Ok(())
         }
 
         fn count_record(&mut self) -> Step<()> {
-            self.records += 1;
+            self.records = self.records.saturating_add(1);
             if self.records > self.limits.max_records {
                 return Err(Stop::Unbounded);
             }
@@ -680,7 +740,9 @@ mod unix {
             if depth > MAX_WALK_DEPTH {
                 return Err(Stop::Unbounded);
             }
-            let mut names = read_dir_names(dir).map_err(|_| Stop::Unobservable)?;
+            // The listing charges one record per entry as it reads it, and
+            // leaves out the ignored paths a `?` walk must skip.
+            let mut names = self.read_dir_names(dir, prefix, set)?;
             names.sort();
             for name in names {
                 // Content below a `.git` entry cannot be enumerated from this
@@ -691,10 +753,6 @@ mod unix {
                 let mut path = prefix.to_vec();
                 path.push(b'/');
                 path.extend_from_slice(&name);
-                if set == Set::Discardable && self.ignored_paths.contains(&path) {
-                    continue;
-                }
-                self.count_record()?;
                 let (leaf, child) = self.leaf_at(dir, &name, true)?;
                 self.push(set, path.clone(), b"w", &leaf);
                 if let Some(child) = child {
@@ -872,41 +930,99 @@ mod unix {
         }
     }
 
-    /// Entry names of an open directory, without `.` and `..`.
-    fn read_dir_names(dir: &OwnedFd) -> std::io::Result<Vec<Vec<u8>>> {
-        // `fdopendir` takes ownership of the descriptor it is given, so it gets
-        // a duplicate and the caller keeps its own.
-        // SAFETY: `dir` is an open descriptor.
-        let duplicate = owned(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
-        // SAFETY: `duplicate` is an open directory descriptor; on success the
-        // stream owns it and `closedir` closes it.
-        let stream = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
-        if stream.is_null() {
-            return Err(std::io::Error::last_os_error());
+    /// An open directory stream, closed exactly once when dropped.
+    struct DirStream(*mut libc::DIR);
+
+    impl DirStream {
+        /// Open a stream over a duplicate of `dir`; the caller keeps its own.
+        fn open(dir: &OwnedFd) -> std::io::Result<Self> {
+            // SAFETY: `dir` is an open descriptor.
+            let duplicate =
+                owned(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+            // SAFETY: `duplicate` is an open directory descriptor; on success
+            // the stream owns it and `closedir` closes it.
+            let stream = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
+            if stream.is_null() {
+                // `duplicate` is still ours and closes when dropped here.
+                return Err(std::io::Error::last_os_error());
+            }
+            std::mem::forget(duplicate);
+            Ok(Self(stream))
         }
-        std::mem::forget(duplicate);
-        let mut names = Vec::new();
-        let result = loop {
+
+        /// The next entry name, `None` at the end of the stream.
+        fn next_name(&mut self) -> std::io::Result<Option<&[u8]>> {
             clear_errno();
-            // SAFETY: `stream` is a valid open directory stream.
-            let entry = unsafe { libc::readdir(stream) };
+            // SAFETY: `self.0` is a valid open directory stream.
+            let entry = unsafe { libc::readdir(self.0) };
             if entry.is_null() {
                 let error = std::io::Error::last_os_error();
-                break match error.raw_os_error() {
-                    Some(0) | None => Ok(()),
+                return match error.raw_os_error() {
+                    Some(0) | None => Ok(None),
                     Some(_) => Err(error),
                 };
             }
             // SAFETY: `readdir` returned a valid entry whose name is
-            // NUL-terminated.
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
+            // NUL-terminated and lives until the next `readdir` on this stream,
+            // which the `&mut self` borrow excludes.
+            Ok(Some(
+                unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes(),
+            ))
+        }
+    }
+
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is valid and this is its only `closedir`.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    impl Oracle<'_> {
+        /// Entry names of an open directory, without `.` and `..`.
+        ///
+        /// Budgeted per entry: each one is charged as a record before its name
+        /// is retained, and the retained name bytes are bounded by
+        /// `max_listing_name_bytes`. The first entry past either budget stops
+        /// the listing as `Unbounded`, so no directory is ever materialized
+        /// beyond the budget. The stream is closed on every path.
+        ///
+        /// In a discardable walk, an entry that is an ignored path is skipped
+        /// uncharged: it is read once, through its own `!` record, which
+        /// already counted it.
+        fn read_dir_names(&mut self, dir: &OwnedFd, prefix: &[u8], set: Set) -> Step<Vec<Vec<u8>>> {
+            let skips_ignored = set == Set::Discardable && !self.ignored_paths.is_empty();
+            let mut stream = DirStream::open(dir).map_err(|_| Stop::Unobservable)?;
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            let mut listing_bytes: u64 = 0;
+            self.last_listing_retained = 0;
+            loop {
+                let name = match stream.next_name() {
+                    Ok(Some(name)) => name,
+                    Ok(None) => break,
+                    Err(_) => return Err(Stop::Unobservable),
+                };
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                if skips_ignored {
+                    let mut path = prefix.to_vec();
+                    path.push(b'/');
+                    path.extend_from_slice(name);
+                    if self.ignored_paths.contains(&path) {
+                        continue;
+                    }
+                }
+                self.count_record()?;
+                listing_bytes = listing_bytes.saturating_add(name.len() as u64);
+                if listing_bytes > self.limits.max_listing_name_bytes {
+                    return Err(Stop::Unbounded);
+                }
                 names.push(name.to_vec());
+                self.last_listing_retained = names.len();
             }
-        };
-        // SAFETY: `stream` is valid and closed exactly once.
-        unsafe { libc::closedir(stream) };
-        result.map(|()| names)
+            Ok(names)
+        }
     }
 }
 
@@ -995,7 +1111,9 @@ pub enum ConfirmedDeleteReason {
     AheadUnknown,
     /// The content observation could not be taken.
     ContentUnobservable,
-    /// The content observation exceeded its combined budget.
+    /// The content observation exceeded its budget: 500,000 records, 256 MiB
+    /// of hashed bytes, or 64 MiB of directory-entry names in one listing
+    /// (`max_listing_name_bytes`).
     ContentUnbounded,
     /// An actual nested repository or a status-reported submodule.
     NestedRepository,
@@ -1011,11 +1129,13 @@ pub enum ConfirmedDeleteReason {
     IgnoredContent,
     /// `.wt/teardown` failed; the worktree was retained.
     TeardownFailed,
+    /// The worktree has a detached HEAD (no branch), so no option is offered.
+    DetachedHead,
 }
 
 impl ConfirmedDeleteReason {
     /// Every reason, in the order capabilities advertise them.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::BranchChanged,
         Self::IdentityChanged,
         Self::HeadMoved,
@@ -1035,6 +1155,7 @@ impl ConfirmedDeleteReason {
         Self::Dirty,
         Self::IgnoredContent,
         Self::TeardownFailed,
+        Self::DetachedHead,
     ];
 
     /// Wire representation.
@@ -1059,6 +1180,7 @@ impl ConfirmedDeleteReason {
             Self::Dirty => "dirty",
             Self::IgnoredContent => "ignored_content",
             Self::TeardownFailed => "teardown_failed",
+            Self::DetachedHead => "detached_head",
         }
     }
 

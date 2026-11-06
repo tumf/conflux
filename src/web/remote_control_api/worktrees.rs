@@ -35,6 +35,7 @@ use crate::worktree_ops::service::{
 use super::dto::{
     new_hex_id, CommandResult, ConfirmedDeleteParams, ConfirmedDeleteRefusalResult,
     ConfirmedDeleteResult, ErrorCode, MergeAbortEvidence, MergeAbortOutcome, MergeAbortResult,
+    MergeHookEvidence, MergeLanded, MergeLandingEvidence,
 };
 use super::executor::{CommandFailure, ExecutionSummary};
 
@@ -65,11 +66,13 @@ pub const MERGE_ABORT_RESTORE_VERIFICATION: [&str; 3] =
     ["head_equals_premerge", "no_merge_head", "root_clean"];
 
 /// Every stable reason an abort-on-conflict merge can settle with besides `merged`.
-pub const MERGE_ABORT_REASONS: [&str; 4] = [
+pub const MERGE_ABORT_REASONS: [&str; 6] = [
     "predicted_conflict",
     "conflict_aborted",
     "abort_failed",
     "restore_unknown",
+    "merge_failed",
+    "merged_hook_failed",
 ];
 
 // ============================================================================
@@ -445,6 +448,11 @@ impl MergeAbortCapability {
 
 /// Whether consent-bound destructive deletion is served, and how to use it.
 ///
+/// The content observation budget behind `content_unbounded` is 500,000
+/// records, 256 MiB of hashed bytes, and `max_listing_name_bytes` — 64 MiB of
+/// directory-entry names per listing, charged entry by entry as it is read.
+/// A detached worktree is `detached_head` for every option.
+///
 /// `Default` is the *unavailable* answer, which is what `#[serde(default)]`
 /// decodes an older owner's omission as.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -593,6 +601,11 @@ pub struct DeletePreviewResponse {
     pub head: String,
     /// True for the main worktree, which is never deletable.
     pub is_main: bool,
+    /// True when the worktree has a detached HEAD (no branch). Every option is
+    /// then ineligible with `detached_head`, and the empty `consent.branch`
+    /// cannot be echoed. Omitted by older owners, which decodes as `false`.
+    #[serde(default)]
+    pub is_detached: bool,
     /// Uncommitted-change state (`--ignored=no`); `null` when unobservable.
     // Published as required: always written, `null` when it does not apply.
     #[schema(required)]
@@ -754,9 +767,75 @@ pub fn map_worktree_error(error: &WorktreeOpError) -> CommandFailure {
             crate::vcs::git::commands::Restoration::Failed
             | crate::vcs::git::commands::Restoration::Unknown => ErrorCode::MergeAbortFailed,
         },
-        WorktreeOpError::Internal(_) => ErrorCode::InternalError,
+        // The base moved: a 409-class state, not an owner fault.
+        WorktreeOpError::MergedHookFailed { .. } => ErrorCode::MergeHookFailed,
+        WorktreeOpError::MergeFailed { .. } | WorktreeOpError::Internal(_) => {
+            ErrorCode::InternalError
+        }
     };
     CommandFailure::new(code, error.to_string())
+}
+
+/// `merge_worktree` keeps its contract byte for byte: the typed merge
+/// failures an abort-on-conflict merge produces are `internal_error` there,
+/// with no result.
+fn map_preserving_merge_error(error: &WorktreeOpError) -> CommandFailure {
+    match error {
+        WorktreeOpError::MergedHookFailed { .. } | WorktreeOpError::MergeFailed { .. } => {
+            CommandFailure::new(ErrorCode::InternalError, error.to_string())
+        }
+        other => map_worktree_error(other),
+    }
+}
+
+/// How many bytes of a hook's failure text a result may quote.
+const MAX_HOOK_DETAIL_BYTES: usize = 1024;
+
+/// Last `MAX_HOOK_DETAIL_BYTES` of `text` after the shared detail sanitizer,
+/// control characters replaced, never splitting a character.
+fn bounded_hook_detail(text: &str) -> String {
+    let sanitized = crate::events::sanitize_detail(text);
+    let trimmed = sanitized.trim();
+    let mut start = trimmed.len().saturating_sub(MAX_HOOK_DETAIL_BYTES);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    trimmed[start..]
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Landing evidence of a conflicting merge, derived from its verified abort.
+fn landing_from_abort(abort: &crate::vcs::git::commands::AbortReport) -> MergeLandingEvidence {
+    let moved = abort
+        .head_after
+        .as_deref()
+        .is_some_and(|head| head != abort.premerge_head);
+    let (landed, detail) = if moved {
+        // The abort's reads include no ancestry check, so a moved HEAD is
+        // reported for what it is rather than as a failed read.
+        (
+            crate::vcs::git::commands::Landing::Unknown,
+            Some("HEAD differs from the pre-merge HEAD after the abort".to_string()),
+        )
+    } else {
+        crate::vcs::git::commands::classify_landing(
+            Some(&abort.premerge_head),
+            abort.head_after.as_deref(),
+            abort.merge_head_present,
+            None,
+        )
+    };
+    MergeLandingEvidence {
+        landed: landed.into(),
+        head_after: abort.head_after.clone(),
+        merge_head_present: abort.merge_head_present,
+        clean_after: abort.clean_after,
+        detail,
+    }
 }
 
 /// Typed `merge_abort` evidence for a refusal, when the refusal has any.
@@ -778,6 +857,15 @@ pub fn merge_abort_failure_result(
             conflict_files: files.clone(),
             abort: None,
             recovery: None,
+            // Refused before any Git mutation: positively nothing landed.
+            merge: Some(MergeLandingEvidence {
+                landed: MergeLanded::NotLanded,
+                head_after: None,
+                merge_head_present: None,
+                clean_after: None,
+                detail: Some("refused before any Git mutation".to_string()),
+            }),
+            hook: Some(MergeHookEvidence::not_run()),
         }),
         WorktreeOpError::MergeConflictAborted { files, abort } => {
             let confirmed = abort.restored == Restoration::Confirmed;
@@ -793,8 +881,45 @@ pub fn merge_abort_failure_result(
                 conflict_files: files.clone(),
                 abort: Some(MergeAbortEvidence::from_report(abort)),
                 recovery: (!confirmed).then(|| RECOVERY_LOCAL_OR_TUI.to_string()),
+                merge: Some(landing_from_abort(abort)),
+                hook: Some(MergeHookEvidence::not_run()),
             })
         }
+        WorktreeOpError::MergedHookFailed {
+            premerge_head,
+            landing,
+            hook_detail,
+            ..
+        } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::MergedHookFailed,
+            premerge_head: premerge_head.clone(),
+            conflict_files: Vec::new(),
+            abort: None,
+            recovery: Some(RECOVERY_LOCAL_OR_TUI.to_string()),
+            merge: Some(MergeLandingEvidence::from_report(landing)),
+            hook: Some(MergeHookEvidence {
+                ran: true,
+                exit_ok: Some(false),
+                detail: Some(bounded_hook_detail(hook_detail)),
+            }),
+        }),
+        WorktreeOpError::MergeFailed {
+            premerge_head,
+            landing,
+            ..
+        } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::MergeFailed,
+            premerge_head: premerge_head.clone(),
+            conflict_files: Vec::new(),
+            abort: None,
+            recovery: None,
+            merge: Some(MergeLandingEvidence::from_report(landing)),
+            hook: Some(MergeHookEvidence::not_run()),
+        }),
         _ => None,
     }
 }
@@ -974,7 +1099,7 @@ impl WorktreeOperations for RemoteWorktreeOperations {
             .service
             .merge_worktree(&key.path, ConflictPolicy::PreserveConflict)
             .await
-            .map_err(|error| map_worktree_error(&error))?;
+            .map_err(|error| map_preserving_merge_error(&error))?;
 
         let _ = self.observe().await;
         Ok(ExecutionSummary::changed(outcome.detail))
@@ -994,19 +1119,34 @@ impl WorktreeOperations for RemoteWorktreeOperations {
         // failed abort left behind are what the next read reports.
         let refreshed = self.observe().await.ok();
         match result {
-            Ok(outcome) => Ok(
-                ExecutionSummary::changed(outcome.detail.clone()).with_result(
-                    CommandResult::MergeAbort(Box::new(MergeAbortResult {
-                        worktree_id: worktree_id.to_string(),
-                        branch: outcome.branch,
-                        outcome: MergeAbortOutcome::Merged,
-                        premerge_head: None,
-                        conflict_files: Vec::new(),
-                        abort: None,
-                        recovery: None,
-                    })),
-                ),
-            ),
+            Ok(outcome) => {
+                let evidence = outcome.merge_evidence.as_ref();
+                Ok(
+                    ExecutionSummary::changed(outcome.detail.clone()).with_result(
+                        CommandResult::MergeAbort(Box::new(MergeAbortResult {
+                            worktree_id: worktree_id.to_string(),
+                            branch: outcome.branch,
+                            outcome: MergeAbortOutcome::Merged,
+                            premerge_head: None,
+                            conflict_files: Vec::new(),
+                            abort: None,
+                            recovery: None,
+                            merge: evidence.map(|e| MergeLandingEvidence::from_report(&e.landing)),
+                            hook: evidence.map(|e| {
+                                if e.hook_ran {
+                                    MergeHookEvidence {
+                                        ran: true,
+                                        exit_ok: Some(true),
+                                        detail: None,
+                                    }
+                                } else {
+                                    MergeHookEvidence::not_run()
+                                }
+                            }),
+                        })),
+                    ),
+                )
+            }
             Err(error) => {
                 let branch = refreshed
                     .as_ref()
@@ -1052,6 +1192,7 @@ impl WorktreeOperations for RemoteWorktreeOperations {
             branch: preview.facts.branch.clone(),
             head: preview.facts.head.clone(),
             is_main: preview.facts.is_main,
+            is_detached: preview.facts.is_detached || preview.facts.branch.is_empty(),
             dirty: preview.observation.dirty,
             has_commits_ahead: preview.observation.has_commits_ahead,
             inspection: preview.facts.inspection,

@@ -157,6 +157,17 @@ symlinks, and executable files are `text_not_editable`. Writer exclusion
 published on every read as `editable` and enforced as `target_ineligible`.
 External editors are not excluded, and a save never commits, stages, or pushes.
 
+**Abort-on-conflict merge.** `merge_worktree_abort_on_conflict` settles with a
+typed `merge_abort` result on success and on every refusal after eligibility.
+`merge` says whether the merge commit landed on base (`confirmed`,
+`not_landed`, or `unknown`), re-read from Git after the command stopped, and
+`hook` what `on_merged` did. A hook failure after a landed merge is
+`merge_hook_failed` with `outcome: merged_hook_failed` and
+`recovery: local_or_tui_required`; a Git failure before any merge commit stays
+`internal_error` with `outcome: merge_failed`. Nothing re-merges, aborts,
+resets, or re-runs the hook. `merge_worktree` is unchanged: the same failures
+are `internal_error` with no result.
+
 **Worktree safety.** Worktrees are addressed only by the opaque process-local
 `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
 server-derived and are rejected as mutation input, so no client can steer where a
@@ -175,7 +186,12 @@ identities over the bytes `git worktree remove --force` would delete beyond
 again before removal, every fact is re-derived; any difference is
 `delete_consent_stale` with nothing removed. An unobservable or over-budget
 content observation is `worktree_dirty_unknown`, and a nested repository is
-`target_ineligible`, whatever permissions were given.
+`target_ineligible`, whatever permissions were given. The observation budget is
+500,000 records, 256 MiB of hashed bytes, and 64 MiB of directory-entry names
+per listing (`max_listing_name_bytes`); every directory entry is charged as it
+is read, so no listing is materialized past it. A detached worktree reports
+every option ineligible with `detached_head`, and its empty `consent.branch`
+cannot be echoed: there is no remote detached destructive delete.
 
 **Worktree sessions.** `run_worktree_command` (an existing worktree by opaque
 `worktree_id`) and `create_session_worktree` (a fresh `ws-session-*` worktree
@@ -183,13 +199,17 @@ from base `HEAD`, set up and cleaned up exactly as the TUI `+` key does) launch
 the owner's *configured* `worktree_command`. No request carries a command, argv,
 environment, path, or branch; the template's `{workspace_dir}` and `{repo_root}`
 are expanded server-side. stdin is `/dev/null`, the configured retry policy
-retries inside one session (`attempt`), an exact idempotent replay launches
+retries inside one session (`attempt`, counted from the runner's typed
+report of each successful spawn), an exact idempotent replay launches
 nothing, and a second request for a running worktree or a fifth concurrent
 session is `worktree_session_busy`. `stop_worktree_session` cancels through the
 runner's own path and settles after the reap. `GET /api/v2/worktree-sessions`
-publishes each session with a bounded output tail: that tail is the command's own
-stdout/stderr with control sequences stripped, **not redacted**, readable by every
-authenticated client. Owner-generated members never carry the template, the
+publishes each session with a bounded output tail: that tail is only the
+command's own stdout/stderr with control sequences stripped, **not redacted**,
+readable by every authenticated client. The runner's own retry, launch-failure,
+shutdown, limit, and cleanup facts are `runner_notices`, from a typed channel no
+child output can forge, and `signal` is the signal that terminated the leader as
+reaped — `SIGKILL` after escalation — or `null` when unknown. Owner-generated members never carry the template, the
 expanded command, environment values, or absolute paths. Session state events
 (`worktree_session_started`, `worktree_session_finished`) never advance
 `state_revision`; output is never an event or a log entry.";
@@ -316,6 +336,7 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::SessionCleanupFacts,
             crate::web::remote_control_api::dto::SessionOutput,
             crate::web::remote_control_api::dto::SessionOutputLine,
+            crate::web::remote_control_api::dto::SessionRunnerNotice,
             crate::web::remote_control_api::dto::SessionSetupFacts,
             crate::web::remote_control_api::dto::WorktreeSessionCapability,
             crate::web::remote_control_api::dto::WorktreeSessionEventType,
@@ -340,6 +361,9 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::MergeAbortOutcome,
             crate::web::remote_control_api::dto::MergeAbortRestoration,
             crate::web::remote_control_api::dto::MergeAbortResult,
+            crate::web::remote_control_api::dto::MergeHookEvidence,
+            crate::web::remote_control_api::dto::MergeLanded,
+            crate::web::remote_control_api::dto::MergeLandingEvidence,
             crate::web::remote_control_api::worktrees::MergeAbortCapability,
             // Consent-bound destructive deletion: a read-only preview whose
             // `consent` is echoed to one separate, re-verified command.

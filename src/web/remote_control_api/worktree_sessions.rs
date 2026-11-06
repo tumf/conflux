@@ -31,13 +31,13 @@ use crate::worktree_ops::session::{
     CleanupOutcome, GitSessionProvisionRuntime, LaunchSpec, ProvisionError, SessionEvent,
     SessionEventSink, SessionKind, SessionProvisionRuntime, SessionProvisioner, SessionRefusal,
     SessionSnapshot, SetupFacts, WorktreeSessionRegistry, MAX_OUTPUT_BYTES, MAX_RETAINED_FINISHED,
-    MAX_RUNNING_SESSIONS, SESSION_REASONS,
+    MAX_RUNNER_NOTICES, MAX_RUNNING_SESSIONS, SESSION_REASONS,
 };
 
 use super::auth::CorrelationId;
 use super::dto::{
     ApiError, CommandResult, ErrorCode, SessionCleanupFacts, SessionOutput, SessionOutputLine,
-    SessionSetupFacts, WorktreeSessionCapability, WorktreeSessionEventType,
+    SessionRunnerNotice, SessionSetupFacts, WorktreeSessionCapability, WorktreeSessionEventType,
     WorktreeSessionResource, WorktreeSessionResponse, WorktreeSessionResult,
     WorktreeSessionsResponse,
 };
@@ -129,6 +129,7 @@ pub fn capability(
         max_running: MAX_RUNNING_SESSIONS,
         max_retained: MAX_RETAINED_FINISHED,
         max_output_bytes: MAX_OUTPUT_BYTES,
+        max_runner_notices: Some(MAX_RUNNER_NOTICES),
         stdin: "null".to_string(),
         reasons: SESSION_REASONS.iter().map(|r| r.to_string()).collect(),
         event_types: vec![
@@ -654,6 +655,19 @@ pub fn resource(snapshot: &SessionSnapshot, instance_id: &str) -> WorktreeSessio
             retained_bytes: snapshot.output.retained_bytes,
             truncated_bytes: snapshot.output.truncated_bytes,
         },
+        runner_notices: Some(
+            snapshot
+                .runner_notices
+                .notices
+                .iter()
+                .map(|notice| SessionRunnerNotice {
+                    kind: notice.kind.to_string(),
+                    attempt: notice.attempt,
+                    detail: notice.detail.clone(),
+                })
+                .collect(),
+        ),
+        runner_notices_dropped: Some(snapshot.runner_notices.dropped),
     }
 }
 

@@ -222,6 +222,10 @@ impl WorktreeBackend for GitWorktreeBackend {
         }
     }
 
+    async fn merge_landing(&self, premerge_head: Option<&str>) -> commands::LandingReport {
+        commands::read_merge_landing(&self.repo_root, premerge_head).await
+    }
+
     async fn run_on_merged(&self, change_id: &str, worktree_path: &Path) -> WorktreeOpResult<()> {
         let hooks_config = self.config.get_hooks();
         let hooks = match &self.hook_events {

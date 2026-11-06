@@ -511,7 +511,11 @@ executable, oversized, and non-text files are `text_not_editable` with a stable
 (`change_active`, `change_admitted`, `managed_process_live`, `root_busy`) from
 the same classifier a write is refused by (`target_ineligible`);
 `managed_process_live` means a managed writer is bound to the root *or* the
-owner cannot prove none is, and `edit_blocked_detail` says which. Retained
+owner cannot prove none is, and `edit_blocked_detail` says which. An unscoped
+writer's lease is released only on positive knowledge of its spawn — never
+attempted, a spawn that returned an error, or a bound process group observed
+empty; an attempted spawn whose outcome was never reported, or one without a
+process-group identity, stays unknown with that typed detail. Retained
 unproven processes from an earlier run keep their root blocked; restarting the
 owner is not quiescence evidence, and the editor kills nothing. External
 editors are not excluded: the compare and the rename are not atomic against
@@ -531,7 +535,9 @@ from `GET /api/v2/worktree-sessions[/{session_id}]` and stopped with
 any of it.
 
 - Same runner path as the TUI: `sh -c`, stdin `/dev/null`, own process group,
-  stagger, and the configured retry policy *inside* one session (`attempt`).
+  stagger, and the configured retry policy *inside* one session (`attempt`,
+  moved only by the runner's typed report of a later successful spawn; a retry
+  merely scheduled does not count).
   An exact idempotent replay launches nothing; a running worktree is
   `worktree_session_busy` (`reason=worktree_busy`); a fifth concurrent session is
   `worktree_session_busy` (`reason=capacity`) before any Git effect.
@@ -559,9 +565,16 @@ any of it.
   environment, or cwd discloses them; that is the operator's choice when
   configuring `worktree_command`. The tail is never an event, log entry, or
   snapshot field, and owner-generated members never carry the template, the
-  expanded command, environment values, or absolute paths. The runner's own
-  stderr notices (`[Retry N/M]`, from which `attempt` is counted, and cleanup
-  diagnostics) are interleaved in the tail.
+  expanded command, environment values, or absolute paths. The tail is
+  child-only: the runner's own retry, launch-failure, shutdown, limit, and
+  cleanup facts arrive on a typed channel as `runner_notices` (`kind`,
+  `attempt`, `detail`; at most 32, overflow in `runner_notices_dropped`), so a
+  child printing `[Retry N/M]` or a fake `pgid=` line changes no typed member.
+  The TUI terminal and every other text consumer still print `[Retry N/M]`.
+- `signal`/`exit_code` of a stopped or runtime-limited session are the leader's
+  as reaped — `SIGTERM`, or `SIGKILL` after the 5 s escalation — and both are
+  `null` when the leader was not reaped. An older owner omits `runner_notices`
+  and `max_runner_notices` (decode as unpublished).
 - The launch result names the session kind as `result.session_kind`, not
   `kind`: `kind` is the `CommandResult` discriminant. The session resource
   itself uses `kind`.
@@ -611,11 +624,19 @@ repository: `HEAD` equals `premerge_head`, no `MERGE_HEAD`, and a clean root.
 Only all three passing is `merge_conflict_aborted` (`restored: confirmed`); a
 failed or unreadable check is `merge_abort_failed` (`restored: failed` or
 `unknown`, `recovery: local_or_tui_required`), and the root stays `root_busy`
-while `MERGE_HEAD` remains. Read the typed `merge_abort` result, never the
-prose, and never treat an abort attempt as a restoration. Nothing retries the
+while `MERGE_HEAD` remains. The result also carries `merge` (`landed`:
+`confirmed`, `not_landed`, or `unknown`, re-read from Git after the command
+stopped) and `hook` (`ran`, `exit_ok`, `detail`). A landed merge whose
+`on_merged` hook then failed is `merge_hook_failed` (409,
+`outcome: merged_hook_failed`, `recovery: local_or_tui_required`) — the base
+moved; a Git failure after eligibility and before any merge commit stays
+`internal_error` with `outcome: merge_failed`. `merge_worktree` keeps
+`internal_error` with no result for both. Read the typed `merge_abort` result,
+never the prose, and never treat an abort attempt as a restoration. Nothing retries the
 abort or compensates — not the owner and not a relaying server. An older
 owner omits `capabilities.worktrees.merge_abort` (decoded as unavailable) and
-refuses the command with `validation_failed`.
+refuses the command with `validation_failed`; one built before the landing and
+hook evidence omits `merge` and `hook` (decoded as `null`).
 
 ### Deleting a worktree over `/api/v2`
 
@@ -636,9 +657,14 @@ calls the worktree clean. Every fact is re-derived under the root guard before
 teardown and again before removal; any difference is `delete_consent_stale`
 with nothing removed, and `refusal.observed` carries the fresh facts. Unknown
 dirty/content and a content observation past the combined budget (500,000
-records or 256 MiB) are `worktree_dirty_unknown`; a nested repository is
+records, 256 MiB, or 64 MiB of directory-entry names in one listing — each entry
+charged as it is read) are `worktree_dirty_unknown`; a nested repository is
 `target_ineligible`; neither yields to any permission, and no weaker identity is
-ever substituted. A worktree too large to bind — usually build output — is
+ever substituted. A detached worktree previews `is_detached: true` with every
+option `detached_head`, its blank `consent.branch` is `validation_failed`, and
+one detached after an attached preview is refused `target_ineligible`
+(`refusal.reason: detached_head`) — there is no remote detached destructive
+delete. A worktree too large to bind — usually build output — is
 reduced locally or deleted through the TUI, never remotely. After teardown the
 ignored identity may be the consented one or empty and nothing else; a refusal
 after teardown says `teardown_ran: true`, and teardown is never reversed. A

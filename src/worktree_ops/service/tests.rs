@@ -3062,3 +3062,118 @@ async fn remote_worktree_session_provisioner_order_matches_tui_plus() {
     assert!(matches!(error, ProvisionError::Unavailable(_)));
     assert!(runtime.calls().is_empty());
 }
+
+#[test]
+fn remote_contract_gap_merge_hook_failure_is_a_typed_variant_with_same_display() {
+    use crate::vcs::git::commands::LandingReport;
+    let hooked = WorktreeOpError::MergedHookFailed {
+        change_id: "c1".to_string(),
+        premerge_head: Some("a".repeat(40)),
+        landing: Box::new(LandingReport::unknown("test")),
+        hook_detail: "hook exit 2".to_string(),
+    };
+    assert_eq!(
+        hooked.to_string(),
+        "on_merged hook failed for 'c1'; branch merged transition blocked: hook exit 2",
+        "the operator text is the untyped message this replaced"
+    );
+    let failed = WorktreeOpError::MergeFailed {
+        premerge_head: None,
+        landing: Box::new(LandingReport::unknown("test")),
+        detail: "Working directory is not clean. Commit or stash changes before merging."
+            .to_string(),
+    };
+    assert_eq!(
+        failed.to_string(),
+        WorktreeOpError::Internal(
+            "Working directory is not clean. Commit or stash changes before merging.".to_string()
+        )
+        .to_string()
+    );
+}
+
+#[tokio::test]
+async fn remote_contract_gap_merge_hook_failure_variant_only_for_abort_policy() {
+    for (policy, typed) in [
+        (ConflictPolicy::AbortOnConflict, true),
+        (ConflictPolicy::PreserveConflict, false),
+    ] {
+        let backend = FakeBackend::stable(vec![mergeable()]);
+        *backend.on_merged.lock().unwrap() =
+            Err(WorktreeOpError::Internal("hook exit 2".to_string()));
+        let (service, sink) = service(backend);
+        let failure = service
+            .merge_worktree(Path::new("/workspaces/c1"), policy)
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            matches!(failure, WorktreeOpError::MergedHookFailed { .. }),
+            typed,
+            "{policy:?}: {failure:?}"
+        );
+        let text = "on_merged hook failed for 'c1'; branch merged transition blocked: hook exit 2";
+        assert_eq!(failure.to_string(), text);
+        assert!(sink
+            .events()
+            .contains(&WorktreeOperationEvent::MergeFailed {
+                branch: "c1".to_string(),
+                error: text.to_string(),
+            }));
+    }
+}
+
+#[test]
+fn remote_contract_gap_delete_detached_head_is_classified_first() {
+    let observed = content("README=A", None);
+    let attached = managed("/w/a", "a");
+    let consent = consent_for(&attached, &observed);
+
+    let mut detached = attached.clone();
+    detached.is_detached = true;
+    detached.branch = String::new();
+    // Even a main worktree with an unreadable root reports the detached fact
+    // first: it is checked before every other one.
+    let mut worst = detached.clone();
+    worst.is_main = true;
+    worst.base_merge_in_progress = SafetyFact::Unknown;
+    for facts in [&detached, &worst] {
+        for options in [
+            DeleteOptions::fail_closed(),
+            DeleteOptions::local(true),
+            DeleteOptions::local_discarding_dirty(false),
+            all_permissions(),
+        ] {
+            assert_eq!(
+                classify_confirmed_delete(facts, &observed, options),
+                Err(ConfirmedDeleteReason::DetachedHead)
+            );
+        }
+        // Detaching after an attached preview is refused as what it is, not
+        // as a branch change.
+        assert_eq!(
+            classify_consent(
+                facts,
+                &observed,
+                Some(MERGE_BASE),
+                &consent,
+                all_permissions(),
+                false
+            ),
+            Err(ConfirmedDeleteReason::DetachedHead)
+        );
+    }
+
+    // An empty branch name alone is a detached HEAD too.
+    let mut nameless = attached.clone();
+    nameless.branch = String::new();
+    assert_eq!(
+        classify_confirmed_delete(&nameless, &observed, all_permissions()),
+        Err(ConfirmedDeleteReason::DetachedHead)
+    );
+
+    // The attached worktree is unaffected.
+    assert_eq!(
+        classify_confirmed_delete(&attached, &observed, all_permissions()),
+        Ok(())
+    );
+}

@@ -28,6 +28,11 @@ use crate::worktree_ops::consent::{
 // Pure classification
 // ============================================================================
 
+/// Whether the worktree has no branch: a detached HEAD, or an empty branch name.
+fn is_detached(facts: &WorktreeFacts) -> bool {
+    facts.is_detached || facts.branch.is_empty()
+}
+
 /// Decide whether the observed facts admit a confirmed delete under `options`.
 ///
 /// The permission half of the decision, shared by the preview's per-option
@@ -43,6 +48,11 @@ pub fn classify_confirmed_delete(
     content: &ContentObservation,
     options: DeleteOptions,
 ) -> Result<(), ConfirmedDeleteReason> {
+    // A detached HEAD has no branch to consent to, so no option is offered
+    // remotely, whatever else is true of the worktree.
+    if is_detached(facts) {
+        return Err(ConfirmedDeleteReason::DetachedHead);
+    }
     if facts.is_main {
         return Err(ConfirmedDeleteReason::MainWorktree);
     }
@@ -88,6 +98,11 @@ pub fn classify_consent(
     options: DeleteOptions,
     after_teardown: bool,
 ) -> Result<(), ConfirmedDeleteReason> {
+    // Checked before the branch comparison: a worktree detached after an
+    // attached preview is refused for what it is, not as a branch change.
+    if is_detached(facts) {
+        return Err(ConfirmedDeleteReason::DetachedHead);
+    }
     if facts.branch != consent.branch {
         return Err(ConfirmedDeleteReason::BranchChanged);
     }
@@ -279,6 +294,9 @@ fn reason_message(reason: ConfirmedDeleteReason) -> &'static str {
             "the worktree contains a nested repository whose content cannot be bound; delete it locally"
         }
         ConfirmedDeleteReason::MainWorktree => "the main worktree cannot be deleted",
+        ConfirmedDeleteReason::DetachedHead => {
+            "the worktree has a detached HEAD and no branch to consent to; delete it locally or through the TUI"
+        }
         ConfirmedDeleteReason::RootBusy => {
             "the repository root is busy or holding an unresolved merge"
         }
@@ -577,6 +595,7 @@ impl WorktreeService {
                 branch: after.branch.clone(),
                 path: after.path,
                 branch_retained,
+                merge_evidence: None,
             },
         })
     }
@@ -607,6 +626,11 @@ impl WorktreeService {
         teardown: TeardownDisposition,
     ) -> Result<(), ConfirmedDeleteRefusal> {
         let identity = || -> Result<(), ConfirmedDeleteReason> {
+            // A worktree detached since the preview is refused for what it is
+            // before any identity comparison could call it a branch change.
+            if is_detached(facts) {
+                return Err(ConfirmedDeleteReason::DetachedHead);
+            }
             if expected
                 .branch
                 .as_deref()
