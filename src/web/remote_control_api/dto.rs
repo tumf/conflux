@@ -2671,16 +2671,19 @@ pub struct SessionOutputLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SessionRunnerNotice {
     /// `retry_scheduled`, `inactivity_terminated`, `runtime_limit_reached`,
-    /// `launch_failed`, `shutdown_refused`, or
-    /// `process_group_cleanup_unconfirmed`.
+    /// `launch_failed`, `shutdown_refused`,
+    /// `process_group_cleanup_unconfirmed`, or `stop_refused_attempt` (a stop
+    /// arrived before the next attempt was spawned, so it never was).
     pub kind: String,
     /// The attempt the notice concerns (for `retry_scheduled`, the attempt
-    /// scheduled next); `null` when it concerns none.
+    /// scheduled next; for `stop_refused_attempt`, the attempt refused);
+    /// `null` when it concerns none.
     // Published as required: always written, `null` when it does not apply.
     #[schema(required)]
     pub attempt: Option<u32>,
     /// Sanitized facts, for example `cause=crash, max_attempts=1, delay_ms=0`
-    /// or `pgid=4242, force_killed=true`; `null` when the kind has none.
+    /// `pgid=4242, force_killed=true`, or `stage=retry` (`retry`, `stagger`,
+    /// or `spawn` for `stop_refused_attempt`); `null` when the kind has none.
     // Published as required: always written, `null` when it does not apply.
     #[schema(required)]
     pub detail: Option<String>,

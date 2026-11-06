@@ -298,6 +298,18 @@ impl RunCommandScope {
             .count()
     }
 
+    /// Registrations past their retry delay and parked before the next spawn
+    /// (stagger wait or admission). Lets a test that holds the stagger lock
+    /// know the runner reached the spawn boundary without a timing guess.
+    #[cfg(test)]
+    pub(crate) fn waiting_to_spawn_for_test(&self) -> usize {
+        self.lock()
+            .entries
+            .values()
+            .filter(|entry| entry.phase == ExecutionPhase::WaitingToSpawn)
+            .count()
+    }
+
     /// Owned process identities the scope still cannot prove quiescent.
     #[allow(dead_code)] // Consumed by TUI escalation coverage and heavy regressions.
     pub fn retained_process_ids(&self) -> Vec<u32> {
@@ -1434,6 +1446,127 @@ pub enum RunnerNotice {
     },
     /// The leader of `attempt` was not reaped; its status is unknown.
     LeaderNotReaped { attempt: u32 },
+    /// The handle's stop arrived before `next_attempt` was spawned, so it never
+    /// was. `stage` is `retry` (before or during the retry delay), `stagger`
+    /// (during the stagger wait), or `spawn` (at spawn admission).
+    StopRefusedAttempt {
+        next_attempt: u32,
+        stage: &'static str,
+    },
+}
+
+/// How the retry loop treats the handle's cancellation while no child runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAdmission {
+    /// The cancel is observed by the next child monitoring loop, so a stop
+    /// during a delay cancels the *next* attempt after it spawned. Every
+    /// text-emitting caller keeps this.
+    SpawnThenCancel,
+    /// A stop received before the next spawn refuses that spawn.
+    RefuseBeforeSpawn,
+}
+
+/// Verdict of a cancellation checkpoint at a spawn boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelCheck {
+    Proceed,
+    Refuse,
+}
+
+/// Non-blocking read of the handle's cancellation at a spawn boundary.
+///
+/// A pending receiver is left armed and nothing is consumed. A received stop
+/// refuses; a dropped handle refuses a scoped runner (losing the handle is
+/// never permission to detach) and is a neutralised no-op for an unscoped one
+/// — the same rule the child monitoring loops apply. Once observed, the
+/// receiver is neutralised, so a later call never re-reads it.
+fn cancel_check(
+    cancel_rx_opt: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cancel_observed: &mut bool,
+    scoped: bool,
+) -> CancelCheck {
+    use tokio::sync::oneshot::error::TryRecvError;
+    if *cancel_observed {
+        return CancelCheck::Proceed;
+    }
+    let Some(rx) = cancel_rx_opt.as_mut() else {
+        return CancelCheck::Proceed;
+    };
+    let stopped = match rx.try_recv() {
+        Err(TryRecvError::Empty) => return CancelCheck::Proceed,
+        Ok(()) => true,
+        Err(TryRecvError::Closed) => scoped,
+    };
+    *cancel_observed = true;
+    *cancel_rx_opt = None;
+    if stopped {
+        CancelCheck::Refuse
+    } else {
+        CancelCheck::Proceed
+    }
+}
+
+/// Resolve when `wait` completes, or earlier with `Refuse` when the handle was
+/// cancelled (or dropped, for a scoped runner). Biased to the cancel.
+///
+/// The receiver is polled by reference, so it is not consumed unless it
+/// yields. A dropped handle on an unscoped runner neutralises the receiver and
+/// keeps awaiting `wait`: it never shortens the wait.
+async fn race_with_cancel<F: std::future::Future<Output = ()>>(
+    wait: F,
+    cancel_rx_opt: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cancel_observed: &mut bool,
+    scoped: bool,
+) -> CancelCheck {
+    tokio::pin!(wait);
+    if !*cancel_observed && cancel_rx_opt.is_some() {
+        tokio::select! {
+            biased;
+            result = async {
+                match cancel_rx_opt {
+                    Some(ref mut rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                *cancel_observed = true;
+                *cancel_rx_opt = None;
+                if result.is_ok() || scoped {
+                    return CancelCheck::Refuse;
+                }
+            }
+            _ = &mut wait => return CancelCheck::Proceed,
+        }
+    }
+    wait.await;
+    CancelCheck::Proceed
+}
+
+/// Publish the refusal of `next_attempt` at `stage`. Typed only: the text
+/// sink never runs under [`StopAdmission::RefuseBeforeSpawn`].
+async fn emit_stop_refused(
+    sink: &NoticeSink,
+    out_tx: &mpsc::Sender<OutputLine>,
+    next_attempt: u32,
+    stage: &'static str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+) {
+    warn!(
+        op = ?operation_type,
+        change_id = ?change_id,
+        next_attempt,
+        stage,
+        "Stop received before the next attempt spawned; refusing it"
+    );
+    sink.emit(
+        out_tx,
+        RunnerNotice::StopRefusedAttempt {
+            next_attempt,
+            stage,
+        },
+        None,
+    )
+    .await;
 }
 
 impl RunnerNotice {
@@ -1694,6 +1827,7 @@ impl AiCommandRunner {
             operation_type,
             change_id,
             NoticeSink::Text,
+            StopAdmission::SpawnThenCancel,
         )
         .await
     }
@@ -1705,7 +1839,11 @@ impl AiCommandRunner {
     /// launch-failure, shutdown, limit, cleanup, and leader-reap fact is a
     /// [`RunnerNotice`] on the third receiver instead. The notice channel
     /// closes when the runner task ends, after the last notice. Behaviour is
-    /// otherwise identical, retry policy and escalation included.
+    /// otherwise identical, retry policy and escalation included, except that
+    /// a `terminate()` received while no child runs — before or during a retry
+    /// delay, during the stagger wait, or at spawn admission — refuses the next
+    /// attempt ([`RunnerNotice::StopRefusedAttempt`]) instead of spawning it
+    /// and cancelling it afterwards.
     pub async fn execute_streaming_with_retry_observed(
         &self,
         command: &str,
@@ -1725,6 +1863,7 @@ impl AiCommandRunner {
                 operation_type,
                 change_id,
                 NoticeSink::Typed(notice_tx),
+                StopAdmission::RefuseBeforeSpawn,
             )
             .await?;
         Ok((handle, out_rx, notice_rx))
@@ -1737,7 +1876,9 @@ impl AiCommandRunner {
         operation_type: Option<&str>,
         change_id: Option<&str>,
         sink: NoticeSink,
+        stop_admission: StopAdmission,
     ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
+        let refuse_before_spawn = stop_admission == StopAdmission::RefuseBeforeSpawn;
         // Admission is reserved before anything is launched. A scope that is
         // already closing refuses the execution outright, so a command that
         // raced shutdown never reaches stagger, retry, or `Command::spawn`.
@@ -1906,7 +2047,44 @@ impl AiCommandRunner {
                 // admission and spawn inside one critical section. Checking
                 // admission before the delay would leave a window in which
                 // shutdown starts and a process is still launched.
-                command_queue.wait_for_stagger_slot().await;
+                if refuse_before_spawn {
+                    // Under RefuseBeforeSpawn the stagger wait races the
+                    // handle's stop, and the stop is read once more right
+                    // before admission. Dropping the stagger future mid-wait
+                    // releases the shared lock without claiming the slot.
+                    let refused_at = if race_with_cancel(
+                        command_queue.wait_for_stagger_slot(),
+                        &mut cancel_rx_opt,
+                        &mut cancel_observed,
+                        scoped,
+                    )
+                    .await
+                        == CancelCheck::Refuse
+                    {
+                        Some("stagger")
+                    } else if cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                        == CancelCheck::Refuse
+                    {
+                        Some("spawn")
+                    } else {
+                        None
+                    };
+                    if let Some(stage) = refused_at {
+                        emit_stop_refused(
+                            &sink,
+                            &out_tx,
+                            attempt,
+                            stage,
+                            operation_type_owned.as_deref(),
+                            change_id_owned.as_deref(),
+                        )
+                        .await;
+                        final_termination = CommandTermination::Cancelled;
+                        break 'retry;
+                    }
+                } else {
+                    command_queue.wait_for_stagger_slot().await;
+                }
                 let spawned = match &scope_execution {
                     Some(execution) => execution.admit_spawn(|| cmd.spawn()),
                     None => {
@@ -2681,6 +2859,22 @@ impl AiCommandRunner {
                         let _ = managed_child.terminate();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         let _ = managed_child.force_kill().await;
+                        if refuse_before_spawn
+                            && cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                                == CancelCheck::Refuse
+                        {
+                            emit_stop_refused(
+                                &sink,
+                                &out_tx,
+                                attempt + 1,
+                                "retry",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                            )
+                            .await;
+                            final_termination = CommandTermination::Cancelled;
+                            break 'retry;
+                        }
                         let retry_msg = format!(
                             "[Retry {}/{}] Inactivity timeout, retrying in {}ms \
                              (op={}, change_id={})",
@@ -2701,7 +2895,31 @@ impl AiCommandRunner {
                             Some(retry_msg),
                         )
                         .await;
-                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        if refuse_before_spawn {
+                            if race_with_cancel(
+                                tokio::time::sleep(Duration::from_millis(retry_delay_ms)),
+                                &mut cancel_rx_opt,
+                                &mut cancel_observed,
+                                scoped,
+                            )
+                            .await
+                                == CancelCheck::Refuse
+                            {
+                                emit_stop_refused(
+                                    &sink,
+                                    &out_tx,
+                                    attempt + 1,
+                                    "retry",
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                )
+                                .await;
+                                final_termination = CommandTermination::Cancelled;
+                                break 'retry;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        }
                         continue 'retry;
                     }
 
@@ -2754,6 +2972,22 @@ impl AiCommandRunner {
                         let _ = managed_child.terminate();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         let _ = managed_child.force_kill().await;
+                        if refuse_before_spawn
+                            && cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                                == CancelCheck::Refuse
+                        {
+                            emit_stop_refused(
+                                &sink,
+                                &out_tx,
+                                attempt + 1,
+                                "retry",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                            )
+                            .await;
+                            final_termination = CommandTermination::Cancelled;
+                            break 'retry;
+                        }
                         let retry_msg = format!(
                             "[Retry {}/{}] Command crashed, retrying in {}ms...",
                             attempt, max_retries, retry_delay_ms
@@ -2769,7 +3003,31 @@ impl AiCommandRunner {
                             Some(retry_msg),
                         )
                         .await;
-                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        if refuse_before_spawn {
+                            if race_with_cancel(
+                                tokio::time::sleep(Duration::from_millis(retry_delay_ms)),
+                                &mut cancel_rx_opt,
+                                &mut cancel_observed,
+                                scoped,
+                            )
+                            .await
+                                == CancelCheck::Refuse
+                            {
+                                emit_stop_refused(
+                                    &sink,
+                                    &out_tx,
+                                    attempt + 1,
+                                    "retry",
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                )
+                                .await;
+                                final_termination = CommandTermination::Cancelled;
+                                break 'retry;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        }
                         continue 'retry;
                     }
                 }
@@ -4005,6 +4263,713 @@ mod tests {
             assert!(
                 !survived,
                 "process group {pgid} outlived the run that owned it"
+            );
+        }
+    }
+
+    /// A stop that arrives while no attempt runs: refused before the next spawn
+    /// on the observed entry point, unchanged on the text entry point.
+    ///
+    /// The helper cases are unit tests over the oneshot alone. The rest drive
+    /// real `sh` processes and are integration evidence behind `heavy-tests`;
+    /// the shared stagger lock held by the test is the spawn-boundary barrier,
+    /// and the scope's `WaitingToSpawn` phase is how the test knows the runner
+    /// reached it. Timeouts are hang guards only.
+    mod session_retry_stop {
+        use super::*;
+        use std::future::Future;
+        use std::task::Poll;
+        use tokio::sync::oneshot;
+
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+
+        // ---- checkpoint helpers (unit) -----------------------------------
+
+        #[test]
+        fn session_retry_stop_cancel_check_leaves_pending_receiver_armed() {
+            let (tx, rx) = oneshot::channel::<()>();
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Proceed
+            );
+            assert!(rx_opt.is_some(), "a pending receiver is not consumed");
+            assert!(!observed);
+
+            tx.send(()).unwrap();
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Refuse,
+                "the stop sent after the first check is still read"
+            );
+        }
+
+        #[test]
+        fn session_retry_stop_cancel_check_refuses_sent_cancel_once() {
+            let (tx, rx) = oneshot::channel::<()>();
+            tx.send(()).unwrap();
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Refuse
+            );
+            assert!(observed);
+            assert!(
+                rx_opt.is_none(),
+                "an observed stop neutralises the receiver"
+            );
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Proceed,
+                "a second read neither panics nor re-reads"
+            );
+        }
+
+        #[test]
+        fn session_retry_stop_cancel_check_treats_dropped_handle_by_scope() {
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Refuse,
+                "a scoped runner never detaches on a dropped handle"
+            );
+            assert!(observed && rx_opt.is_none());
+
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Proceed,
+                "an unscoped runner is not stopped by a dropped handle"
+            );
+            assert!(
+                observed && rx_opt.is_none(),
+                "but the receiver is neutralised"
+            );
+        }
+
+        #[tokio::test]
+        async fn session_retry_stop_race_prefers_cancel_over_elapsed_wait() {
+            // A pre-sent stop wins over a wait that never completes.
+            let (tx, rx) = oneshot::channel::<()>();
+            tx.send(()).unwrap();
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let never = std::sync::Arc::new(tokio::sync::Notify::new());
+            let verdict =
+                race_with_cancel(never.notified(), &mut rx_opt, &mut observed, true).await;
+            assert_eq!(verdict, CancelCheck::Refuse);
+            assert!(rx_opt.is_none());
+
+            // No stop: a completed wait proceeds and leaves the receiver armed.
+            let (_tx, rx) = oneshot::channel::<()>();
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let verdict = race_with_cancel(async {}, &mut rx_opt, &mut observed, true).await;
+            assert_eq!(verdict, CancelCheck::Proceed);
+            assert!(rx_opt.is_some() && !observed);
+
+            // A dropped handle on an unscoped runner never shortens the wait:
+            // the race is still pending after it observed the closure, and
+            // proceeds only once the wait completes.
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+            let verdict = {
+                let mut race = Box::pin(race_with_cancel(
+                    gate.notified(),
+                    &mut rx_opt,
+                    &mut observed,
+                    false,
+                ));
+                let first = std::future::poll_fn(|cx| Poll::Ready(race.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "a dropped handle did not end the wait");
+                gate.notify_one();
+                race.await
+            };
+            assert_eq!(verdict, CancelCheck::Proceed);
+            assert!(observed && rx_opt.is_none());
+        }
+
+        // ---- real processes (integration) --------------------------------
+
+        fn config(retry_delay_ms: u64) -> CommandQueueConfig {
+            CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
+                stagger_delay_ms: 0,
+                // Counts attempts: 3 admits two retries.
+                max_retries: 3,
+                retry_delay_ms,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+                max_runtime_secs: 0,
+            }
+        }
+
+        fn scoped(
+            config: CommandQueueConfig,
+            stagger: SharedStaggerState,
+        ) -> (AiCommandRunner, RunCommandScope) {
+            let scope = RunCommandScope::new();
+            let mut runner = AiCommandRunner::new(config, stagger);
+            runner.set_run_command_scope(scope.clone());
+            (runner, scope)
+        }
+
+        fn pid_lines(path: &std::path::Path) -> Vec<i32> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        }
+
+        fn mkfifo(path: &std::path::Path) {
+            let status = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .expect("mkfifo runs");
+            assert!(status.success());
+        }
+
+        /// Open the FIFO for writing (blocks until the script reads it).
+        async fn release_fifo(path: std::path::PathBuf) {
+            tokio::time::timeout(
+                HANG_GUARD,
+                tokio::task::spawn_blocking(move || std::fs::write(path, "go\n").unwrap()),
+            )
+            .await
+            .expect("the script never read its barrier")
+            .unwrap();
+        }
+
+        /// Drain child output in the background so the runner never blocks on it.
+        fn drain_output(mut rx: mpsc::Receiver<OutputLine>) {
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        }
+
+        /// Notices up to and including the first that matches `until`.
+        async fn notices_until(
+            rx: &mut mpsc::UnboundedReceiver<RunnerNotice>,
+            until: impl Fn(&RunnerNotice) -> bool,
+        ) -> Vec<RunnerNotice> {
+            let mut seen = Vec::new();
+            loop {
+                let notice = tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                    .unwrap_or_else(|| panic!("notice channel closed early: {seen:?}"));
+                let done = until(&notice);
+                seen.push(notice);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
+        /// Every remaining notice until the runner task ends.
+        async fn notices_to_end(
+            rx: &mut mpsc::UnboundedReceiver<RunnerNotice>,
+        ) -> Vec<RunnerNotice> {
+            let mut seen = Vec::new();
+            while let Some(notice) = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("the runner task never ended")
+            {
+                seen.push(notice);
+            }
+            seen
+        }
+
+        /// Block until the scope reports the execution parked before a spawn.
+        async fn parked_before_spawn(scope: &RunCommandScope) {
+            tokio::time::timeout(HANG_GUARD, async {
+                while scope.waiting_to_spawn_for_test() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the runner never reached the spawn boundary");
+        }
+
+        fn is_retry_scheduled(next: u32) -> impl Fn(&RunnerNotice) -> bool {
+            move |n| matches!(n, RunnerNotice::RetryScheduled { next_attempt, .. } if *next_attempt == next)
+        }
+
+        fn started(notices: &[RunnerNotice], attempt: u32) -> bool {
+            notices.contains(&RunnerNotice::AttemptStarted { attempt })
+        }
+
+        fn refusals(notices: &[RunnerNotice]) -> Vec<(u32, &'static str)> {
+            notices
+                .iter()
+                .filter_map(|n| match n {
+                    RunnerNotice::StopRefusedAttempt {
+                        next_attempt,
+                        stage,
+                    } => Some((*next_attempt, *stage)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Common evidence of a refused retry after attempt 1 ran.
+        async fn assert_refused_after_attempt_one(
+            mut handle: StreamingChildHandle,
+            scope: &RunCommandScope,
+            pids_file: &std::path::Path,
+            notices: &[RunnerNotice],
+            stages: &[&str],
+        ) {
+            let refused = refusals(notices);
+            assert_eq!(refused.len(), 1, "{notices:?}");
+            assert_eq!(refused[0].0, 2, "{notices:?}");
+            assert!(stages.contains(&refused[0].1), "{notices:?}");
+            assert!(!started(notices, 2), "attempt 2 never started: {notices:?}");
+            assert!(
+                matches!(
+                    notices.last(),
+                    Some(RunnerNotice::StopRefusedAttempt { .. })
+                ),
+                "the refusal is the last fact: {notices:?}"
+            );
+
+            let status = handle.wait().await.expect("a final status");
+            assert!(!status.success());
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            let pids = pid_lines(pids_file);
+            assert_eq!(pids.len(), 1, "exactly one process ran: {pids:?}");
+            let cleanup = handle.process_group_cleanup().await;
+            assert!(cleanup.is_confirmed(), "{}", cleanup.diagnostics());
+            assert_eq!(
+                cleanup.pgid(),
+                Some(pids[0] as u32),
+                "the published cleanup is attempt 1's sweep"
+            );
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_retry_after_crash_delay_stop() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let (runner, scope) = scoped(config(60_000), Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert!(seen.iter().any(|n| matches!(
+                n,
+                RunnerNotice::LeaderReaped {
+                    attempt: 1,
+                    exit_code: Some(3),
+                    signal: None
+                }
+            )));
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["retry"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_retry_after_inactivity_delay_stop() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(60_000);
+            cfg.inactivity_timeout_secs = 1;
+            cfg.inactivity_kill_grace_secs = 0;
+            cfg.inactivity_timeout_max_retries = 2;
+            let (runner, scope) = scoped(cfg, Arc::new(Mutex::new(None)));
+            // No output at all, so the inactivity timeout ends attempt 1.
+            let command = format!("echo $$ >> '{}'; exec sleep 300", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, |n| {
+                matches!(
+                    n,
+                    RunnerNotice::RetryScheduled {
+                        next_attempt: 2,
+                        cause: RetryCause::InactivityTimeout,
+                        ..
+                    }
+                )
+            })
+            .await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert!(
+                matches!(
+                    seen.first(),
+                    Some(RunnerNotice::AttemptStarted { attempt: 1 })
+                ),
+                "{seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .any(|n| matches!(n, RunnerNotice::InactivityTerminated { attempt: 1, .. })),
+                "{seen:?}"
+            );
+            assert!(
+                seen.iter().any(|n| matches!(
+                    n,
+                    RunnerNotice::LeaderReaped {
+                        attempt: 1,
+                        signal: Some(_),
+                        ..
+                    }
+                )),
+                "attempt 1 was reaped by a signal: {seen:?}"
+            );
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["retry"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_spawn_parked_in_stagger() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(0);
+            // Attempt 1 claims the empty stagger slot and arms it, so attempt 2
+            // parks in a 60 s stagger wait.
+            cfg.stagger_delay_ms = 60_000;
+            let (runner, scope) = scoped(cfg, Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            parked_before_spawn(&scope).await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["stagger"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_spawn_at_held_boundary() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let barrier = dir.path().join("crash.barrier");
+            mkfifo(&barrier);
+            let stagger: SharedStaggerState = Arc::new(Mutex::new(None));
+            let (runner, scope) = scoped(config(0), stagger.clone());
+            let command = format!(
+                "echo $$ >> '{}'; read x < '{}'; exit 3",
+                pids_file.display(),
+                barrier.display()
+            );
+
+            // Attempt 1 is admitted only once the test lets go of the lock.
+            let held = stagger.lock().await;
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+            drop(held);
+            let mut seen = notices_until(&mut notices, |n| {
+                *n == RunnerNotice::AttemptStarted { attempt: 1 }
+            })
+            .await;
+
+            // Re-take the lock before attempt 1 can crash, then let it crash.
+            let held = stagger.lock().await;
+            release_fifo(barrier).await;
+            seen.extend(notices_until(&mut notices, is_retry_scheduled(2)).await);
+            parked_before_spawn(&scope).await;
+
+            handle.terminate().unwrap();
+            drop(held);
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_refused_after_attempt_one(
+                handle,
+                &scope,
+                &pids_file,
+                &seen,
+                &["stagger", "spawn"],
+            )
+            .await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_running_child_still_escalates() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let ready = dir.path().join("ready");
+            mkfifo(&ready);
+            let (runner, scope) = scoped(config(0), Arc::new(Mutex::new(None)));
+            let command = format!(
+                "trap '' TERM; echo $$ >> '{}'; echo ready > '{}'; sleep 60",
+                pids_file.display(),
+                ready.display()
+            );
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+            let ready_path = ready.clone();
+            tokio::time::timeout(
+                HANG_GUARD,
+                tokio::task::spawn_blocking(move || std::fs::read_to_string(ready_path).unwrap()),
+            )
+            .await
+            .expect("hang guard")
+            .unwrap();
+
+            handle.terminate().unwrap();
+            let seen = notices_to_end(&mut notices).await;
+
+            assert!(
+                seen.iter().any(|n| matches!(
+                    n,
+                    RunnerNotice::LeaderReaped {
+                        attempt: 1,
+                        signal: Some(9),
+                        ..
+                    }
+                )),
+                "the running-child cancel branch still escalates: {seen:?}"
+            );
+            assert!(refusals(&seen).is_empty(), "{seen:?}");
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            assert_eq!(pid_lines(&pids_file).len(), 1);
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_scope_shutdown_in_delay_is_still_shutdown() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            // The delay does not race scope shutdown (unchanged): the loop head
+            // refuses once it ends, so the delay is kept short.
+            let (runner, scope) = scoped(config(1_000), Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            scope.close();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_eq!(
+                seen.last(),
+                Some(&RunnerNotice::ShutdownRefused { stage: "retry" }),
+                "{seen:?}"
+            );
+            assert!(refusals(&seen).is_empty(), "{seen:?}");
+            assert!(!started(&seen, 2));
+            assert_ne!(handle.termination().await, CommandTermination::Cancelled);
+            assert_eq!(pid_lines(&pids_file).len(), 1);
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        // ---- the text entry point keeps spawn-then-cancel ------------------
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_text_entry_point_keeps_spawn_then_cancel() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let barrier = dir.path().join("crash.barrier");
+            mkfifo(&barrier);
+            let stagger: SharedStaggerState = Arc::new(Mutex::new(None));
+            let (runner, scope) = scoped(config(0), stagger.clone());
+            // Attempt 1 waits on the barrier and crashes; attempt 2 (the FIFO
+            // is gone by then) runs until it is cancelled.
+            let command = format!(
+                "echo $$ >> '{pids}'; if [ -p '{b}' ]; then read x < '{b}'; rm -f '{b}'; exit 3; fi; sleep 60",
+                pids = pids_file.display(),
+                b = barrier.display()
+            );
+
+            let held = stagger.lock().await;
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("admitted");
+            drop(held);
+            // Attempt 1 has spawned once its PID line exists.
+            tokio::time::timeout(HANG_GUARD, async {
+                while pid_lines(&pids_file).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("attempt 1 never started");
+
+            let held = stagger.lock().await;
+            release_fifo(barrier.clone()).await;
+            let mut stderr = Vec::new();
+            loop {
+                match tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Some(OutputLine::Stderr(line)) => {
+                        let retry = line.starts_with("[Retry 1/");
+                        stderr.push(line);
+                        if retry {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("output closed before the retry: {stderr:?}"),
+                }
+            }
+            parked_before_spawn(&scope).await;
+
+            handle.terminate().unwrap();
+            drop(held);
+            while let Some(line) = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("hang guard")
+            {
+                if let OutputLine::Stderr(line) = line {
+                    stderr.push(line);
+                }
+            }
+            let _ = handle.wait().await;
+
+            // Attempt 2 may be cancelled before its shell writes a PID line, so
+            // the spawn is proven by the cleanup report: the cancel branch
+            // swept a process group other than attempt 1's.
+            let pids = pid_lines(&pids_file);
+            assert!(!pids.is_empty() && pids.len() <= 2, "{pids:?}");
+            assert!(stderr.iter().all(|l| !l.contains("stage=")), "{stderr:?}");
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            let cleanup = handle.process_group_cleanup().await;
+            let second = cleanup.pgid().expect("the cancelled attempt's group") as i32;
+            assert_ne!(
+                second, pids[0],
+                "the default policy spawned attempt 2 and then cancelled it: {stderr:?}"
+            );
+            if let Some(&logged) = pids.get(1) {
+                assert_eq!(logged, second);
+            }
+            assert!(
+                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(second), None)
+                    == Err(nix::errno::Errno::ESRCH),
+                "attempt 2's group is gone"
+            );
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_text_entry_point_unscoped_dropped_handle_does_not_shorten_delay(
+        ) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(300);
+            cfg.max_retries = 2;
+            let runner = AiCommandRunner::new(cfg, Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("admitted");
+            // Wait for the retry line: attempt 1 crashed and the delay runs.
+            loop {
+                match tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Some(OutputLine::Stderr(line)) if line.starts_with("[Retry 1/") => break,
+                    Some(_) => {}
+                    None => panic!("output closed before the retry"),
+                }
+            }
+            drop(handle);
+            while tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("hang guard")
+                .is_some()
+            {}
+
+            assert_eq!(
+                pid_lines(&pids_file).len(),
+                2,
+                "a dropped handle on an unscoped runner does not stop the retry"
             );
         }
     }

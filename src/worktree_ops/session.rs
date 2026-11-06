@@ -1367,6 +1367,16 @@ fn apply_notice(entry: &mut Entry, notice: RunnerNotice) {
             Some(current),
             Some(format!("pgid={pgid}, force_killed={force_killed}")),
         )),
+        // A refused attempt never started, so `attempt` stays at the last
+        // one that did.
+        RunnerNotice::StopRefusedAttempt {
+            next_attempt,
+            stage,
+        } => Some(record(
+            "stop_refused_attempt",
+            Some(next_attempt),
+            Some(format!("stage={stage}")),
+        )),
     };
     if let Some(record) = retained {
         entry.snapshot.runner_notices.push(record);

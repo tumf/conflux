@@ -223,21 +223,45 @@ impl Options {
     }
 }
 
+/// Runner timing seams; the defaults are what every other case runs with.
+#[derive(Default)]
+struct Seams {
+    retry_delay_ms: u64,
+    stagger_delay_ms: u64,
+    /// `(timeout_secs, kill_grace_secs, max_retries)`; `None` keeps the defaults.
+    inactivity: Option<(u64, u64, u32)>,
+    /// The runner's shared stagger state, so a test can hold its lock.
+    shared_stagger: Option<crate::ai_command_runner::SharedStaggerState>,
+}
+
 impl Wired {
     async fn new(fixture: Fixture, options: Options) -> Self {
+        Self::with_seams(fixture, options, Seams::default()).await
+    }
+
+    async fn with_seams(fixture: Fixture, options: Options, seams: Seams) -> Self {
+        let (inactivity_secs, inactivity_grace, inactivity_retries) = match seams.inactivity {
+            Some((secs, grace, retries)) => (Some(secs), Some(grace), Some(retries)),
+            None => (None, None, None),
+        };
         let config = Arc::new(OrchestratorConfig {
             worktree_command: options.template.clone(),
             workspace_base_dir: Some(fixture.base.to_string_lossy().to_string()),
-            command_queue_stagger_delay_ms: Some(0),
+            command_queue_stagger_delay_ms: Some(seams.stagger_delay_ms),
             command_queue_max_retries: Some(options.retries),
-            command_queue_retry_delay_ms: Some(0),
+            command_queue_retry_delay_ms: Some(seams.retry_delay_ms),
+            command_inactivity_timeout_secs: inactivity_secs,
+            command_inactivity_kill_grace_secs: inactivity_grace,
+            command_inactivity_timeout_max_retries: inactivity_retries,
             ..Default::default()
         });
 
         let registry = WorktreeSessionRegistry::new(
             crate::ai_command_runner::AiCommandRunner::from_orchestrator_config(
                 &config,
-                Arc::new(tokio::sync::Mutex::new(None)),
+                seams
+                    .shared_stagger
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(None))),
             ),
         );
         let service = Arc::new(
@@ -1617,6 +1641,508 @@ async fn remote_contract_gap_session_notices_disclose_no_path_or_template() {
         "CFLX_TEST_CREDENTIAL",
         root.to_str().unwrap(),
         "crash.sh",
+    ] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+    wired.shutdown().await;
+}
+
+// ============================================================================
+// A stop while no attempt runs spawns nothing further
+// ============================================================================
+
+/// `(kind, attempt, detail)` of every retained runner notice.
+fn notice_rows(session: &Value) -> Vec<(String, Value, Value)> {
+    session["runner_notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["kind"].as_str().unwrap().to_string(),
+                n["attempt"].clone(),
+                n["detail"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn kinds(session: &Value) -> Vec<String> {
+    notice_rows(session)
+        .into_iter()
+        .map(|(k, _, _)| k)
+        .collect()
+}
+
+/// The single `stop_refused_attempt` notice as `(attempt, stage)`.
+fn refusal(session: &Value) -> (u64, String) {
+    let rows: Vec<_> = notice_rows(session)
+        .into_iter()
+        .filter(|(k, _, _)| k == "stop_refused_attempt")
+        .collect();
+    assert_eq!(rows.len(), 1, "{session}");
+    let (_, attempt, detail) = &rows[0];
+    let stage = detail
+        .as_str()
+        .unwrap()
+        .strip_prefix("stage=")
+        .unwrap_or_else(|| panic!("detail is stage=<token> only: {detail}"))
+        .to_string();
+    (attempt.as_u64().unwrap(), stage)
+}
+
+impl Wired {
+    /// Wait until the session retains a notice of `kind`. The registry
+    /// publishes no event for a notice, so this reads the session resource,
+    /// bounded by the hang guard.
+    async fn notice_seen(&self, session_id: &str, kind: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + HANG_GUARD;
+        loop {
+            let session = self.session(session_id).await;
+            if kinds(&session).iter().any(|k| k == kind) {
+                return session;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "notice {kind} never appeared: {session}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until the execution is in `WaitingToSpawn`: past its retry delay
+    /// for a retry, but for the first attempt the registration starts there,
+    /// so it does not prove the runner already reached the stagger wait.
+    async fn parked_before_spawn(&self) {
+        tokio::time::timeout(HANG_GUARD, async {
+            while self.registry.scope().waiting_to_spawn_for_test() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the runner never reached the spawn boundary");
+    }
+}
+
+async fn wait_for_pid(path: &Path) -> i32 {
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if let Some(pid) = pids(path).first() {
+                return *pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the attempt never started")
+}
+
+/// Open the FIFO for writing; blocks until the script reads it.
+async fn release_fifo(path: PathBuf) {
+    tokio::time::timeout(
+        HANG_GUARD,
+        tokio::task::spawn_blocking(move || std::fs::write(path, "go\n").unwrap()),
+    )
+    .await
+    .expect("the script never read its barrier")
+    .unwrap();
+}
+
+impl Wired {
+    /// The registry's own cleanup verdict for a settled session; it is not a
+    /// member of the session resource.
+    fn process_group_confirmed(&self, session_id: &str) -> Option<bool> {
+        self.registry
+            .get(session_id)
+            .expect("a retained session")
+            .process_group_confirmed
+    }
+}
+
+/// The settled stop of a session whose attempt 1 ran and whose retry was refused.
+fn assert_refused_retry(wired: &Wired, record: &Value, session: &Value, pids_file: &Path) {
+    let session_id = session["session_id"].as_str().unwrap();
+    let confirmed = wired.process_group_confirmed(session_id);
+    assert!(confirmed.is_some(), "the cleanup verdict was published");
+    assert_eq!(record["state"], "succeeded", "{record}");
+    assert_eq!(record["result"]["kind"], "worktree_session_stop");
+    assert_eq!(record["result"]["state_after"], "stopped");
+    assert_eq!(
+        record["result"]["terminated"],
+        json!(confirmed == Some(true)),
+        "terminated reflects attempt 1's group cleanup: {record} {session}"
+    );
+    assert_eq!(session["state"], "stopped", "{session}");
+    assert_eq!(session["attempt"], 1, "the refused attempt never started");
+    assert_eq!(session["stop_requested"], true);
+    assert_eq!(pids(pids_file).len(), 1, "exactly one process ran");
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_crash_delay_stop_spawns_nothing() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("crash.pids");
+    let script = fixture.script(
+        "crash.sh",
+        &format!("echo $$ >> '{}'\necho first\nexit 3\n", pids_file.display()),
+    );
+    let worktree = fixture.add_worktree("crash-delay");
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            retry_delay_ms: 60_000,
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    wired.notice_seen(&session_id, "retry_scheduled").await;
+    let record = wired.stop(&session_id).await;
+    let session = wired.session(&session_id).await;
+
+    assert_refused_retry(&wired, &record, &session, &pids_file);
+    assert_eq!(session["exit_code"], 3, "attempt 1's real exit code");
+    assert_eq!(session["signal"], Value::Null);
+    assert_eq!(wired.process_group_confirmed(&session_id), Some(true));
+    assert_eq!(
+        notice_rows(&session),
+        vec![
+            (
+                "retry_scheduled".to_string(),
+                json!(2),
+                json!("cause=crash, max_attempts=3, delay_ms=60000")
+            ),
+            (
+                "stop_refused_attempt".to_string(),
+                json!(2),
+                json!("stage=retry")
+            ),
+        ]
+    );
+    assert_eq!(
+        tail_texts(&session),
+        vec!["first"],
+        "no second process wrote"
+    );
+    assert_eq!(wired.registry.launch_count(), 1);
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_inactivity_delay_stop_spawns_nothing() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("idle.pids");
+    let script = fixture.script(
+        "idle.sh",
+        &format!("echo $$ >> '{}'\nexec sleep 300\n", pids_file.display()),
+    );
+    let worktree = fixture.add_worktree("idle-delay");
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            retry_delay_ms: 60_000,
+            inactivity: Some((1, 0, 2)),
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    let scheduled = wired.notice_seen(&session_id, "retry_scheduled").await;
+    assert!(
+        notice_rows(&scheduled)
+            .iter()
+            .any(|(k, _, d)| k == "retry_scheduled"
+                && d.as_str().unwrap().contains("cause=inactivity_timeout")),
+        "{scheduled}"
+    );
+    let record = wired.stop(&session_id).await;
+    let session = wired.session(&session_id).await;
+
+    assert_refused_retry(&wired, &record, &session, &pids_file);
+    assert_eq!(
+        kinds(&session),
+        vec![
+            "inactivity_terminated",
+            "retry_scheduled",
+            "stop_refused_attempt"
+        ],
+        "{session}"
+    );
+    assert_eq!(notice_rows(&session)[0].1, json!(1));
+    assert_eq!(refusal(&session), (2, "retry".to_string()));
+    assert!(
+        ["SIGTERM", "SIGKILL"].contains(&session["signal"].as_str().unwrap_or("")),
+        "attempt 1's reaped kill signal: {session}"
+    );
+    assert_eq!(wired.registry.launch_count(), 1);
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_stagger_before_retry_spawns_nothing() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("stagger.pids");
+    let script = fixture.script(
+        "stagger.sh",
+        &format!("echo $$ >> '{}'\nexit 3\n", pids_file.display()),
+    );
+    let worktree = fixture.add_worktree("stagger-retry");
+    // Attempt 1 claims the empty slot and arms the stagger, so attempt 2
+    // parks in a 60 s stagger wait.
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            stagger_delay_ms: 60_000,
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    wired.notice_seen(&session_id, "retry_scheduled").await;
+    wired.parked_before_spawn().await;
+    let record = wired.stop(&session_id).await;
+    let session = wired.session(&session_id).await;
+
+    assert_refused_retry(&wired, &record, &session, &pids_file);
+    assert_eq!(
+        kinds(&session),
+        vec!["retry_scheduled", "stop_refused_attempt"]
+    );
+    assert_eq!(refusal(&session), (2, "stagger".to_string()));
+    assert_eq!(session["exit_code"], 3);
+    assert_eq!(wired.registry.launch_count(), 1);
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_racing_the_spawn_boundary_spawns_nothing() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("race.pids");
+    let barrier = fixture.fifo("race.barrier");
+    let script = fixture.script(
+        "race.sh",
+        &format!(
+            "echo $$ >> '{}'\nread x < '{}'\necho first\nexit 3\n",
+            pids_file.display(),
+            barrier.display()
+        ),
+    );
+    let worktree = fixture.add_worktree("race");
+    let stagger: crate::ai_command_runner::SharedStaggerState =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            shared_stagger: Some(stagger.clone()),
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    // Attempt 1 is admitted only after the test lets go of the lock once.
+    let held = stagger.lock().await;
+    let session_id = wired.launched(&id).await;
+    drop(held);
+    wait_for_pid(&pids_file).await;
+
+    // Re-take the lock before attempt 1 can crash, then let it crash: the
+    // runner blocks at the spawn boundary of attempt 2.
+    let held = stagger.lock().await;
+    release_fifo(barrier).await;
+    wired.notice_seen(&session_id, "retry_scheduled").await;
+    wired.parked_before_spawn().await;
+    let record = wired.stop(&session_id).await;
+    drop(held);
+    let session = wired.session(&session_id).await;
+
+    assert_refused_retry(&wired, &record, &session, &pids_file);
+    let (attempt, stage) = refusal(&session);
+    assert_eq!(attempt, 2);
+    assert!(["stagger", "spawn"].contains(&stage.as_str()), "{stage}");
+    assert_eq!(tail_texts(&session), vec!["first"]);
+    assert_eq!(wired.registry.launch_count(), 1);
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_stop_before_first_spawn_is_stopped_not_failed() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("never.pids");
+    let script = fixture.script(
+        "never.sh",
+        &format!("echo $$ >> '{}'\nexit 0\n", pids_file.display()),
+    );
+    let worktree = fixture.add_worktree("never");
+    let stagger: crate::ai_command_runner::SharedStaggerState =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            shared_stagger: Some(stagger.clone()),
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let held = stagger.lock().await;
+    let session_id = wired.launched(&id).await;
+    wired.parked_before_spawn().await;
+    let record = wired.stop(&session_id).await;
+    drop(held);
+    let session = wired.session(&session_id).await;
+
+    assert!(!pids_file.exists(), "no process was ever spawned");
+    assert_eq!(record["result"]["state_after"], "stopped", "{record}");
+    assert_eq!(session["state"], "stopped", "{session}");
+    assert_eq!(session["attempt"], 1);
+    assert_eq!(session["exit_code"], Value::Null);
+    assert_eq!(session["signal"], Value::Null);
+    assert!(session.get("pgid").is_none_or(Value::is_null));
+    let (attempt, stage) = refusal(&session);
+    assert_eq!(attempt, 1);
+    assert!(["stagger", "spawn"].contains(&stage.as_str()), "{stage}");
+    assert_eq!(kinds(&session), vec!["stop_refused_attempt"]);
+    // Nothing needed cleanup: the not-applicable report counts as confirmed,
+    // which is "settled with no group", not "a process was killed".
+    assert_eq!(wired.process_group_confirmed(&session_id), Some(true));
+    assert_eq!(record["result"]["terminated"], true);
+    assert_eq!(wired.registry.launch_count(), 1);
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_running_leader_stop_is_unchanged() {
+    let fixture = Fixture::new();
+    let (script, pids_file, ready) = sleeper(&fixture, "running");
+    let background_file = fixture.file("running.bg");
+    let worktree = fixture.add_worktree("running");
+    let wired = Wired::new(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    read_fifo(ready).await;
+    let leader = pids(&pids_file)[0];
+    let background: i32 = std::fs::read_to_string(&background_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let record = wired.stop(&session_id).await;
+    assert_eq!(record["state"], "succeeded", "{record}");
+    assert_eq!(record["result"]["terminated"], true);
+    assert_eq!(record["result"]["state_after"], "stopped");
+    assert!(!alive(leader) && !alive(background));
+
+    let session = wired.session(&session_id).await;
+    assert_eq!(session["state"], "stopped");
+    assert_eq!(session["signal"], "SIGTERM");
+    assert_eq!(session["attempt"], 1);
+    assert_eq!(pids(&pids_file), vec![leader]);
+    assert!(
+        !kinds(&session).iter().any(|k| k == "stop_refused_attempt"),
+        "a running leader is stopped by the cancel branch: {session}"
+    );
+    wired.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_shutdown_during_delay_is_shutdown_refused() {
+    let fixture = Fixture::new();
+    let pids_file = fixture.file("shutdown.pids");
+    let script = fixture.script(
+        "shutdown.sh",
+        &format!("echo $$ >> '{}'\nexit 3\n", pids_file.display()),
+    );
+    let worktree = fixture.add_worktree("shutdown-delay");
+    // Scope shutdown does not race the delay (unchanged): the loop head
+    // refuses once the delay ends, so the delay is kept short.
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(format!("sh {}", script.display())).retries(3),
+        Seams {
+            retry_delay_ms: 1_000,
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    wired.notice_seen(&session_id, "retry_scheduled").await;
+    wired.shutdown().await;
+    let session = wired.session(&session_id).await;
+
+    assert_eq!(session["state"], "stopped", "{session}");
+    assert_eq!(session["attempt"], 1);
+    assert_eq!(kinds(&session), vec!["retry_scheduled", "shutdown_refused"]);
+    assert_eq!(notice_rows(&session)[1].2, json!("stage=retry"));
+    assert_eq!(pids(&pids_file).len(), 1);
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn session_retry_stop_notices_disclose_no_path_or_template() {
+    let fixture = Fixture::new();
+    let script = fixture.script("secret-crash.sh", "exit 3\n");
+    let root = fixture.root();
+    let worktree = fixture.add_worktree("secret-stop");
+    let template = format!(
+        "CFLX_TEST_CREDENTIAL=hunter2-credential sh {} {{workspace_dir}}",
+        script.display()
+    );
+    let wired = Wired::with_seams(
+        fixture,
+        Options::template(template).retries(3),
+        Seams {
+            retry_delay_ms: 60_000,
+            ..Seams::default()
+        },
+    )
+    .await;
+
+    let id = wired.worktree_id(&worktree).await;
+    let session_id = wired.launched(&id).await;
+    wired.notice_seen(&session_id, "retry_scheduled").await;
+    wired.stop(&session_id).await;
+    let session = wired.session(&session_id).await;
+
+    let rows = notice_rows(&session);
+    let refusal_row = rows
+        .iter()
+        .find(|(k, _, _)| k == "stop_refused_attempt")
+        .unwrap_or_else(|| panic!("{session}"));
+    assert_eq!(refusal_row.2, json!("stage=retry"));
+    let rendered = serde_json::to_string(&session["runner_notices"]).unwrap();
+    for secret in [
+        "hunter2-credential",
+        "CFLX_TEST_CREDENTIAL",
+        root.to_str().unwrap(),
+        "secret-crash.sh",
     ] {
         assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
     }

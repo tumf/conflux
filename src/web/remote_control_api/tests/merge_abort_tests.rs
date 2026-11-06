@@ -234,7 +234,24 @@ impl Fixture {
         )
         .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        shim
+        // A child forked by a concurrent test while the write was open keeps a
+        // writer reference until it execs, so the first exec of a fresh script
+        // can fail with ETXTBSY. Once one exec succeeds no writer remains and
+        // none can appear, so probe until then.
+        for _ in 0..1000 {
+            match std::process::Command::new(&shim)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return shim,
+                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("shim probe failed: {err}"),
+            }
+        }
+        panic!("shim stayed busy");
     }
 }
 
