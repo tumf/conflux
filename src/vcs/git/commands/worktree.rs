@@ -989,6 +989,29 @@ pub async fn count_commits_ahead<P: AsRef<Path>>(
     Ok(count)
 }
 
+/// True exactly when [`run_worktree_teardown`] would execute `.wt/teardown`.
+///
+/// The same follow-symlink `exists` / `is_file` / execute-bit checks the runner
+/// makes, so a preview's `teardown_script_present` cannot disagree with what
+/// the delete actually does.
+pub fn teardown_script_would_run(worktree_path: &Path) -> bool {
+    let teardown_script = worktree_path.join(".wt").join("teardown");
+    if !teardown_script.exists() || !teardown_script.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&teardown_script)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Execute the worktree teardown script if it exists and is executable.
 ///
 /// Checks for `<worktree>/.wt/teardown` and executes it in the worktree directory.

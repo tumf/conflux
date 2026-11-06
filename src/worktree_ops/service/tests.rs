@@ -69,6 +69,12 @@ struct FakeBackend {
     /// service as the same failure, and that is exactly the distinction the
     /// service is not allowed to make.
     delete_branch_at: Mutex<WorktreeOpResult<()>>,
+    /// Successive content observations, then the last one repeated.
+    content: Mutex<Vec<crate::worktree_ops::consent::ContentObservation>>,
+    /// What `merge_base` answers.
+    merge_base: Mutex<Option<String>>,
+    /// What `teardown_script_present` answers.
+    teardown_present: Mutex<bool>,
 }
 
 impl FakeBackend {
@@ -86,6 +92,9 @@ impl FakeBackend {
             branch_refs: Mutex::new(std::collections::HashMap::new()),
             delete_branch: Mutex::new(Ok(())),
             delete_branch_at: Mutex::new(Ok(())),
+            content: Mutex::new(vec![clean_content()]),
+            merge_base: Mutex::new(Some(MERGE_BASE.to_string())),
+            teardown_present: Mutex::new(true),
         })
     }
 
@@ -215,6 +224,76 @@ impl WorktreeBackend for FakeBackend {
         });
         self.eligible.lock().unwrap().clone()
     }
+
+    async fn observe_content(
+        &self,
+        _path: &Path,
+        _limits: ConsentLimits,
+    ) -> crate::worktree_ops::consent::ContentObservation {
+        let mut script = self.content.lock().unwrap();
+        if script.len() > 1 {
+            script.remove(0)
+        } else {
+            script
+                .first()
+                .cloned()
+                .unwrap_or(crate::worktree_ops::consent::ContentObservation::Unobservable)
+        }
+    }
+
+    async fn merge_base(&self, _head: &str) -> WorktreeOpResult<Option<String>> {
+        Ok(self.merge_base.lock().unwrap().clone())
+    }
+
+    async fn commits_between(&self, _merge_base: &str, _head: &str) -> WorktreeOpResult<usize> {
+        Ok(2)
+    }
+
+    async fn teardown_script_present(&self, _path: &Path) -> bool {
+        *self.teardown_present.lock().unwrap()
+    }
+}
+
+// ── Confirmed-delete fixtures ────────────────────────────────────────────────
+
+const MERGE_BASE: &str = "1111111111111111111111111111111111111111";
+const HEAD: &str = "cafebabe";
+
+fn content_id(seed: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(seed.as_bytes());
+    format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn content(
+    discardable: &str,
+    ignored: Option<&str>,
+) -> crate::worktree_ops::consent::ContentObservation {
+    crate::worktree_ops::consent::ContentObservation::Observed(
+        crate::worktree_ops::consent::ObservedContent {
+            discardable_content_id: if discardable.is_empty() {
+                crate::worktree_ops::consent::empty_content_id()
+            } else {
+                content_id(discardable)
+            },
+            ignored_content_id: ignored
+                .map(content_id)
+                .unwrap_or_else(crate::worktree_ops::consent::empty_content_id),
+            has_ignored_content: ignored.is_some(),
+            entries: usize::from(!discardable.is_empty()),
+            ignored_entries: usize::from(ignored.is_some()),
+        },
+    )
+}
+
+fn clean_content() -> crate::worktree_ops::consent::ContentObservation {
+    content("", None)
 }
 
 #[derive(Default)]
@@ -622,10 +701,17 @@ fn remote_worktree_preserving_policy_attempts_a_predicted_conflict() {
 
     // The aborting frontend refuses up front; the preserving one must run the
     // merge so the conflict evidence it promises actually exists.
-    assert!(matches!(
-        classify_merge_eligibility(&facts, ConflictPolicy::AbortOnConflict),
-        Err(WorktreeOpError::Ineligible(_))
-    ));
+    // The aborting refusal is typed so it can carry the predicted files; its
+    // text is unchanged from the untyped refusal it replaced.
+    let refusal = classify_merge_eligibility(&facts, ConflictPolicy::AbortOnConflict)
+        .expect_err("a predicted conflict refuses an aborting merge");
+    assert_eq!(
+        refusal,
+        WorktreeOpError::PredictedConflict {
+            files: vec!["src/main.rs".to_string()]
+        }
+    );
+    assert_eq!(refusal.to_string(), "the worktree conflicts with base");
     assert!(classify_merge_eligibility(&facts, ConflictPolicy::PreserveConflict).is_ok());
 }
 
@@ -1853,6 +1939,165 @@ async fn remote_worktree_on_merged_failure_blocks_the_merged_transition() {
     );
 }
 
+// ── Abort-on-conflict merge ──────────────────────────────────────────────────
+
+fn abort_report(
+    restored: crate::vcs::git::commands::Restoration,
+) -> crate::vcs::git::commands::AbortReport {
+    use crate::vcs::git::commands::Restoration;
+    let confirmed = restored == Restoration::Confirmed;
+    crate::vcs::git::commands::AbortReport {
+        premerge_head: "a".repeat(40),
+        exit_ok: confirmed,
+        head_after: (restored != Restoration::Unknown).then(|| "a".repeat(40)),
+        merge_head_present: Some(!confirmed),
+        clean_after: Some(confirmed),
+        restored,
+        detail: String::new(),
+    }
+}
+
+fn ran_on_merged(backend: &FakeBackend) -> bool {
+    backend
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::OnMerged { .. }))
+}
+
+#[tokio::test]
+async fn remote_merge_abort_predicted_conflict_refuses_before_merge() {
+    let mut facts = mergeable();
+    facts.conflict_files = vec!["src/lib.rs".to_string()];
+    let backend = FakeBackend::stable(vec![facts]);
+    let (service, sink) = service(backend.clone());
+
+    let refusal = service
+        .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+        .await
+        .expect_err("a predicted conflict is refused");
+
+    assert_eq!(
+        refusal,
+        WorktreeOpError::PredictedConflict {
+            files: vec!["src/lib.rs".to_string()]
+        }
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Merge { .. })),
+        "no Git mutation may run for a predicted conflict"
+    );
+    assert!(!ran_on_merged(&backend));
+    assert_eq!(
+        sink.events(),
+        vec![WorktreeOperationEvent::MergeFailed {
+            branch: "c1".to_string(),
+            error: "the worktree conflicts with base".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn remote_merge_abort_confirmed_restoration_is_a_typed_failure() {
+    use crate::vcs::git::commands::Restoration;
+    let backend = FakeBackend::stable(vec![mergeable()]);
+    *backend.merge.lock().unwrap() = Ok(MergeAttempt::ConflictAborted {
+        files: vec!["src/lib.rs".to_string()],
+        abort: abort_report(Restoration::Confirmed),
+    });
+    let (service, sink) = service(backend.clone());
+
+    let failure = service
+        .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+        .await
+        .expect_err("an aborted conflict fails the merge");
+
+    let WorktreeOpError::MergeConflictAborted { files, abort } = &failure else {
+        panic!("unexpected error: {failure:?}");
+    };
+    assert_eq!(files, &["src/lib.rs".to_string()]);
+    assert_eq!(abort.restored, Restoration::Confirmed);
+    let text = failure.to_string();
+    assert!(text.contains("Merge aborted; base restored to"), "{text}");
+    assert!(!ran_on_merged(&backend));
+    assert!(sink
+        .events()
+        .contains(&WorktreeOperationEvent::MergeFailed {
+            branch: "c1".to_string(),
+            error: text,
+        }));
+    assert!(!sink
+        .events()
+        .iter()
+        .any(|event| matches!(event, WorktreeOperationEvent::MergeCompleted { .. })));
+}
+
+#[tokio::test]
+async fn remote_merge_abort_failed_restoration_is_distinct() {
+    use crate::vcs::git::commands::Restoration;
+    for (restored, marker) in [
+        (Restoration::Failed, "abort FAILED"),
+        (Restoration::Unknown, "UNCONFIRMED"),
+    ] {
+        let backend = FakeBackend::stable(vec![mergeable()]);
+        *backend.merge.lock().unwrap() = Ok(MergeAttempt::ConflictAborted {
+            files: vec!["src/lib.rs".to_string()],
+            abort: abort_report(restored),
+        });
+        let (service, sink) = service(backend.clone());
+
+        let failure = service
+            .merge_worktree(Path::new("/workspaces/c1"), ConflictPolicy::AbortOnConflict)
+            .await
+            .expect_err("an unconfirmed abort fails the merge");
+
+        let WorktreeOpError::MergeConflictAborted { abort, .. } = &failure else {
+            panic!("unexpected error: {failure:?}");
+        };
+        assert_eq!(abort.restored, restored);
+        let text = failure.to_string();
+        assert!(text.contains(marker), "{text}");
+        assert!(!text.contains("Merge aborted"), "{text}");
+        assert!(!text.contains("preserved"), "{text}");
+        assert!(!ran_on_merged(&backend));
+        assert!(sink
+            .events()
+            .contains(&WorktreeOperationEvent::MergeFailed {
+                branch: "c1".to_string(),
+                error: text,
+            }));
+    }
+}
+
+#[tokio::test]
+async fn remote_merge_abort_preserve_policy_is_unchanged() {
+    // A predicted conflict is still attempted under the preserving policy, and
+    // the conflict still comes back as `MergeConflict` with no abort.
+    let mut facts = mergeable();
+    facts.conflict_files = vec!["src/lib.rs".to_string()];
+    let backend = FakeBackend::stable(vec![facts]);
+    *backend.merge.lock().unwrap() = Ok(MergeAttempt::Conflict {
+        files: vec!["src/lib.rs".to_string()],
+    });
+    let (service, _sink) = service(backend.clone());
+
+    let failure = service
+        .merge_worktree(
+            Path::new("/workspaces/c1"),
+            ConflictPolicy::PreserveConflict,
+        )
+        .await
+        .expect_err("conflict fails");
+    assert!(matches!(failure, WorktreeOpError::MergeConflict { .. }));
+    assert!(backend.calls().contains(&Call::Merge {
+        branch: "c1".to_string(),
+        policy: ConflictPolicy::PreserveConflict,
+    }));
+    assert!(!ran_on_merged(&backend));
+}
+
 // ── Root guard ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1882,4 +2127,1053 @@ async fn dirty_discard_concurrent_mutation_reports_root_busy() {
         )
         .await
         .is_ok());
+}
+
+// ── Consent-bound confirmed deletion ─────────────────────────────────────────
+
+use crate::worktree_ops::consent::{
+    ConfirmedDeleteReason, ContentObservation, DeleteConsent, TeardownDisposition,
+};
+
+/// The consent a client would echo for this fact set and content.
+fn consent_for(facts: &WorktreeFacts, observed: &ContentObservation) -> DeleteConsent {
+    crate::worktree_ops::consent::ConsentObservation::new(
+        facts,
+        observed,
+        Some(MERGE_BASE.to_string()),
+    )
+    .consent()
+}
+
+fn expected_for(facts: &WorktreeFacts) -> ExpectedTarget {
+    ExpectedTarget::on_branch(facts.branch.clone())
+        .with_identity(facts.identity.clone())
+        .with_head(facts.head.clone())
+}
+
+fn all_permissions() -> DeleteOptions {
+    DeleteOptions {
+        skip_teardown: true,
+        allow_known_dirty: true,
+        allow_commits_ahead: true,
+    }
+}
+
+fn mutated(calls: &[Call]) -> bool {
+    calls
+        .iter()
+        .any(|call| matches!(call, Call::Teardown | Call::RemoveWorktree))
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_consent_mismatch_refuses_before_teardown() {
+    let mut facts = managed("/w/a", "a");
+    facts.dirty = DirtyState::Dirty;
+    let observed = content("README=A", None);
+    let good = consent_for(&facts, &observed);
+    let options = DeleteOptions {
+        skip_teardown: false,
+        allow_known_dirty: true,
+        allow_commits_ahead: true,
+    };
+
+    let cases: Vec<(&str, DeleteConsent, ExpectedTarget, ConfirmedDeleteReason)> = vec![
+        (
+            "branch",
+            DeleteConsent {
+                branch: "other".into(),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::BranchChanged,
+        ),
+        (
+            "identity",
+            good.clone(),
+            expected_for(&facts).with_identity("gitdir: /elsewhere/.git"),
+            ConfirmedDeleteReason::IdentityChanged,
+        ),
+        (
+            "head",
+            DeleteConsent {
+                head: "deadbeef".into(),
+                ..good.clone()
+            },
+            ExpectedTarget::on_branch("a")
+                .with_identity(facts.identity.clone())
+                .with_head("deadbeef"),
+            ConfirmedDeleteReason::HeadMoved,
+        ),
+        (
+            "dirty",
+            DeleteConsent {
+                dirty: Some(false),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::DirtyChanged,
+        ),
+        (
+            "ahead",
+            DeleteConsent {
+                has_commits_ahead: Some(true),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::AheadChanged,
+        ),
+        (
+            "merge base",
+            DeleteConsent {
+                merge_base: Some("2".repeat(40)),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::BaseMoved,
+        ),
+        (
+            "discardable content",
+            DeleteConsent {
+                discardable_content_id: Some(content_id("README=B")),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::ContentChanged,
+        ),
+        (
+            "ignored content",
+            DeleteConsent {
+                ignored_content_id: Some(content_id("target/a.o")),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::ContentChanged,
+        ),
+        (
+            "ignored fact",
+            DeleteConsent {
+                has_ignored_content: Some(true),
+                ..good.clone()
+            },
+            expected_for(&facts),
+            ConfirmedDeleteReason::IgnoredChanged,
+        ),
+    ];
+
+    for (label, consent, expected, reason) in cases {
+        let backend = FakeBackend::stable(vec![facts.clone()]);
+        *backend.content.lock().unwrap() = vec![observed.clone()];
+        let (service, _) = service(backend.clone());
+        let refusal = service
+            .delete_worktree_with_consent(Path::new("/w/a"), &expected, &consent, options)
+            .await
+            .expect_err(label);
+        assert_eq!(refusal.reason, Some(reason), "{label}");
+        assert!(refusal.stale, "{label} must be delete_consent_stale");
+        assert!(!refusal.teardown_ran(), "{label}");
+        assert_eq!(refusal.teardown, TeardownDisposition::NotReached, "{label}");
+        assert!(refusal.observed.is_some(), "{label} reports fresh facts");
+        assert!(!mutated(&backend.calls()), "{label}: {:?}", backend.calls());
+    }
+
+    // The matching consent passes.
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![observed.clone()];
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (service, _) = service(backend.clone());
+    service
+        .delete_worktree_with_consent(Path::new("/w/a"), &expected_for(&facts), &good, options)
+        .await
+        .expect("an unchanged consent deletes");
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_unknown_facts_fail_closed() {
+    let facts = managed("/w/a", "a");
+    let mut cases: Vec<(
+        &str,
+        WorktreeFacts,
+        ContentObservation,
+        ConfirmedDeleteReason,
+    )> = vec![];
+    let mut dirty_unknown = facts.clone();
+    dirty_unknown.dirty = DirtyState::Unknown;
+    cases.push((
+        "dirty unknown",
+        dirty_unknown,
+        clean_content(),
+        ConfirmedDeleteReason::DirtyUnknown,
+    ));
+    let mut ahead_unknown = facts.clone();
+    ahead_unknown.has_commits_ahead = SafetyFact::Unknown;
+    cases.push((
+        "ahead unknown",
+        ahead_unknown,
+        clean_content(),
+        ConfirmedDeleteReason::AheadUnknown,
+    ));
+    cases.push((
+        "content unobservable",
+        facts.clone(),
+        ContentObservation::Unobservable,
+        ConfirmedDeleteReason::ContentUnobservable,
+    ));
+    cases.push((
+        "content unbounded",
+        facts.clone(),
+        ContentObservation::Unbounded,
+        ConfirmedDeleteReason::ContentUnbounded,
+    ));
+    cases.push((
+        "nested repository",
+        facts.clone(),
+        ContentObservation::NestedRepository,
+        ConfirmedDeleteReason::NestedRepository,
+    ));
+    let mut main = facts.clone();
+    main.is_main = true;
+    cases.push((
+        "main",
+        main,
+        clean_content(),
+        ConfirmedDeleteReason::MainWorktree,
+    ));
+    let mut busy = facts.clone();
+    busy.base_merge_in_progress = SafetyFact::Yes;
+    cases.push((
+        "busy",
+        busy,
+        clean_content(),
+        ConfirmedDeleteReason::RootBusy,
+    ));
+
+    for (label, facts, observed, reason) in cases {
+        let backend = FakeBackend::stable(vec![facts.clone()]);
+        *backend.content.lock().unwrap() = vec![observed.clone()];
+        let (service, _) = service(backend.clone());
+        // The consent echoes exactly what was observed, so nothing is stale:
+        // the unknown fact itself must refuse, whatever was granted.
+        let consent = consent_for(&facts, &observed);
+        let refusal = service
+            .delete_worktree_with_consent(
+                Path::new("/w/a"),
+                &expected_for(&facts),
+                &consent,
+                all_permissions(),
+            )
+            .await
+            .expect_err(label);
+        assert_eq!(refusal.reason, Some(reason), "{label}");
+        assert!(!refusal.stale, "{label}");
+        let expected_class = match reason {
+            ConfirmedDeleteReason::DirtyUnknown
+            | ConfirmedDeleteReason::ContentUnobservable
+            | ConfirmedDeleteReason::ContentUnbounded => {
+                matches!(refusal.error, WorktreeOpError::DirtyUnknown(_))
+            }
+            ConfirmedDeleteReason::RootBusy => {
+                matches!(refusal.error, WorktreeOpError::RootBusy(_))
+            }
+            _ => matches!(refusal.error, WorktreeOpError::Ineligible(_)),
+        };
+        assert!(expected_class, "{label}: {:?}", refusal.error);
+        assert!(!mutated(&backend.calls()), "{label}: {:?}", backend.calls());
+    }
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_bound_exceeded_fails_closed_in_service() {
+    let facts = managed("/w/a", "a");
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![ContentObservation::Unbounded];
+    let (service, _) = service(backend.clone());
+    let consent = consent_for(&facts, &ContentObservation::Unbounded);
+    assert_eq!(consent.discardable_content_id, None);
+    assert_eq!(consent.ignored_content_id, None);
+
+    let refusal = service
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent,
+            all_permissions(),
+        )
+        .await
+        .expect_err("an unbounded observation refuses with every permission");
+    assert_eq!(
+        refusal.reason,
+        Some(ConfirmedDeleteReason::ContentUnbounded)
+    );
+    assert!(matches!(refusal.error, WorktreeOpError::DirtyUnknown(_)));
+    assert!(!refusal.teardown_ran());
+    assert!(!mutated(&backend.calls()));
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_permissions_map_to_options_exactly() {
+    // skip_teardown: no teardown call, disposition `skipped`.
+    let facts = managed("/w/a", "a");
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (service_a, _) = service(backend.clone());
+    let deleted = service_a
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &clean_content()),
+            DeleteOptions::local(true),
+        )
+        .await
+        .expect("deleted");
+    assert_eq!(deleted.teardown, TeardownDisposition::Skipped);
+    assert!(!backend.calls().contains(&Call::Teardown));
+    assert!(backend.calls().contains(&Call::RemoveWorktree));
+    assert!(!deleted.dirty_discarded && !deleted.commits_discarded);
+
+    // Ordinary consent: teardown runs, disposition `ran`; an absent script is `absent`.
+    for (present, disposition) in [
+        (true, TeardownDisposition::Ran),
+        (false, TeardownDisposition::Absent),
+    ] {
+        let backend = FakeBackend::stable(vec![facts.clone()]);
+        backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+        *backend.teardown_present.lock().unwrap() = present;
+        let (svc, _) = service(backend.clone());
+        let deleted = svc
+            .delete_worktree_with_consent(
+                Path::new("/w/a"),
+                &expected_for(&facts),
+                &consent_for(&facts, &clean_content()),
+                DeleteOptions::fail_closed(),
+            )
+            .await
+            .expect("deleted");
+        assert_eq!(deleted.teardown, disposition);
+        assert!(backend.calls().contains(&Call::Teardown));
+    }
+
+    // discard_commits_ahead on an ahead worktree: atomic delete at the HEAD.
+    let mut ahead = managed("/w/a", "a");
+    ahead.has_commits_ahead = SafetyFact::Yes;
+    let backend = FakeBackend::stable(vec![ahead.clone()]);
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (svc, _) = service(backend.clone());
+    let deleted = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&ahead),
+            &consent_for(&ahead, &clean_content()),
+            DeleteOptions {
+                skip_teardown: false,
+                allow_known_dirty: false,
+                allow_commits_ahead: true,
+            },
+        )
+        .await
+        .expect("deleted");
+    assert!(backend.calls().contains(&Call::DeleteBranchAt {
+        branch: "a".into(),
+        expected_oid: HEAD.into(),
+    }));
+    assert!(deleted.commits_discarded && deleted.branch_deleted);
+
+    // The same permission on a worktree that is not ahead changes nothing:
+    // ordinary merged-branch cleanup, never a force delete.
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    backend.set_branch_refs(
+        "a",
+        vec![Ok(Some(HEAD.to_string())), Ok(Some(HEAD.to_string()))],
+    );
+    let (svc, _) = service(backend.clone());
+    let deleted = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &clean_content()),
+            DeleteOptions {
+                skip_teardown: false,
+                allow_known_dirty: false,
+                allow_commits_ahead: true,
+            },
+        )
+        .await
+        .expect("deleted");
+    assert!(!backend
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::DeleteBranchAt { .. })));
+    assert!(backend
+        .calls()
+        .contains(&Call::DeleteBranch { branch: "a".into() }));
+    assert!(!deleted.commits_discarded);
+
+    // Ahead without the permission is the unchanged `commits_ahead` refusal,
+    // and ahead plus dirty needs both permissions.
+    let mut both = ahead.clone();
+    both.dirty = DirtyState::Dirty;
+    for (label, target, options, reason) in [
+        (
+            "ahead without permission",
+            ahead.clone(),
+            DeleteOptions::local(false),
+            ConfirmedDeleteReason::CommitsAhead,
+        ),
+        (
+            "ahead and dirty with only the ahead permission",
+            both.clone(),
+            DeleteOptions {
+                skip_teardown: false,
+                allow_known_dirty: false,
+                allow_commits_ahead: true,
+            },
+            ConfirmedDeleteReason::Dirty,
+        ),
+    ] {
+        let backend = FakeBackend::stable(vec![target.clone()]);
+        let (svc, _) = service(backend.clone());
+        let refusal = svc
+            .delete_worktree_with_consent(
+                Path::new("/w/a"),
+                &expected_for(&target),
+                &consent_for(&target, &clean_content()),
+                options,
+            )
+            .await
+            .expect_err(label);
+        assert_eq!(refusal.reason, Some(reason), "{label}");
+        assert!(!mutated(&backend.calls()), "{label}");
+    }
+    let backend = FakeBackend::stable(vec![both.clone()]);
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (svc, _) = service(backend.clone());
+    let deleted = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&both),
+            &consent_for(&both, &clean_content()),
+            DeleteOptions {
+                skip_teardown: false,
+                allow_known_dirty: true,
+                allow_commits_ahead: true,
+            },
+        )
+        .await
+        .expect("both permissions delete");
+    assert!(deleted.dirty_discarded && deleted.commits_discarded);
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_post_teardown_content_drift_refuses() {
+    let mut facts = managed("/w/a", "a");
+    facts.dirty = DirtyState::Dirty;
+    let before = content("README=A", None);
+    let after = content("README=teardown-edit", None);
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![before.clone(), after];
+    let (service, _) = service(backend.clone());
+
+    let refusal = service
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &before),
+            DeleteOptions::local_discarding_dirty(false),
+        )
+        .await
+        .expect_err("teardown touched tracked content");
+    assert_eq!(refusal.reason, Some(ConfirmedDeleteReason::ContentChanged));
+    assert!(refusal.stale);
+    assert!(refusal.teardown_ran(), "the refusal must say teardown ran");
+    assert!(backend.calls().contains(&Call::Teardown));
+    assert!(!backend.calls().contains(&Call::RemoveWorktree));
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_teardown_failure_is_retained_and_typed() {
+    let facts = managed("/w/a", "a");
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.teardown.lock().unwrap() =
+        Err(WorktreeOpError::Internal("teardown exited 3".to_string()));
+    let (service, _) = service(backend.clone());
+    let refusal = service
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &clean_content()),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect_err("a failing teardown refuses");
+    assert_eq!(refusal.reason, Some(ConfirmedDeleteReason::TeardownFailed));
+    assert!(matches!(refusal.error, WorktreeOpError::Internal(_)));
+    assert!(refusal.teardown_ran());
+    assert!(!backend.calls().contains(&Call::RemoveWorktree));
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_ignored_content_requires_dirty_discard() {
+    let facts = managed("/w/a", "a");
+    let observed = content("", Some("target/a.o"));
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![observed.clone()];
+    let (svc, _) = service(backend.clone());
+    let refusal = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &observed),
+            DeleteOptions::local(true),
+        )
+        .await
+        .expect_err("ignored content without discard_known_dirty");
+    assert_eq!(refusal.reason, Some(ConfirmedDeleteReason::IgnoredContent));
+    assert!(matches!(refusal.error, WorktreeOpError::Dirty { .. }));
+    assert!(!mutated(&backend.calls()));
+
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![observed.clone()];
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (svc, _) = service(backend.clone());
+    let deleted = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &observed),
+            DeleteOptions::local_discarding_dirty(true),
+        )
+        .await
+        .expect("with the permission the delete proceeds");
+    assert!(deleted.dirty_discarded);
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_post_teardown_ignored_cleanup_is_allowed() {
+    let facts = managed("/w/a", "a");
+    let before = content("", Some("target/a.o"));
+
+    // Teardown removed every ignored path: still eligible.
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    *backend.content.lock().unwrap() = vec![before.clone(), clean_content()];
+    backend.set_branch_ref("a", Ok(Some(HEAD.to_string())));
+    let (svc, _) = service(backend.clone());
+    let deleted = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &before),
+            DeleteOptions::local_discarding_dirty(false),
+        )
+        .await
+        .expect("an emptied ignored set is teardown doing its job");
+    assert_eq!(deleted.teardown, TeardownDisposition::Ran);
+    assert!(!deleted.dirty_discarded, "nothing was left to discard");
+
+    // Teardown left a different ignored set, or touched tracked content.
+    for (label, after) in [
+        ("different ignored set", content("", Some("target/b.o"))),
+        (
+            "tracked content touched",
+            content("README=teardown", Some("target/a.o")),
+        ),
+    ] {
+        let backend = FakeBackend::stable(vec![facts.clone()]);
+        *backend.content.lock().unwrap() = vec![before.clone(), after];
+        let (svc, _) = service(backend.clone());
+        let refusal = svc
+            .delete_worktree_with_consent(
+                Path::new("/w/a"),
+                &expected_for(&facts),
+                &consent_for(&facts, &before),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect_err(label);
+        assert_eq!(
+            refusal.reason,
+            Some(ConfirmedDeleteReason::ContentChanged),
+            "{label}"
+        );
+        assert!(refusal.teardown_ran(), "{label}");
+        assert!(!backend.calls().contains(&Call::RemoveWorktree), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_busy_root_refuses_before_observing() {
+    let facts = managed("/w/a", "a");
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    let (svc, _) = service(backend.clone());
+    let _held = svc.acquire_root_for_test().unwrap();
+    let refusal = svc
+        .delete_worktree_with_consent(
+            Path::new("/w/a"),
+            &expected_for(&facts),
+            &consent_for(&facts, &clean_content()),
+            all_permissions(),
+        )
+        .await
+        .expect_err("held root guard");
+    assert_eq!(refusal.reason, Some(ConfirmedDeleteReason::RootBusy));
+    assert!(matches!(refusal.error, WorktreeOpError::RootBusy(_)));
+    assert!(backend.calls().is_empty());
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_preview_options_agree_with_the_command() {
+    let mut facts = managed("/w/a", "a");
+    facts.dirty = DirtyState::Dirty;
+    facts.has_commits_ahead = SafetyFact::Yes;
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    let (svc, _) = service(backend.clone());
+    let preview = svc
+        .delete_preview(Path::new("/w/a"), &facts.identity)
+        .await
+        .expect("previewed");
+    assert_eq!(preview.ordinary, Err(ConfirmedDeleteReason::CommitsAhead));
+    assert_eq!(
+        preview.skip_teardown,
+        Err(ConfirmedDeleteReason::CommitsAhead)
+    );
+    assert_eq!(
+        preview.discard_known_dirty,
+        Err(ConfirmedDeleteReason::CommitsAhead)
+    );
+    assert_eq!(preview.discard_commits_ahead, Ok(()));
+    assert!(preview.also_discards_dirty);
+    assert_eq!(preview.commits_ahead, Some(2));
+    assert!(preview.teardown_script_present);
+    assert!(
+        backend.calls().iter().all(|c| matches!(c, Call::Observe)),
+        "a preview is a read: {:?}",
+        backend.calls()
+    );
+
+    // Every non-observed content outcome blocks every option.
+    for outcome in [
+        ContentObservation::Unobservable,
+        ContentObservation::Unbounded,
+        ContentObservation::NestedRepository,
+    ] {
+        let backend = FakeBackend::stable(vec![managed("/w/a", "a")]);
+        *backend.content.lock().unwrap() = vec![outcome.clone()];
+        let (svc, _) = service(backend);
+        let preview = svc
+            .delete_preview(Path::new("/w/a"), "gitdir: /w/a/.git")
+            .await
+            .unwrap();
+        let reason = outcome.refusal_reason().unwrap();
+        for option in [
+            preview.ordinary,
+            preview.skip_teardown,
+            preview.discard_known_dirty,
+            preview.discard_commits_ahead,
+        ] {
+            assert_eq!(option, Err(reason));
+        }
+        assert_eq!(preview.observation.discardable_content_id, None);
+    }
+}
+
+// ── Configured-command sessions ──────────────────────────────────────────────
+
+/// A session probe answering from a fixed set of running cwd paths.
+struct FakeSessionProbe(Vec<PathBuf>);
+
+impl SessionProbe for FakeSessionProbe {
+    fn session_running(&self, path: &Path) -> bool {
+        self.0.iter().any(|running| running == path)
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_session_delete_refuses_with_a_running_session() {
+    let backend = FakeBackend::stable(vec![
+        managed("/workspaces/busy", "busy"),
+        managed("/workspaces/idle", "idle"),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let service = WorktreeService::new(backend.clone(), sink, PathBuf::from("/workspaces"))
+        .with_session_probe(Arc::new(FakeSessionProbe(vec![PathBuf::from(
+            "/workspaces/busy",
+        )])));
+
+    let refused = service
+        .delete_worktree(
+            Path::new("/workspaces/busy"),
+            &ExpectedTarget::on_branch("busy"),
+            DeleteOptions::local(false),
+        )
+        .await
+        .expect_err("a worktree with a running session is not deletable");
+    assert!(
+        matches!(&refused, WorktreeOpError::Ineligible(detail) if detail == SESSION_RUNNING_REFUSAL),
+        "typed ineligible refusal, got {refused:?}"
+    );
+    // Refused before teardown: the only backend call was the targeted observation.
+    assert_eq!(backend.calls(), vec![Call::Observe]);
+
+    // An unrelated worktree keeps the existing delete path unchanged.
+    service
+        .delete_worktree(
+            Path::new("/workspaces/idle"),
+            &ExpectedTarget::on_branch("idle"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("an unrelated worktree still deletes");
+    let calls = backend.calls();
+    assert!(calls.contains(&Call::Teardown) && calls.contains(&Call::RemoveWorktree));
+
+    // With no session running, the same target deletes exactly as before.
+    let backend = FakeBackend::stable(vec![managed("/workspaces/busy", "busy")]);
+    let (plain, _sink) = service_with_probe(backend.clone(), Vec::new());
+    plain
+        .delete_worktree(
+            Path::new("/workspaces/busy"),
+            &ExpectedTarget::on_branch("busy"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("probe false leaves deletion unchanged");
+    assert!(backend.calls().contains(&Call::RemoveWorktree));
+}
+
+fn service_with_probe(
+    backend: Arc<FakeBackend>,
+    running: Vec<PathBuf>,
+) -> (WorktreeService, Arc<RecordingSink>) {
+    let sink = Arc::new(RecordingSink::default());
+    (
+        WorktreeService::new(backend, sink.clone(), PathBuf::from("/workspaces"))
+            .with_session_probe(Arc::new(FakeSessionProbe(running))),
+        sink,
+    )
+}
+
+#[tokio::test]
+async fn remote_confirmed_delete_refuses_with_a_running_session() {
+    let facts = managed("/workspaces/busy", "busy");
+    let backend = FakeBackend::stable(vec![facts.clone()]);
+    let (svc, _sink) = service_with_probe(backend.clone(), vec![facts.path.clone()]);
+
+    let refusal = svc
+        .delete_worktree_with_consent(
+            Path::new("/workspaces/busy"),
+            &expected_for(&facts),
+            &consent_for(&facts, &clean_content()),
+            all_permissions(),
+        )
+        .await
+        .expect_err("consent never bypasses a running session");
+    assert!(
+        matches!(&refusal.error, WorktreeOpError::Ineligible(detail) if detail == SESSION_RUNNING_REFUSAL),
+        "typed ineligible refusal, got {refusal:?}"
+    );
+    assert_eq!(refusal.teardown, TeardownDisposition::NotReached);
+    assert!(!mutated(&backend.calls()));
+}
+
+/// A provisioning seam that records every call by name.
+#[derive(Default)]
+struct RecordingProvisionRuntime {
+    calls: Mutex<Vec<&'static str>>,
+    setup_error: Option<String>,
+    cleanup_error: Option<String>,
+    fail_validation_at: Option<usize>,
+}
+
+impl RecordingProvisionRuntime {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: &'static str) -> usize {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(call);
+        calls.iter().filter(|c| **c == call).count()
+    }
+}
+
+#[async_trait]
+impl crate::worktree_ops::session::SessionProvisionRuntime for RecordingProvisionRuntime {
+    async fn check_git_repo(&self, _repo_root: &Path) -> Result<bool, String> {
+        self.record(crate::worktree_ops::session::step::CHECK_GIT_REPO);
+        Ok(true)
+    }
+
+    async fn generate_unique_branch_name(
+        &self,
+        _repo_root: &Path,
+        prefix: &str,
+        max_attempts: u32,
+    ) -> Result<String, String> {
+        self.record(crate::worktree_ops::session::step::GENERATE_BRANCH);
+        assert_eq!((prefix, max_attempts), ("ws-session", 10));
+        Ok("ws-session-abc".to_string())
+    }
+
+    async fn worktree_add(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &str,
+        branch_name: &str,
+        base_commit: &str,
+    ) -> Result<(), String> {
+        self.record(crate::worktree_ops::session::step::WORKTREE_ADD);
+        assert_eq!((branch_name, base_commit), ("ws-session-abc", "HEAD"));
+        Ok(())
+    }
+
+    async fn validate_worktree_command_cwd(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &Path,
+    ) -> Result<(), String> {
+        let n = self.record(crate::worktree_ops::session::step::VALIDATE_CWD);
+        if self.fail_validation_at == Some(n) {
+            return Err(format!("validation {n} failed"));
+        }
+        Ok(())
+    }
+
+    async fn run_worktree_setup(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &Path,
+    ) -> Result<bool, String> {
+        self.record(crate::worktree_ops::session::step::RUN_SETUP);
+        match &self.setup_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(true),
+        }
+    }
+
+    async fn worktree_remove_after_setup_failure(
+        &self,
+        _repo_root: &Path,
+        _worktree_path: &str,
+    ) -> Result<(), String> {
+        self.record(crate::worktree_ops::session::step::CLEANUP);
+        match &self.cleanup_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_session_provisioner_order_matches_tui_plus() {
+    use crate::worktree_ops::session::{
+        CleanupOutcome, CwdPhase, ProvisionError, SessionProvisioner,
+        PLUS_SETUP_FAILURE_STEP_ORDER, PLUS_STEP_ORDER,
+    };
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let base = temp.path().join("ws");
+    let template = "sh run.sh {workspace_dir} {repo_root}";
+
+    // Success: exactly the TUI `+` sequence, three validations, expanded command.
+    let runtime = RecordingProvisionRuntime::default();
+    let provisioned = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect("provisioning succeeds");
+    assert_eq!(runtime.calls(), PLUS_STEP_ORDER.to_vec());
+    assert_eq!(
+        provisioned.validations,
+        vec![
+            CwdPhase::AfterCreate,
+            CwdPhase::AfterSetup,
+            CwdPhase::BeforeLaunch
+        ]
+    );
+    assert_eq!(provisioned.branch, "ws-session-abc");
+    assert!(provisioned.path.starts_with(&base));
+    assert!(base.is_dir(), "the base directory is created first");
+    assert_eq!(
+        provisioned.command,
+        format!(
+            "sh run.sh {} {}",
+            provisioned.path.display(),
+            temp.path().display()
+        )
+    );
+
+    // Setup failure: the TUI's cleanup call, nothing after it.
+    let runtime = RecordingProvisionRuntime {
+        setup_error: Some("setup exploded".to_string()),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("setup failure stops provisioning");
+    assert_eq!(runtime.calls(), PLUS_SETUP_FAILURE_STEP_ORDER.to_vec());
+    assert!(matches!(
+        error,
+        ProvisionError::SetupFailed {
+            cleanup: CleanupOutcome::Removed,
+            ..
+        }
+    ));
+
+    // A cleanup that itself fails reports `retained` with its reason.
+    let runtime = RecordingProvisionRuntime {
+        setup_error: Some("setup exploded".to_string()),
+        cleanup_error: Some("still locked".to_string()),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("setup failure stops provisioning");
+    match error {
+        ProvisionError::SetupFailed {
+            cleanup: CleanupOutcome::Retained { reason },
+            ..
+        } => assert_eq!(reason, "still locked"),
+        other => panic!("expected a retained cleanup, got {other:?}"),
+    }
+
+    // Invalid cwd immediately before launch: the full sequence ran, nothing launches.
+    let runtime = RecordingProvisionRuntime {
+        fail_validation_at: Some(3),
+        ..Default::default()
+    };
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, Some(template))
+        .provision()
+        .await
+        .expect_err("invalid cwd stops provisioning");
+    assert_eq!(runtime.calls(), PLUS_STEP_ORDER.to_vec());
+    assert!(matches!(
+        error,
+        ProvisionError::CwdInvalid {
+            phase: CwdPhase::BeforeLaunch,
+            ..
+        }
+    ));
+
+    // No template: unavailable before any call.
+    let runtime = RecordingProvisionRuntime::default();
+    let error = SessionProvisioner::new(&runtime, temp.path(), &base, None)
+        .provision()
+        .await
+        .expect_err("no template");
+    assert!(matches!(error, ProvisionError::Unavailable(_)));
+    assert!(runtime.calls().is_empty());
+}
+
+#[test]
+fn remote_contract_gap_merge_hook_failure_is_a_typed_variant_with_same_display() {
+    use crate::vcs::git::commands::LandingReport;
+    let hooked = WorktreeOpError::MergedHookFailed {
+        change_id: "c1".to_string(),
+        premerge_head: Some("a".repeat(40)),
+        landing: Box::new(LandingReport::unknown("test")),
+        hook_detail: "hook exit 2".to_string(),
+    };
+    assert_eq!(
+        hooked.to_string(),
+        "on_merged hook failed for 'c1'; branch merged transition blocked: hook exit 2",
+        "the operator text is the untyped message this replaced"
+    );
+    let failed = WorktreeOpError::MergeFailed {
+        premerge_head: None,
+        landing: Box::new(LandingReport::unknown("test")),
+        detail: "Working directory is not clean. Commit or stash changes before merging."
+            .to_string(),
+    };
+    assert_eq!(
+        failed.to_string(),
+        WorktreeOpError::Internal(
+            "Working directory is not clean. Commit or stash changes before merging.".to_string()
+        )
+        .to_string()
+    );
+}
+
+#[tokio::test]
+async fn remote_contract_gap_merge_hook_failure_variant_only_for_abort_policy() {
+    for (policy, typed) in [
+        (ConflictPolicy::AbortOnConflict, true),
+        (ConflictPolicy::PreserveConflict, false),
+    ] {
+        let backend = FakeBackend::stable(vec![mergeable()]);
+        *backend.on_merged.lock().unwrap() =
+            Err(WorktreeOpError::Internal("hook exit 2".to_string()));
+        let (service, sink) = service(backend);
+        let failure = service
+            .merge_worktree(Path::new("/workspaces/c1"), policy)
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            matches!(failure, WorktreeOpError::MergedHookFailed { .. }),
+            typed,
+            "{policy:?}: {failure:?}"
+        );
+        let text = "on_merged hook failed for 'c1'; branch merged transition blocked: hook exit 2";
+        assert_eq!(failure.to_string(), text);
+        assert!(sink
+            .events()
+            .contains(&WorktreeOperationEvent::MergeFailed {
+                branch: "c1".to_string(),
+                error: text.to_string(),
+            }));
+    }
+}
+
+#[test]
+fn remote_contract_gap_delete_detached_head_is_classified_first() {
+    let observed = content("README=A", None);
+    let attached = managed("/w/a", "a");
+    let consent = consent_for(&attached, &observed);
+
+    let mut detached = attached.clone();
+    detached.is_detached = true;
+    detached.branch = String::new();
+    // Even a main worktree with an unreadable root reports the detached fact
+    // first: it is checked before every other one.
+    let mut worst = detached.clone();
+    worst.is_main = true;
+    worst.base_merge_in_progress = SafetyFact::Unknown;
+    for facts in [&detached, &worst] {
+        for options in [
+            DeleteOptions::fail_closed(),
+            DeleteOptions::local(true),
+            DeleteOptions::local_discarding_dirty(false),
+            all_permissions(),
+        ] {
+            assert_eq!(
+                classify_confirmed_delete(facts, &observed, options),
+                Err(ConfirmedDeleteReason::DetachedHead)
+            );
+        }
+        // Detaching after an attached preview is refused as what it is, not
+        // as a branch change.
+        assert_eq!(
+            classify_consent(
+                facts,
+                &observed,
+                Some(MERGE_BASE),
+                &consent,
+                all_permissions(),
+                false
+            ),
+            Err(ConfirmedDeleteReason::DetachedHead)
+        );
+    }
+
+    // An empty branch name alone is a detached HEAD too.
+    let mut nameless = attached.clone();
+    nameless.branch = String::new();
+    assert_eq!(
+        classify_confirmed_delete(&nameless, &observed, all_permissions()),
+        Err(ConfirmedDeleteReason::DetachedHead)
+    );
+
+    // The attached worktree is unaffected.
+    assert_eq!(
+        classify_confirmed_delete(&attached, &observed, all_permissions()),
+        Ok(())
+    );
 }

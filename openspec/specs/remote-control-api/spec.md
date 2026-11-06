@@ -1294,3 +1294,1090 @@ Each projected change MUST carry an additive nullable `acceptance_provenance` ob
 - **WHEN** retry eligibility, admission, and the next action are computed
 - **THEN** all three are identical
 - **AND** restart publishes `null` without changing the next action
+
+### Requirement: Configured worktree command sessions API
+
+V2 MUST extend the closed command set with `run_worktree_command`
+(target opaque `worktree_id`, empty params), `create_session_worktree`
+(empty params), and `stop_worktree_session` (target opaque `session_id`,
+empty params), and MUST expose
+`GET /api/v2/worktree-sessions` and `GET /api/v2/worktree-sessions/{session_id}`.
+The command executed MUST be exactly the configured `worktree_command`
+template with `{workspace_dir}` and `{repo_root}` expanded server-side; no
+request MUST carry a command, argv, environment, path, branch, or base
+commit. Launch MUST use the same runner path as the TUI: `sh -c`, `stdin`
+from `/dev/null`, an owned process group, stagger admission, and the
+configured retry policy inside one session.
+
+`create_session_worktree` MUST create a worktree on a server-generated
+`ws-session-<random>` branch at base `HEAD` under the workspace base
+directory, MUST validate the cwd after creation, run `.wt/setup` from the
+project root, validate after setup and immediately before launch, and MUST
+remove the worktree through the same cleanup the TUI uses when setup fails
+(forced worktree removal with teardown skipped; the `ws-session-*` branch is
+retained exactly as the TUI leaves it), launching nothing and settling
+`worktree_session_setup_failed` with the typed cleanup outcome. The creation
+steps MUST run under the repository root mutation guard. The running-slot
+and worktree-busy reservation MUST be taken before any Git effect and
+released on every refusal, so a `capacity` refusal creates no worktree and
+no branch.
+
+Each session MUST have a process-local 128-bit `session_id`, a `kind`
+(`existing` or `session`), the opaque `worktree_id`, a repository-relative
+path, a closed `state` (`running`, `succeeded`, `failed`, `stopped`),
+`attempt`, start/finish instants, exit code or signal, setup and cleanup
+facts, and an output tail bounded at 65,536 bytes of `sanitize_detail`-ed
+lines with a dropped-byte count. Output MUST NOT enter the log ring, the
+event stream, or the snapshot. A replay of an identical idempotency key MUST
+return the original record and launch nothing; a new request for a worktree
+with a running session MUST be refused `worktree_session_busy`; more than 4
+concurrently running sessions MUST be refused `worktree_session_busy` with
+reason `capacity`. A launch command MUST be refused
+`worktree_session_unavailable` when `worktree_command` is not configured or
+the project is not a Git repository, and `command_executor_unbound` on a
+headless owner.
+
+`stop_worktree_session` MUST cancel the session through the runner's own
+handle (`StreamingChildHandle::terminate`), whose cancellation path sends
+SIGTERM to the session's process group, escalates to SIGKILL after 5
+seconds, verifies the group, and admits no further attempt; it MUST NOT
+signal the process group externally, because the configured retry policy
+would relaunch inside the same session, and MUST settle only after the
+leader is reaped and the cleanup report is read, with `terminated` and
+`state_after`. The runner MUST be bound to a `RunCommandScope` owned by the
+session registry, and owner shutdown MUST close that scope under a bounded
+deadline so every running session is terminated and reaped and no further
+attempt can spawn. Scheduler `stop`, `stop_and_dequeue`, and `force_stop`
+MUST NOT terminate these independent sessions or close their registry scope;
+session stop and owner process shutdown are separate operations.
+The guarantee covers the processes that remain in the
+session's process group; a descendant that left it (`setsid`,
+daemonization) is explicitly outside the stop and shutdown guarantee. The shared worktree service MUST refuse deleting a worktree whose
+session is running, for the TUI and the API alike. Sessions MUST be retained
+in memory only (running never evicted, at most 32 finished), MUST NOT be
+persisted, and MUST NOT influence scheduling, resume, acceptance, or archive.
+No owner-generated field (path, branch, result, error detail, events, the
+log ring, the snapshot, or the OpenAPI document) MUST disclose the template,
+the expanded command, environment values, absolute paths, or credentials.
+The output tail is the command's own stdout/stderr: it MUST be retained only
+after control-sequence stripping and size bounding, MUST NOT be redacted or
+claimed to be, MUST be readable only through the bearer-authenticated
+session resource, and MUST never appear as an event, log entry, or snapshot
+field. A configured command that prints its arguments, environment, or cwd
+discloses them to every authenticated reader; that disclosure is the
+operator's responsibility when configuring `worktree_command`, and the
+documentation MUST say so.
+
+Capabilities MUST advertise `worktree_sessions` (`available`, `commands`,
+`routes`, `max_running`, `max_retained`, `max_output_bytes`, `stdin`,
+`reasons`), decoding as unavailable when an older owner omits it; the
+generated OpenAPI document MUST include the three commands, both routes, the
+`worktree_session` and `worktree_session_stop` result kinds, the
+`worktree_session_started`/`worktree_session_finished` event types, and the
+error codes. Every existing route and command MUST remain unchanged on an
+older owner, and a new command submitted to it MUST fail typed validation
+before any effect. `cflx client` and `cflx client mcp` MUST gain no verb.
+
+#### Scenario: Configured command runs in the addressed worktree with null stdin
+
+- **GIVEN** `worktree_command` is configured and a worktree has an opaque ID
+- **WHEN** an authenticated client submits `run_worktree_command` for it
+- **THEN** one session starts with cwd equal to that worktree and both placeholders expanded
+- **AND** the child's stdin is `/dev/null`
+- **AND** the session resource publishes exit code, state, and the bounded output tail
+- **AND** one `worktree_session_finished` event is published
+
+#### Scenario: Session worktree is created the way the TUI creates it
+
+- **GIVEN** `.wt/setup` exists in the project root
+- **WHEN** a client submits `create_session_worktree`
+- **THEN** a `ws-session-*` branch and registered worktree exist at base `HEAD`
+- **AND** setup ran and the cwd was validated after create, after setup, and before launch
+- **AND** the result names the new opaque `worktree_id`
+
+#### Scenario: Setup failure cleans up and launches nothing
+
+- **GIVEN** `.wt/setup` exits non-zero
+- **WHEN** `create_session_worktree` runs
+- **THEN** the worktree is removed by forced removal without teardown and the `ws-session-*` branch is retained
+- **AND** no process is launched
+- **AND** the record fails `worktree_session_setup_failed` with `cleanup.removed: true`
+
+#### Scenario: Capacity refusal of creation leaves the repository untouched
+
+- **GIVEN** 4 sessions are running
+- **WHEN** a client submits `create_session_worktree`
+- **THEN** it is refused `worktree_session_busy` with reason `capacity` before any Git effect
+- **AND** no worktree or branch is created and the reservation is released
+
+#### Scenario: Resend and concurrency never duplicate a session
+
+- **GIVEN** a session is running for a worktree
+- **WHEN** the same idempotency key is replayed and a new key is submitted
+- **THEN** the replay returns the original record and launches nothing
+- **AND** the new key is refused `worktree_session_busy`
+- **AND** a configured retry inside the session increments `attempt` without a new `session_id`
+
+#### Scenario: Stop terminates the whole process group
+
+- **GIVEN** a running session whose command spawned a background child in the same process group, and a retry policy of at least one retry
+- **WHEN** `stop_worktree_session` is submitted
+- **THEN** both processes are gone after settlement and `terminated` is true
+- **AND** the session reads `stopped` with its signal, `attempt` stays 1, and no new process was started
+
+#### Scenario: Deletion is refused while a session runs
+
+- **GIVEN** a worktree with a running session
+- **WHEN** the API submits `delete_worktree` or the TUI confirms deletion
+- **THEN** the shared service refuses with a typed ineligible reason
+- **AND** nothing is torn down or removed
+
+#### Scenario: Output is bounded and owner metadata discloses no secret
+
+- **GIVEN** a template containing a credential and a command that prints 200 KiB with ANSI codes but never echoes its arguments, environment, or cwd
+- **WHEN** the session finishes
+- **THEN** the retained tail is at most 65,536 bytes with `truncated_bytes` counted and no escape bytes
+- **AND** no owner-generated field, event, log entry, snapshot field, or record contains the credential, the template, or an absolute path
+
+#### Scenario: Output tail is the command's own data
+
+- **GIVEN** a configured command that echoes the expanded `{repo_root}`
+- **WHEN** an authenticated client reads the session resource
+- **THEN** the absolute path appears in `output.lines` exactly as printed, control sequences stripped and not redacted
+- **AND** it appears in no owner-generated field, event, log entry, or snapshot field, and an unauthenticated read is refused
+
+#### Scenario: Older owner stays compatible
+
+- **GIVEN** an owner built before this surface
+- **WHEN** a client decodes its capabilities and submits `run_worktree_command`
+- **THEN** `worktree_sessions` decodes as unavailable
+- **AND** the command is `validation_failed` with no record and no effect
+
+### Requirement: Archive completion and execution clocks are published per revision
+
+Each projected `ChangeResource` MUST publish `archive_complete`, `true`
+exactly when the reducer's archive record contains the change in this owner
+process, read in the same reducer hold as `display_status`, distinct from
+`display_status` and from merge or push success, retained while the row
+advances to `resolving`, `resolve pending`, `merge wait`, `merged`, or
+`pushed`, and `false` in a new process. Each `ChangeResource` MUST publish
+`net_active` with `accumulated_ms` (the sum of closed active intervals),
+`active_since` (the RFC 3339 instant of the open interval or `null`), and
+`has_history`, driven by one shared clock the TUI rows also use: an interval
+opens on a transition into an active display status (`preparing`,
+`applying`, `accepting`, `rejecting`, `archiving`, `resolving`), stays open
+across repeated or successive active statuses, closes exactly once on a
+transition to any other status or on process `Stopped` in either order with
+the reducer synchronization, resumes on the next active status with the
+earlier total retained, is never reset while the owner runs, and is zero
+after restart.
+
+The snapshot MUST publish `run_clock` with `started_at`, `ended_at`, and
+`elapsed_ms` as a projection of the existing TUI run clock through one
+shared rule, boundary for boundary and without changing the TUI: opened
+(`started_at` set, the other two `null`) by an accepted Start dispatch
+while the mode is not running; left unchanged by admitted work resuming a
+persistent-idle Ready, by `ResolveReserved`, by a persistent-idle park, by a
+stop request, by a cancelled stop, by a Start while already running, and by
+a fatal process `Error`; frozen, with `ended_at` set and `elapsed_ms` the
+monotonic duration since the open in whole milliseconds, by every process
+`Stopped` delivery, by every `AllCompleted` delivery whether or not it may
+overwrite the mode, and by a resolve-side settlement that finds no
+processing row while running, except that `ResolveFailed` for an already
+`merged` target MUST be a no-op just as the TUI early-return path is;
+re-frozen at the later instant by a repeated
+terminal delivery, exactly when the TUI re-freezes; and retained until the
+next opening Start. All three members MUST be `null` before the first Start
+in the process. Run-clock parity is scoped to event sequences in which the
+existing web and TUI modes agree; existing mode-divergence cases are not
+redefined or claimed to have universal parity by this metadata extension.
+
+`ChangeTiming` MUST keep its existing per-run meaning: `elapsed_ms` is the
+duration of the finished run and is not cumulative. Accumulated time and
+the open boundary MUST be published in the same snapshot and revision; no
+member MUST change because time passed, a repeated identical status event
+MUST NOT change `net_active`, and `run_clock` MUST change only on a real
+open or freeze event, so the revision MAY advance on a repeated terminal
+event only when the frozen value changes. None of the three members MUST be
+persisted, derived from process start time or logs, or read by scheduling,
+resume, acceptance, or archive decisions.
+
+The three members MUST be published as required, non-null members of the
+generated OpenAPI document and MUST decode as absent (`null`) — never as
+`false` or zero — when an older owner omits them, while a payload omitting
+any pre-existing required member MUST still be rejected. `cflx client`
+verbs MUST keep working against both owners. No new capability block,
+route, or command is introduced.
+
+#### Scenario: Archive completion is published independently of status
+
+- **GIVEN** the reducer recorded `ChangeArchived` for `alpha` and the row advanced to `resolving`
+- **WHEN** a client reads `/api/v2/state`
+- **THEN** `alpha.archive_complete` is `true` while `display_status` is `resolving`
+- **AND** a fresh-process retry showing `resolving` with no archive on record reports `false`
+
+#### Scenario: Net-active clock equals the TUI row
+
+- **GIVEN** one event sequence of apply, acceptance, stop, retry, and archive
+- **WHEN** the TUI row and the API projection observe it with the same instants
+- **THEN** `accumulated_ms`, the open boundary, and `has_history` are equal at every step
+- **AND** the stop event and the reducer synchronization close the interval exactly once in either order
+
+#### Scenario: Run clock is retained after stop and reset by the next start
+
+- **GIVEN** a run was started and then stopped
+- **WHEN** clients read the snapshot repeatedly and later submit `start`
+- **THEN** `run_clock.elapsed_ms` is constant across the reads
+- **AND** the next start publishes a new `started_at` with `ended_at` and `elapsed_ms` null
+- **AND** a persistent-idle park and a fatal process `Error` leave the clock open
+
+#### Scenario: Run clock keeps the TUI start across re-admission and ResolveReserved
+
+- **GIVEN** a run opened at `t0` was parked by a persistent-idle event, or stopped
+- **WHEN** admitted work resumes it, or `ResolveReserved` moves the mode to running
+- **THEN** `run_clock.started_at` is still the `t0` sample
+- **AND** the TUI `orchestration_started_at` driven at the same instants is still `t0`
+
+#### Scenario: Run clock re-freezes on a repeated terminal event like the TUI
+
+- **GIVEN** a run opened at `t0` was frozen by `Stopped` at `t1`
+- **WHEN** a second `Stopped` arrives at `t2`, or a delayed `AllCompleted` arrives at `t3`
+- **THEN** `run_clock.elapsed_ms` equals the TUI `orchestration_elapsed` after the same event (`t2 - t0` or `t3 - t0`)
+- **AND** `ended_at` moves to the later sample and the revision advances on that event, not on any read
+
+#### Scenario: Time passing does not advance the revision
+
+- **GIVEN** an active change and no new event
+- **WHEN** the snapshot is read twice at later instants
+- **THEN** both reads return the same stored snapshot with the same `state_revision`
+- **AND** `ChangeTiming` boundaries are unchanged from before this contract
+
+#### Scenario: Older owner reads as unpublished
+
+- **GIVEN** a `state` payload from an owner that predates these members
+- **WHEN** a client decodes it
+- **THEN** `archive_complete`, `net_active`, and `run_clock` are absent, not `false` or zero
+- **AND** `status`, `wait`, and `mark` behave as before
+- **AND** a payload missing `actions.force_stop_change` is still rejected
+
+### Requirement: Abort-on-conflict remote merge API
+
+V2 MUST extend the closed command set with `merge_worktree_abort_on_conflict`
+(target opaque `worktree_id`, empty params, `deny_unknown_fields`, ordinary
+revision fencing, idempotency, and the application gate) that runs the
+shared base merge under `AbortOnConflict`. `merge_worktree` MUST remain
+unchanged with `PreserveConflict`, its `merge_conflict` refusal, retained
+intermediate state, and `local_or_tui_required` recovery.
+
+A conflict predicted by the fresh targeted inspection MUST be refused as
+`merge_conflict_predicted` before any Git mutation, with the conflict files
+in the typed result. A real conflict MUST run `git merge --abort`, record its
+exit status, and verify restoration from the repository — `HEAD` equals the
+pre-merge commit, no `MERGE_HEAD` exists, and the root working directory is
+clean under the read-only status policy — reporting `restored` as
+`confirmed` only when all three hold, `unknown` when any verification could
+not be read, and `failed` otherwise. A confirmed restoration MUST settle
+`merge_conflict_aborted`; a failed or unknown restoration MUST settle
+`merge_abort_failed` with `recovery: local_or_tui_required`, MUST NOT claim
+that state was preserved, and MUST leave later incompatible mutations
+refused as `root_busy` while `MERGE_HEAD` remains. The owner MUST NOT retry
+the abort or run any further compensation. `on_merged` MUST run only after a
+completed merge, exactly once. After a confirmed abort a following merge of
+a mergeable branch MUST be admissible.
+
+The result kind `merge_abort` MUST carry `outcome`, `premerge_head`,
+`conflict_files`, `abort` (`exit_ok`, `head_after`, `merge_head_present`,
+`clean_after`, `restored`, `detail`), and `recovery`, and MUST be present on
+success and on every refusal after eligibility. The same verified report
+MUST reach the TUI merge path: the operator-facing text MUST state that the
+merge was aborted and the base restored only when restoration was confirmed,
+and MUST state that the abort failed or restoration is unconfirmed
+otherwise. Capabilities MUST advertise `worktrees.merge_abort` (`available`,
+`command`, `predicted_conflict_refused`, `restore_verification`, `reasons`),
+MUST keep `merge_conflict_preserves_state: true` and
+`merge_conflict_recovery` with descriptions narrowed to `merge_worktree`,
+and MUST decode `merge_abort` as unavailable when an older owner omits it.
+The generated OpenAPI document MUST include the command variant, the result
+kind, and the three error codes. `cflx client` and `cflx client mcp` MUST
+gain no verb.
+
+#### Scenario: Clean branch merges and runs on_merged once
+
+- **GIVEN** a worktree branch that merges cleanly into base
+- **WHEN** `merge_worktree_abort_on_conflict` is submitted
+- **THEN** base contains a `--no-ff` merge commit and `on_merged` ran exactly once
+- **AND** the record settles `succeeded` with `outcome: merged`
+
+#### Scenario: Predicted conflict is refused before any mutation
+
+- **GIVEN** the fresh inspection reports conflict files for the branch
+- **WHEN** the abort-on-conflict command is submitted
+- **THEN** it fails `merge_conflict_predicted` naming those files
+- **AND** base `HEAD` is unchanged and no `MERGE_HEAD` exists
+
+#### Scenario: Real conflict is aborted and restoration is verified
+
+- **GIVEN** a merge that conflicts at execution time
+- **WHEN** the owner runs `git merge --abort` and it succeeds
+- **THEN** `HEAD` equals `premerge_head`, `MERGE_HEAD` is absent, the root is clean
+- **AND** the record fails `merge_conflict_aborted` with `restored: confirmed`
+- **AND** `on_merged` did not run and a following clean merge succeeds
+
+#### Scenario: Failed abort is reported, not assumed
+
+- **GIVEN** `git merge --abort` exits non-zero
+- **WHEN** the owner verifies restoration
+- **THEN** the record fails `merge_abort_failed` with `exit_ok: false`, `restored: failed`, and `recovery: local_or_tui_required`
+- **AND** the TUI text says the abort failed rather than "Merge aborted"
+- **AND** a later incompatible mutation is `root_busy` until local recovery
+
+#### Scenario: Default merge and older owners are unchanged
+
+- **GIVEN** an older owner and a current owner
+- **WHEN** `merge_worktree` conflicts on either, and `merge_worktree_abort_on_conflict` is submitted to the older owner
+- **THEN** `merge_worktree` fails `merge_conflict` and retains the intermediate state on both
+- **AND** the new command is `validation_failed` on the older owner with no effect
+- **AND** `merge_conflict_preserves_state` is `true` on both and `merge_abort` decodes as unavailable from the older owner
+
+### Requirement: Confirmed destructive worktree deletion API
+
+V2 MUST expose `GET /api/v2/worktrees/{worktree_id}/delete-preview` as a
+read (no command record, no revision change, both listeners) that performs a
+fresh targeted observation and returns `observed_at` (top level, outside
+`consent`), `branch`, `head`, `is_main`, `dirty`, `has_commits_ahead`,
+`inspection`, `content_observation` (`observed`, `status_failed`,
+`unbounded`, `nested_repository`), `has_ignored_content`, `ignored_entries`,
+`teardown_script_present` (true exactly when the teardown runner would
+execute the script: a regular file with an execute bit), per-option
+eligibility with a typed `blocked_reason` for `ordinary`, `skip_teardown`,
+`discard_known_dirty`, and `discard_commits_ahead` (with
+`also_discards_dirty`), and a `consent` object holding exactly `branch`,
+`head`, `dirty`, `has_commits_ahead`, `has_ignored_content`, `merge_base`,
+`discardable_content_id`, and `ignored_content_id`, which the command MUST
+accept verbatim.
+
+Both identities MUST come from one bounded read-only oracle over the sorted
+records of `git status --porcelain=v2 -z --untracked-files=normal
+--ignored=traditional` combined with the oracle's own fd-relative walk of
+every directory record Git collapses (`? dir/` and `! dir/`), so that the
+bound set is the on-disk content `git worktree remove --force` deletes
+beyond `HEAD`. `discardable_content_id` MUST be `sha256:` over the staged,
+unstaged, unmerged, and untracked records combined with the no-follow
+on-disk bytes (or symlink target string, or deletion marker) of every path
+with a worktree-side difference and of every entry walked beneath an
+untracked directory, and MUST change whenever any such byte changes.
+`ignored_content_id` MUST be `sha256:` over every ignored path's file type,
+size, mtime, mode, and the no-follow bytes of the file itself (or symlink
+target string), including every file, symlink, special file, and empty
+subdirectory walked beneath a collapsed ignored directory, and MUST change
+whenever an ignored path is added, modified, or removed at any depth,
+including a same-size byte change with mtime and mode restored; metadata
+MUST be bound in addition to bytes, never instead of them. `dirty` keeps its
+`--ignored=no` meaning. Every path MUST be resolved component by component
+from an open worktree root descriptor with `O_NOFOLLOW`, files MUST be
+opened `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` and re-checked with `fstat` so that
+a FIFO or a path swapped after `fstatat` is recorded by type without being
+read or followed, and the walk MUST NOT traverse a symlink. The oracle MUST
+have one documented combined budget over tracked, untracked, and ignored
+content with each path counted once (500,000 records including walked
+entries, 256 MiB of hashed bytes) beyond which the observation is
+`unbounded` with no partial, prefix, or metadata-only identity and no
+exclusion of ignored content, MUST report an actual `.git` descendant at any
+depth or a status-reported submodule as `nested_repository` while a
+directory record itself is walked rather than refused, MUST publish both
+identities and `has_ignored_content` as `null` with the typed
+`content_observation` whenever it is not `observed`, and MUST be computed
+through the read-only status policy without writing, staging, running
+hooks, or excluding any path. A worktree whose observation is `unbounded`
+MUST NOT be deletable through this command; reducing its content remains a
+local operation.
+
+V2 MUST extend the closed command set with `delete_worktree_confirmed`
+(target opaque `worktree_id`) whose typed params are the three independent
+booleans `skip_teardown`, `discard_known_dirty`, `discard_commits_ahead` and
+the echoed `consent`, with `deny_unknown_fields`; either discard permission
+without both `discardable_content_id` and `ignored_content_id` (regardless of
+`consent.dirty`), `discard_commits_ahead` without `merge_base`, or a
+non-40-hex commit MUST be `validation_failed`. Under the repository root
+mutation guard the shared service MUST re-observe the target, including the
+content observation, and refuse with `delete_consent_stale` (reasons
+`branch_changed`, `identity_changed`, `head_moved`, `base_moved`,
+`dirty_changed`, `ahead_changed`, `ignored_changed`, `content_changed`) when
+any consented fact or either recomputed identity differs, MUST refuse
+unknown dirty and an unobservable or unbounded content observation as
+`worktree_dirty_unknown`, MUST refuse unknown ahead, the main worktree, and
+a `nested_repository` observation as `target_ineligible` whatever
+permissions were given, MUST refuse known ignored content without
+`discard_known_dirty` as `worktree_dirty` with reason `ignored_content`
+even when `dirty` is `false`, MUST refuse a held guard or base merge as
+`root_busy`, and MUST apply the unchanged eligibility, teardown, drift,
+branch-ref, removal, and branch-cleanup steps with the `DeleteOptions` the
+permissions map to. The service MUST re-run the content observation after
+teardown and refuse `delete_consent_stale` with `teardown_ran: true` without
+removing anything when `discardable_content_id` changed or when the ignored
+identity is neither the consented one nor the empty-set identity. Nothing
+MUST be removed on any refusal.
+
+The settled result kind `delete_worktree_confirmed` MUST report `teardown`
+(`ran`, `skipped`, `absent`, `not_reached`), `dirty_discarded`,
+`commits_discarded`, `branch_deleted`, `branch_retained_reason`, and, on
+refusal, `refusal.reason`, `refusal.teardown_ran`, and the freshly observed
+facts including both identities and `content_observation`. The `delete_worktree` command MUST remain unchanged (empty params,
+fail-closed options, existing refusals). Capabilities MUST advertise
+`worktrees.confirmed_delete` (`available`, `command`, `preview_route`,
+`permissions`, `consent_fields`, `content_id_algorithm`, `reasons`), MUST
+keep `delete_requires_teardown: true` with its description narrowed to the
+`delete_worktree` command, and MUST decode `confirmed_delete` as unavailable
+when an older owner omits it. The generated OpenAPI document MUST include the
+command variant, the preview route, the result kind, and the error code.
+`cflx client` and `cflx client mcp` MUST gain no verb.
+
+#### Scenario: Preview publishes facts, options, and consent
+
+- **GIVEN** a dirty worktree with commits ahead of base and a `.wt/teardown` script
+- **WHEN** an authenticated client reads its `delete-preview`
+- **THEN** `dirty`, `has_commits_ahead`, `teardown_script_present`, and each option's eligibility and reason are published
+- **AND** `consent.discardable_content_id` and `consent.ignored_content_id` are `sha256:` identities and `observed_at` is outside `consent`
+- **AND** the `consent` object submitted verbatim as `params.consent` passes validation
+- **AND** no command record exists and the revision is unchanged
+
+#### Scenario: Ignored content is disclosed and needs dirty discard
+
+- **GIVEN** a worktree that `git status --ignored=no` reports clean but which holds an ignored file
+- **WHEN** an authenticated client reads its `delete-preview` and then submits `delete_worktree_confirmed` without `discard_known_dirty`
+- **THEN** the preview publishes `dirty: false`, `has_ignored_content: true`, `ignored_entries`, and `ordinary` blocked with `ignored_content`
+- **AND** the command refuses `worktree_dirty` with reason `ignored_content` and removes nothing
+- **AND** modifying the ignored file after the preview makes a `discard_known_dirty: true` submission `delete_consent_stale` with `content_changed`
+- **AND** rewriting an ignored file to different bytes of the same size with its mtime and mode restored, or changing a file three levels beneath a collapsed ignored directory, is likewise `delete_consent_stale` with `content_changed`
+- **AND** fresh consent with `discard_known_dirty: true` removes the worktree
+
+#### Scenario: Oracle limits and nested repositories fail closed
+
+- **GIVEN** a worktree containing an actual nested repository (untracked, or inside an ignored directory), or one whose combined records or hashed bytes exceed the documented budget, including when ignored build output alone exceeds it
+- **WHEN** an authenticated client reads its `delete-preview` and submits `delete_worktree_confirmed` with every permission
+- **THEN** the preview publishes `content_observation` as `nested_repository` or `unbounded` with `null` identities and every option ineligible
+- **AND** the command refuses `target_ineligible` (reason `nested_repository`) or `worktree_dirty_unknown` (reason `content_unbounded`)
+- **AND** no metadata-only or partial identity is published in place of the refusal, and a plain ignored directory without a `.git` descendant is walked rather than refused
+- **AND** nothing is torn down or removed and `delete_worktree` behaves as before
+
+#### Scenario: Skip-teardown removes without running the script
+
+- **GIVEN** a clean worktree whose `.wt/teardown` writes a marker
+- **WHEN** `delete_worktree_confirmed` is submitted with `skip_teardown: true` and valid consent
+- **THEN** the worktree is removed, the marker is absent, the result reports `teardown: skipped`
+- **AND** the opaque ID is retired
+
+#### Scenario: Same HEAD and same dirty flag but changed content is stale
+
+- **GIVEN** a preview taken while `README` holds `A` with `dirty: true`
+- **WHEN** `README` is changed to `B` without committing and the consent is submitted with `discard_known_dirty: true`
+- **THEN** the command fails `delete_consent_stale` with reason `content_changed`
+- **AND** the worktree, branch, and ID are intact and `refusal.observed` carries the new identity
+
+#### Scenario: Ahead and dirty requires both permissions
+
+- **GIVEN** a worktree that is dirty and ahead of base
+- **WHEN** consent is submitted with `discard_commits_ahead: true` and `discard_known_dirty: false`
+- **THEN** the command refuses `worktree_dirty` and removes nothing
+- **AND** `discard_commits_ahead: true` with `consent.dirty: false` and no identities is `validation_failed` before any observation
+- **AND** with both permissions the worktree is removed, the branch is force-deleted at the consented commit, and the result reports both discards
+
+#### Scenario: Cancel submits nothing
+
+- **GIVEN** a client read the preview
+- **WHEN** the operator cancels and no command is submitted
+- **THEN** the worktree, its ID, the command registry, and the revision are unchanged
+
+#### Scenario: Teardown failure is recoverable by consented skip
+
+- **GIVEN** a worktree whose `.wt/teardown` exits non-zero
+- **WHEN** an ordinary delete fails and a `delete_worktree_confirmed` with `skip_teardown: true` and fresh consent follows
+- **THEN** the first fails `internal_error` retaining the worktree and its ID
+- **AND** the second removes the worktree and reports `teardown: skipped`
+
+#### Scenario: Unknown, main, and busy fail closed
+
+- **GIVEN** a target whose dirty state cannot be observed, the main worktree, or a held root guard
+- **WHEN** `delete_worktree_confirmed` is submitted
+- **THEN** the refusals are `worktree_dirty_unknown`, `target_ineligible`, and `root_busy` respectively
+- **AND** nothing is torn down or removed
+
+#### Scenario: Ordinary delete and older owners are unchanged
+
+- **GIVEN** an owner built before this surface and a current owner
+- **WHEN** `delete_worktree` is submitted with a `skip_teardown` field, and `delete_worktree_confirmed` is submitted to the older owner
+- **THEN** both are `validation_failed` with no delegation
+- **AND** `delete_requires_teardown` is published as `true` by both owners
+- **AND** `confirmed_delete` decodes as unavailable from the older owner
+
+### Requirement: Bounded remote text edit API
+
+V2 MUST expose `GET /api/v2/changes/{change_id}/text?path=<relative>` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=<relative>` as reads that
+create no command record, advance no revision, and are served on both
+listeners and by a headless `cflx run`. It MUST extend the closed command set
+with `write_change_text` (target `change_id`) and `write_worktree_text`
+(target opaque `worktree_id`), each taking exactly `params.path`,
+`params.expected` (`{"kind":"content","content_id":"sha256:<64 hex>"}` or
+`{"kind":"absent"}`), and `params.content`, with `deny_unknown_fields`,
+ordinary revision fencing, idempotency identity, and the application gate.
+There MUST be no unconditional write and no client-supplied root, absolute
+path, branch, or Git ref.
+
+The scope root MUST be server-derived: `openspec/changes/<change_id>` in the
+project repository for a tracked, non-archived change, or the registered
+directory bound to the opaque worktree ID. `path` MUST be at most 1024 UTF-8
+bytes and MUST be refused as `validation_failed` when it is empty, absolute,
+contains `\`, a NUL, or an empty, `.`, or `..` component. Every directory
+component and the leaf MUST be opened with `O_NOFOLLOW` from the root
+descriptor on every read and every write. The owner MUST refuse with
+`text_not_editable` and a stable reason — `git_metadata` (any `.git`
+component, file or directory), `conflux_owned_path` (top-level `.wt/` or the
+top-level `.conflux-inflight`), `unsafe_path` (a symlink or non-directory on
+the walk or a symlink leaf), `nested_repository` (a traversed directory below
+the root that contains a `.git` entry of any type; the root's own `.git` is
+not examined), `not_regular_file`, `executable` (any execute bit),
+`too_large` (over 1,048,576 bytes), `not_text` (invalid UTF-8 or NUL),
+`root_missing` — and with `target_ineligible` and reason `change_active`,
+`change_admitted`, `managed_process_live`, or `root_busy` when the owning
+change is in an active display status, is admitted (`queue_intent` queued or
+display status `queued` / `blocked`), when the owner's managed writer
+coverage for the target root is not `Clear`, or when the repository root
+mutation guard is held or a base merge or resolve is in progress — the last
+applying to the main worktree row and every change directory alike. The read
+response MUST publish `editable`, `edit_blocked_reason`, and a bounded
+diagnostic `edit_blocked_detail` from the same classifier. A nested worktree
+MUST be editable only through its own opaque worktree ID, never through a
+path from another root.
+
+Managed writer coverage MUST be a tri-state (`Clear`, `Busy`, `Unknown`)
+computed from one process-local ledger, never a boolean, and `Busy` and
+`Unknown` MUST both refuse as `managed_process_live`. The ledger MUST account
+for every owner-managed writer: every run command scope the owner has
+installed, retained until each of its identities is proven quiescent and
+never dropped because a later run replaced it, a shutdown took it, or a
+quiescence budget expired; every spawn that bypasses the scope, including
+the shell command path and the configured worktree session, held as a lease
+from before spawn until both direct-child reap and managed process-group /
+retained-descendant quiescence are positively confirmed (shell exit alone
+MUST NOT release coverage); and spawns with no
+working directory, bound to the owner's own canonical working directory.
+Each writer's working directory MUST be canonicalized at registration and
+compared to the canonical root by component-wise path containment, so a
+symlink alias binds the real path and a sibling whose name shares a prefix
+is not bound. A failed canonicalization, an unresolved completion/quiescence lease, or an owner with
+no ledger attached MUST be `Unknown`; the absence of a current scope, of a
+termination port, or of a ledger MUST NOT be read as `Clear`. `Clear` MUST be
+provable by an owner — a headless `cflx run` included — whose ledger exists
+and is empty. A running lease with known cwd MUST be `Busy` for the bound
+root and MUST NOT block unrelated siblings as `Unknown` solely because the
+child has not exited. Owner restart MUST NOT be presented as quiescence
+evidence or performed to bypass an unknown result. The coverage MUST be read once, as part of the eligibility
+snapshot at the start of a write, and the contract MUST state that a writer
+admitted after that snapshot and before the rename is in the same window as
+an external writer. Reaching `Clear` MUST NOT kill, sweep, or reset any
+process or ledger entry, and `force_stop_change`, `owns_managed_process`,
+and `kill_managed_process` MUST keep their current target and scope.
+
+`content_id` MUST be `sha256:` followed by the lowercase hex SHA-256 of the
+exact file bytes. A write MUST compare the current bytes to `expected`
+immediately before replacing them, MUST refuse `text_stale` with the current
+`content_id` (or `null` when absent) when they differ or when `absent` was
+expected and the file exists, MUST settle `no_op` with `outcome: unchanged`
+when the new bytes equal the current bytes, and otherwise MUST write through a
+same-directory temporary file, `fsync`, and `rename`, preserving the existing
+permission bits (`0644` subject to umask for a created file), removing the
+temporary file on every failure path, and reporting a `text_write` result
+with `outcome`, `content_id_before`, `content_id_after`, `current_content_id`,
+`bytes_written`, `mode`, and `effects.file_written`. A refused record MUST
+carry the same result. A successful worktree write MUST trigger the ordinary
+worktree observation refresh so `dirty` follows, and MUST NOT stage, commit,
+or push. The write itself MUST NOT advance the state revision, but the
+observation refresh it triggers MAY, and the contract MUST tell clients to
+re-read `state_revision` after a save. A temporary file left by a process
+crash between create and rename MUST be reported as ordinary untracked dirt
+and MUST NOT be ignored or excluded from any cleanliness check.
+
+The contract MUST state that the compare and the rename are not atomic
+against external writers: Conflux's own writers are excluded by eligibility,
+and uncooperative external editors are not excluded. Capabilities MUST
+advertise `text_edit` (`available`, `read_routes`, `commands`, `max_bytes`,
+`max_path_bytes`, `content_id_algorithm`, `excluded`, `reasons`), and the
+generated OpenAPI document MUST include both routes, both command variants,
+the result kind, and both error codes. The block MUST decode as unavailable
+when an older owner omits it, every existing route and command MUST remain
+unchanged on such an owner, and a new command submitted to it MUST fail
+typed validation before any effect. `cflx client` and `cflx client mcp` MUST
+gain no verb.
+
+#### Scenario: Read publishes identity and eligibility
+
+- **GIVEN** a live opaque worktree whose `src/lib.rs` is a regular `0644` file
+- **WHEN** an authenticated client reads `/api/v2/worktrees/{id}/text?path=src/lib.rs`
+- **THEN** it receives `content`, `content_id` equal to `sha256:` of the bytes, `size_bytes`, `mode: "0644"`, `editable: true`, and the limits
+- **AND** the state revision is unchanged and no command record exists
+
+#### Scenario: Matching write replaces atomically and dirties Git
+
+- **GIVEN** a prior read returned identity `C` for a `0600` file
+- **WHEN** `write_worktree_text` is submitted with `expected.content_id = C` and new content
+- **THEN** the file holds the new bytes with mode `0600`, the record settles `succeeded` with `outcome: written`
+- **AND** `git status --porcelain` lists only that path and no commit is created
+- **AND** no temporary file remains in the directory
+
+#### Scenario: Stale write refuses and preserves client text
+
+- **GIVEN** the file changed after the client read identity `C`
+- **WHEN** a write with `expected.content_id = C` is submitted
+- **THEN** the record fails with `text_stale` and `current_content_id` names the current bytes
+- **AND** the file bytes and directory listing are unchanged
+- **AND** no response asks the client to discard its buffer
+
+#### Scenario: Containment refuses symlinks and Git metadata in both forms
+
+- **GIVEN** a linked worktree whose `.git` is a file and a main worktree whose `.git` is a directory
+- **WHEN** a client addresses `.git`, a path through a symlinked directory, a symlink leaf, `.wt/teardown`, an executable, a file over 1 MiB, or a file with NUL bytes
+- **THEN** each is refused with `text_not_editable` and its stable reason
+- **AND** a leaf replaced by a symlink after a successful read is refused at write time
+- **AND** no bytes under either root change
+
+#### Scenario: Active writers exclude remote edits
+
+- **GIVEN** change `alpha` is `applying`, or the owner's writer coverage for `alpha`'s worktree is `Busy` (a registered writer with or without a change ID), or the root guard is held, or a resolve is running
+- **WHEN** a client reads and then writes a file in `alpha`'s worktree
+- **THEN** the read reports `editable: false` with the matching reason
+- **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a writer bound only to a sibling path leaves the target editable
+
+#### Scenario: Retained writers from a previous run exclude remote edits
+
+- **GIVEN** a previous run's scope holds an identity spawned under `alpha`'s worktree that was never proven quiescent, and a new run has since been started with a fresh scope
+- **WHEN** a client reads and then writes a file in `alpha`'s worktree
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail naming the retained identity
+- **AND** the write fails `target_ineligible` with the same reason and writes nothing
+- **AND** a sibling worktree stays editable, nothing is killed, and `actions.force_stop_change` is unchanged
+- **AND** once the identity is released with confirmed quiescence the same read reports `editable: true`
+
+#### Scenario: Unknown writer coverage fails closed
+
+- **GIVEN** an owner with no writer ledger attached to its termination port, or a ledger holding a lease whose child was never reaped, or a writer whose working directory could not be canonicalized
+- **WHEN** a client reads a file in any worktree, in the main worktree, or in a change directory
+- **THEN** the read reports `editable: false` with `managed_process_live` and a detail saying coverage is unknown
+- **AND** the write fails `target_ineligible` and writes nothing
+- **AND** the change-keyed `managed_process_live` on the state snapshot is unchanged
+
+#### Scenario: Unscoped and session writers are covered
+
+- **GIVEN** a child spawned through the shell command path or through the configured worktree session with `alpha`'s worktree as its working directory and no change ID
+- **WHEN** a client reads a file in `alpha`'s worktree while the child is alive, and again after direct-child reap and confirmed process-group quiescence
+- **THEN** the first read reports `editable: false` with `managed_process_live` and a sibling directory is `Clear`
+- **AND** the second read reports `editable: true`
+- **AND** shell exit with a surviving managed descendant does not clear coverage or allow a write
+
+#### Scenario: Canonical containment decides a binding
+
+- **GIVEN** a writer registered through a symlink alias of `alpha`'s worktree, and a sibling worktree whose name begins with `alpha`
+- **WHEN** a client reads a file in each
+- **THEN** `alpha` reports `editable: false` with `managed_process_live` and the sibling reports `editable: true`
+- **AND** a writer whose working directory no longer exists at registration refuses every root
+
+#### Scenario: Admitted targets exclude remote edits
+
+- **GIVEN** change `alpha` is `queued` or `blocked`, or its `queue_intent` is queued
+- **WHEN** a client reads and then writes a file in `alpha`'s change directory or in its worktree
+- **THEN** the read reports `editable: false` with reason `change_admitted`
+- **AND** the write fails `target_ineligible` with `change_admitted` and writes nothing
+
+#### Scenario: Nested repository is not reachable through another root
+
+- **GIVEN** change `alpha`'s worktree lies under the project root, and a directory under the main worktree carries its own `.git` entry
+- **WHEN** a client addresses a file inside either through the main worktree's opaque ID
+- **THEN** the read and the write are refused with `text_not_editable` and reason `nested_repository`
+- **AND** the same file is served through `alpha`'s own worktree ID
+- **AND** no bytes under the project root or under `alpha`'s worktree change
+
+#### Scenario: Absent expectation creates exactly once
+
+- **GIVEN** `notes.md` does not exist in the change directory
+- **WHEN** `write_change_text` is submitted with `expected.kind = absent`
+- **THEN** the file is created and the record reports `content_id_before: null`
+- **AND** a second `absent` write is `text_stale`
+
+#### Scenario: Older owner stays compatible
+
+- **GIVEN** an owner built before this surface
+- **WHEN** a client decodes its capabilities and submits `write_worktree_text`
+- **THEN** `text_edit` decodes as unavailable
+- **AND** the command is `validation_failed` with no record and no effect
+- **AND** every existing read and command keeps working
+
+#### Scenario: Contract completeness
+
+- **GIVEN** a client captures `cflx openapi`
+- **WHEN** it inspects the document
+- **THEN** both text routes, both write commands, the `text_write` result kind, `text_stale`, `text_not_editable`, and `capabilities.text_edit` are present
+- **AND** removing any of them from a copy fails the completeness check
+
+### Requirement: Landed-merge and pre-merge failure evidence for the abort-on-conflict merge
+
+`merge_worktree_abort_on_conflict` MUST carry the `merge_abort` result on
+every settlement after eligibility, including the two paths that today
+settle `internal_error` with `result: null`: an `on_merged` hook failure
+after the merge commit landed, and a Git failure after eligibility but
+before any merge commit landed. The owner MUST distinguish whether the hook ran and failed or Git failed before it from its recorded operation stage, never from error text. Separately, `merge.landed` MUST be derived from repository evidence re-read after the failure, never inferred from that stage. A hook failure with inconclusive or contrary landing evidence MUST publish the observed `unknown` or `not_landed`, not an invented `confirmed`; the owner MUST NOT compensate or run the hook again.
+
+A merge whose commit landed and whose `on_merged` hook then failed MUST
+settle the typed error code `merge_hook_failed` (HTTP 409) with
+`outcome: merged_hook_failed`, `premerge_head`, a `merge` object whose
+`landed` is `confirmed` only when the re-read `HEAD` differs from
+`premerge_head`, is a descendant of it, and no `MERGE_HEAD` exists, and a
+`hook` object (`ran: true`, `exit_ok: false`, bounded sanitized `detail`),
+with `recovery: local_or_tui_required`. The owner MUST NOT re-run the hook,
+re-merge, abort, reset, revert, or otherwise compensate; the base keeps the
+merge commit, and the reducer's merged transition stays blocked exactly as it
+is today. A Git failure after eligibility and before a merge commit landed
+(dirty base at the clean check, unreadable `HEAD`, or a `git merge` failure
+that is not a conflict) MUST keep the error code `internal_error` and MUST
+carry `outcome: merge_failed` with `merge.landed` as `not_landed` only when
+the re-read `HEAD` equals `premerge_head` and no `MERGE_HEAD` exists, and
+`unknown` whenever `premerge_head` or either verification could not be read;
+`hook` MUST be `ran: false`. Refusals before eligibility settled
+(`worktree_not_found`, `root_busy`, `target_ineligible`) MAY still carry no
+result, and the contract MUST name them as the only such settlements.
+`merge_worktree` MUST remain byte-for-byte unchanged, including
+`internal_error` with no result on its own hook failure. Capabilities MUST
+list `merge_failed` and `merged_hook_failed` in `worktrees.merge_abort.reasons`,
+the generated OpenAPI document MUST include the new error code, the two
+outcome values, and the `merge` and `hook` schemas, and an older owner that
+omits them MUST still decode as before.
+
+#### Scenario: Hook failure after a landed merge is typed and not compensated
+
+- **GIVEN** a worktree branch that merges cleanly and an `on_merged` hook that exits non-zero
+- **WHEN** `merge_worktree_abort_on_conflict` is submitted
+- **THEN** base `HEAD` is a `--no-ff` merge commit of the branch and no `MERGE_HEAD` exists
+- **AND** the record fails `merge_hook_failed` with `outcome: merged_hook_failed`, `merge.landed: confirmed`, `hook.ran: true`, `hook.exit_ok: false`
+- **AND** the hook ran exactly once and base `HEAD` is unchanged after settlement
+- **AND** `merge_worktree` for a sibling worktree with the same hook still fails `internal_error` with `result: null`
+
+#### Scenario: Pre-merge Git failure reports that nothing landed
+
+- **GIVEN** a base worktree whose clean check fails after eligibility
+- **WHEN** `merge_worktree_abort_on_conflict` is submitted
+- **THEN** the record fails `internal_error` with `outcome: merge_failed`, `merge.landed: not_landed`, and `hook.ran: false`
+- **AND** `merge.head_after` equals `premerge_head` and `merge.merge_head_present` is `false`
+- **AND** `on_merged` did not run
+
+#### Scenario: Unreadable landing evidence is unknown, not inferred
+
+- **GIVEN** a Git failure after eligibility whose `HEAD` re-read cannot be performed
+- **WHEN** the owner settles the command
+- **THEN** `merge.landed` is `unknown` with the verification that failed named in `merge.detail`
+- **AND** the record does not claim `not_landed` and the owner attempts no compensation
+
+### Requirement: Session attempt, output provenance, and observed termination signal
+
+A worktree session's `attempt`, its retained `output.lines`, and its `signal`
+MUST be owner facts that child output cannot change. The runner MUST publish
+its own notices — retry scheduled with the next attempt number and cause,
+attempt started after a successful spawn, inactivity termination, runtime-limit
+termination, launch failure, shutdown refusal, and process-group cleanup
+diagnostics — to the session through a typed channel separate from the child's
+stdout/stderr. The session MUST derive later `attempt` values only from
+`AttemptStarted` after the corresponding process spawned, never from
+`RetryScheduled` or the text of an output line. Before the first successful
+spawn, the legacy initial `attempt: 1` remains unchanged; stopping a scheduled
+retry during its delay does not increment `attempt` without a second spawn. A child line that begins with `[Retry `, contains a PGID, or imitates
+any runner notice MUST remain in `output.lines` verbatim (after
+control-sequence stripping) and MUST change no typed member. `output.lines`
+MUST contain only bytes the child wrote to its stdout or stderr; runner
+notices MUST NOT be interleaved into it and MUST instead be retained in a
+bounded typed `runner_notices` list (`kind`, `attempt`, sanitized `detail`)
+that discloses no template, expanded command, environment value, or absolute
+path. The existing text-emitting runner entry point used by the TUI
+terminal, the parallel executor, and the shell command path MUST keep
+emitting the same stderr notice lines, so nothing outside the session
+resource changes.
+
+`signal` MUST be the signal that actually terminated the leader as reaped by
+the runner, named from the wait status (`SIGTERM` when the group honoured
+the first signal, `SIGKILL` when the runner escalated after its 5-second
+grace), and `exit_code` MUST be the leader's real exit code when it exited
+instead of dying from a signal. When the leader's wait status is unavailable
+— the escalation timed out without a reap, or the runner never obtained a
+status — `signal` and `exit_code` MUST both be `null` and the session MUST
+NOT substitute the signal it requested. The configured retry policy inside
+one session, the "stop admits no further attempt" guarantee, the 5-second
+SIGTERM-to-SIGKILL escalation, verified group cleanup, and settlement after
+reap are unchanged. The `worktree_sessions` capability MUST advertise
+`max_runner_notices`, the generated OpenAPI document MUST include
+`runner_notices` and the corrected `signal` description, and an older owner
+that omits both MUST decode as before.
+
+#### Scenario: Child output cannot forge an attempt or a runner notice
+
+- **GIVEN** a configured command that prints `[Retry 1/3] Command crashed, retrying in 0ms...` and `process-group cleanup unconfirmed (pgid=1, force_killed=false)` to stderr and exits `0`
+- **WHEN** the session finishes
+- **THEN** both lines are present in `output.lines` on stream `stderr` exactly as printed
+- **AND** `attempt` is `1`, `runner_notices` is empty, `state` is `succeeded`, and `exit_code` is `0`
+
+#### Scenario: A real retry is a typed fact and the tail stays the child's
+
+- **GIVEN** a retry policy allowing one retry and a command that crashes on its first attempt and succeeds on its second
+- **WHEN** the session finishes
+- **THEN** `attempt` is `2` and `runner_notices` holds one `retry_scheduled` notice naming attempt `2`
+- **AND** no `[Retry ` line and no runner text appears in `output.lines`
+- **AND** the TUI terminal path for the same command still prints the `[Retry 1/1]` stderr notice
+
+#### Scenario: Stopping in the retry delay does not invent a new attempt
+
+- **GIVEN** the first process failed and retry attempt `2` was scheduled, but stop cancelled the delay before another spawn
+- **WHEN** the session settles
+- **THEN** `attempt` remains `1` although `runner_notices` records the scheduled retry
+- **AND** no second process was spawned
+
+#### Scenario: Observed signal follows the escalation
+
+- **GIVEN** a running session whose command ignores SIGTERM, and another whose command exits on SIGTERM
+- **WHEN** `stop_worktree_session` is submitted to each
+- **THEN** the ignoring session settles `stopped` with `signal: SIGKILL` after the escalation and `terminated: true`
+- **AND** the honouring session settles `stopped` with `signal: SIGTERM`
+- **AND** neither started a new process and `attempt` stays `1` for both
+
+#### Scenario: Unavailable wait status is null, not the requested signal
+
+- **GIVEN** a cancelled session whose leader status the runner could not obtain
+- **WHEN** the session settles
+- **THEN** `state` is `stopped`, `signal` is `null`, and `exit_code` is `null`
+- **AND** the record does not read `SIGTERM`
+
+### Requirement: Bounded directory enumeration in the consent oracle
+
+The confirmed-delete content oracle MUST apply its record budget to each
+directory entry as `readdir` returns it, before the entry's name is retained,
+and MUST charge the retained name bytes of the listing being read against a
+documented listing budget (`max_listing_name_bytes`, 64 MiB in production),
+so that a directory with more entries than the remaining record budget or
+more name bytes than the listing budget makes the observation `unbounded`
+without first materializing the whole listing in memory. The oracle MUST
+stop reading a listing at the first entry past either budget and MUST never
+retain more names than the budget allows plus the one entry that exceeded
+it. Every directory stream MUST be closed on every exit path, including the
+`unbounded`, `nested_repository`, and unobservable ones, through an owned
+guard rather than a trailing call, and every counter MUST use saturating
+arithmetic. The depth limit of 256, the combined 500,000-record and 256 MiB
+hashed-byte budget, byte-level identity, no-follow resolution, and the
+`nested_repository` rule are unchanged, and no partial, prefix, or
+metadata-only identity is substituted. The documented budget MUST name the
+new listing bound, and `capabilities.worktrees.confirmed_delete` MUST remain
+decodable by older clients.
+
+#### Scenario: A huge single directory fails closed before being materialized
+
+- **GIVEN** injected limits of `max_records: 5` and an untracked directory holding 20 entries
+- **WHEN** the oracle walks the directory
+- **THEN** the observation is `unbounded`
+- **AND** the walker counted at most 6 records and retained at most 6 names before stopping
+- **AND** the directory stream was closed and no identity was published
+
+#### Scenario: Listing name bytes are bounded independently of record count
+
+- **GIVEN** injected limits with a large record budget and a `max_listing_name_bytes` smaller than one directory's names
+- **WHEN** the oracle walks that directory
+- **THEN** the observation is `unbounded`
+- **AND** the preview publishes `content_observation: unbounded` with `null` identities and every option ineligible
+
+#### Scenario: Budgets that fit are unchanged
+
+- **GIVEN** production limits and the existing bound-exceeded, depth, FIFO, and nested-repository fixtures
+- **WHEN** the existing `remote_confirmed_delete` cases run
+- **THEN** every identity, refusal, and `unbounded` outcome is the same as before this change
+
+### Requirement: Detached worktree delete preview is ineligible
+
+`GET /api/v2/worktrees/{worktree_id}/delete-preview` for a worktree whose
+`HEAD` is detached or whose branch is empty MUST report every option
+(`ordinary`, `skip_teardown`, `discard_known_dirty`,
+`discard_commits_ahead`) as ineligible with the closed `blocked_reason`
+`detached_head`, decided before dirty, ahead, content, or ignored facts and
+independent of whether the inspection ran. The `consent` object MUST still
+be published as observed, with `branch` empty, as a disclosure and not as an
+admission ticket: the contract MUST state that `delete_worktree_confirmed`
+refuses an empty `consent.branch` as `validation_failed` before any
+observation, unchanged. A target that was previewed with a branch and became
+detached before the command MUST be refused `target_ineligible` with reason
+`detached_head` under the root guard with nothing torn down or removed.
+`detached_head` MUST be added to `ConfirmedDeleteReason`, to the
+`confirmed_delete.reasons` capability list, and to the OpenAPI enum; no
+remote detached destructive deletion is introduced, the ordinary
+`delete_worktree` path is unchanged, and unknown merge base still blocks
+`discard_commits_ahead` with `ahead_unknown` for attached worktrees.
+
+#### Scenario: Detached preview offers nothing and names why
+
+- **GIVEN** a linked worktree checked out at a detached commit
+- **WHEN** an authenticated client reads its `delete-preview`
+- **THEN** all four options are `eligible: false` with `blocked_reason: detached_head`
+- **AND** `consent.branch` is empty and `is_detached` is published
+- **AND** submitting that consent is `validation_failed` and no command record changes any worktree
+
+#### Scenario: Detaching after the preview is refused under the guard
+
+- **GIVEN** a preview taken on an attached clean worktree
+- **WHEN** the worktree is detached and the consent is submitted with `skip_teardown: true`
+- **THEN** the command refuses `target_ineligible` with `refusal.reason: detached_head`
+- **AND** nothing was torn down or removed and the worktree keeps its ID
+
+### Requirement: Spawn-outcome-aware writer lease release
+
+A writer lease taken for an unscoped spawn MUST record a typed spawn
+outcome — `not_attempted`, `attempted`, `failed`, `spawned` with a bound
+process group, or `spawned` without one — and its release on drop or
+settlement MUST follow that outcome alone. A lease dropped or settled while
+`not_attempted` (the runner positively never called `spawn`: admission or
+shutdown refused it before the call) or `failed` (the spawn call returned an
+error and produced no child) MUST be released, leaving coverage `Clear`. A
+lease whose spawn was `attempted` but whose outcome the runner never
+learned, or `spawned` with no process-group identity, MUST stay `Unknown`
+with a detail naming the outcome, and no elapsed time, owner restart,
+direct-child reap alone, or "missing PGID" reasoning MUST release it. A
+lease `spawned` with a bound process group MUST keep today's rules: `Busy`
+while the child runs, `Unknown` after an unconfirmed handle drop until a
+process-group probe proves the group empty, and retained after reap while
+descendants remain. The runner MUST mark `attempted` immediately before the
+spawn call and bind the process group immediately after a successful spawn,
+before any step that can fail, so a failure between spawn and managed-child
+construction leaves a probe-clearable lease rather than a removed one.
+Scoped run-command coverage, canonical cwd containment, sibling `Clear`,
+`Busy`/`Unknown` precedence, `force_stop_change`, `owns_managed_process`,
+and `kill_managed_process` are unchanged, and no kill authority is added.
+
+#### Scenario: Refused-before-spawn lease releases, in-flight lease does not
+
+- **GIVEN** a ledger and two leases: one whose spawn admission was refused before the call, one marked `attempted` whose runner task was aborted before reporting an outcome
+- **WHEN** both leases are dropped and the root is read
+- **THEN** the first root reads `Clear` and `editable: true`
+- **AND** the second root reads `managed_process_live` with a detail naming an unresolved attempted spawn, and stays so after any wait and after reading again
+
+#### Scenario: Spawn failure is released but a spawn without identity is not
+
+- **GIVEN** a spawn whose `sh` cannot be executed, and a real spawn whose process id could not be read
+- **WHEN** each lease is settled
+- **THEN** the failed spawn's root reads `Clear`
+- **AND** the identity-less spawn's root reads `managed_process_live` with a detail naming the missing process-group identity, and no probe or restart clears it
+
+#### Scenario: Failure after a real spawn stays probe-clearable
+
+- **GIVEN** a real spawn whose process group was bound and whose handle was dropped without a reap
+- **WHEN** the group is still alive, and later after it is gone
+- **THEN** the root reads `managed_process_live` while the group lives
+- **AND** it reads `editable: true` once the probe proves the group empty, with nothing killed
+
+### Requirement: Session stop received before the next spawn refuses that attempt
+
+For a configured worktree session, the runner's cancellation path MUST honour
+a `stop_worktree_session` that is received while no child process is running
+— during the retry delay that follows a crash retry, during the retry delay
+that follows an inactivity-timeout retry, during the stagger wait before an
+attempt, and at the final spawn admission — by refusing the next attempt
+instead of spawning it. The runner MUST race each of those waits against the
+handle's cancellation and MUST re-read the cancellation immediately before
+the spawn call, so the "admits no further attempt" guarantee holds on the
+real process path and not only in an injected fixture. A refused attempt MUST
+publish a typed `stop_refused_attempt` runner notice naming the attempt that
+was refused and the stage at which it was refused (`retry`, `stagger`, or
+`spawn`), MUST NOT publish `AttemptStarted`, and MUST settle the invocation
+with `CommandTermination::Cancelled`, the process-group cleanup report of the
+attempt that actually ran (or the not-applicable report when none did), the
+writer lease settled, and no further loop iteration. An already scheduled
+`retry_scheduled` notice MUST remain in `runner_notices`; a stop received
+before the retry is scheduled MUST schedule none.
+
+The session MUST then read `stopped`, keep `attempt` at the last attempt that
+actually spawned (`1` when the first attempt is the only one that ran, and the
+legacy initial `1` when none did), publish `exit_code` and `signal` from the
+reaped leader of the attempt that ran (its own exit code with `signal: null`
+after a crash, the signal that reaped it after an inactivity termination,
+both `null` when no attempt ever spawned), retain only that attempt's bytes in
+`output.lines`, and publish `result.terminated` as today's fact — `true` only
+when the state is `stopped` and the last attempt's process group was proven
+quiescent — with `result.state_after: stopped`. No wire member is added or
+removed; the documented `kind` vocabulary gains `stop_refused_attempt`, and an
+older owner that never publishes it MUST decode unchanged.
+
+The cancellation signal MUST be read without being consumed while pending,
+without being lost once sent, and without misreading a closed channel: a
+dropped handle on the registry-scoped runner is a cancellation, exactly as the
+running-child cancellation branch already decides, and a pending signal is left
+armed for the next checkpoint. A stop that arrives after the final admission
+check returned and before the spawn call returned MAY still be honoured
+against the attempt it admitted, by the existing running-child cancellation
+branch, and the session then truthfully publishes that attempt; the contract
+MUST name this as the only remaining way an attempt can start after a stop.
+
+This behaviour MUST be selected by an explicit stop policy on the shared
+retry loop that only the session registry's observed entry point opts into.
+The text-emitting entry point used by the TUI terminal, the parallel executor,
+apply, archive, acceptance, and shell commands MUST keep its default
+spawn-then-cancel behaviour and stderr text byte for byte; scope shutdown MUST
+keep its own loop-head, pre-delay, and admission checks and its
+`shutdown_refused` notice on both policies; session stop and owner shutdown
+MUST remain two distinguishable operations; and the SIGTERM-to-SIGKILL
+escalation, verified group cleanup, observed signal, retry policy, stagger
+semantics for every existing caller, `CommandTermination`, and
+`StreamingChildHandle` MUST be unchanged. No kill authority is added and no
+other session or the scheduler is affected by one session's stop.
+
+#### Scenario: Stop during a crash retry delay spawns nothing
+
+- **GIVEN** a session with a retry policy admitting a retry, a 60-second retry delay, and a command that records its PID and exits non-zero
+- **AND** the session resource already shows a `retry_scheduled` notice for attempt `2`
+- **WHEN** `stop_worktree_session` is submitted
+- **THEN** the record settles `result.state_after: stopped` well within the hang guard rather than after the delay
+- **AND** exactly one PID was ever recorded by the command and `attempt` is `1`
+- **AND** `runner_notices` is `retry_scheduled` for attempt `2` followed by `stop_refused_attempt` for attempt `2` with `stage=retry`
+- **AND** `exit_code` is the first attempt's own exit code, `signal` is `null`, and `output.lines` holds only the first attempt's output
+
+#### Scenario: Stop during an inactivity retry delay spawns nothing
+
+- **GIVEN** a session whose command prints nothing, an inactivity timeout with a remaining inactivity retry budget, and a 60-second retry delay
+- **AND** the session shows `inactivity_terminated` for attempt `1` and `retry_scheduled` for attempt `2` with `cause=inactivity_timeout`
+- **WHEN** `stop_worktree_session` is submitted
+- **THEN** no second process is spawned and `attempt` is `1`
+- **AND** `stop_refused_attempt` for attempt `2` with `stage=retry` follows the scheduled notice
+- **AND** `signal` is the signal that reaped the first attempt and the session reads `stopped`
+
+#### Scenario: Stop while parked in the stagger wait or at the spawn boundary spawns nothing
+
+- **GIVEN** a session whose first attempt crashed with no retry delay, and either a long stagger wait before attempt `2` or the shared stagger lock held by the test so attempt `2` is blocked at the spawn boundary
+- **WHEN** `stop_worktree_session` is submitted and the barrier is then released
+- **THEN** no second process is spawned, `attempt` is `1`, and the session reads `stopped`
+- **AND** `stop_refused_attempt` for attempt `2` names `stage=stagger` or `stage=spawn`
+
+#### Scenario: Stop before the first spawn is stopped, not failed
+
+- **GIVEN** a session whose first attempt is blocked at the spawn boundary before any process exists
+- **WHEN** `stop_worktree_session` is submitted and the barrier is released
+- **THEN** no process is ever spawned and the session reads `stopped` with `attempt: 1`, `exit_code: null`, `signal: null`
+- **AND** `runner_notices` holds one `stop_refused_attempt` for attempt `1`
+
+#### Scenario: Stopping a running leader is unchanged
+
+- **GIVEN** a running session whose command ignores SIGTERM, and another whose command honours it, each with a retry policy of at least one retry
+- **WHEN** `stop_worktree_session` is submitted to each
+- **THEN** the ignoring session settles `stopped` with `signal: SIGKILL` and the honouring one with `signal: SIGTERM`, both with `terminated: true`, `attempt: 1`, and the whole group gone
+- **AND** neither session records a `stop_refused_attempt` notice
+
+#### Scenario: Owner shutdown during a retry delay stays a shutdown refusal
+
+- **GIVEN** a session parked in a 60-second retry delay after its first attempt crashed
+- **WHEN** the owner closes the session registry scope
+- **THEN** no second process is spawned and the session reads `stopped` with `attempt: 1`
+- **AND** `runner_notices` records `shutdown_refused` and no `stop_refused_attempt`
+
+#### Scenario: The text entry point keeps spawn-then-cancel
+
+- **GIVEN** the same crashing command run through the text-emitting runner entry point with the shared stagger lock held so attempt `2` is blocked at the spawn boundary
+- **WHEN** the handle is terminated and the lock is released
+- **THEN** attempt `2` spawns and is then terminated by the existing cancellation branch, so two PIDs were recorded
+- **AND** the `[Retry 1/N]` stderr line is printed as before and no refusal text appears

@@ -279,10 +279,15 @@ fn projected_snapshot_has_no_wall_clock_field() {
     assert!(!object.contains_key("timestamp"));
     assert_eq!(
         object.keys().collect::<Vec<_>>().len(),
-        7,
+        8,
         "snapshot fields: app_mode, persistent_scheduler_idle, is_resolving, \
-         process_error, parallel, changes, totals"
+         process_error, parallel, changes, totals, run_clock"
     );
+    // `run_clock` publishes boundary instants only, never a live counter: before
+    // the first Start every member is null.
+    let run_clock = object["run_clock"].as_object().unwrap();
+    assert_eq!(run_clock.len(), 3, "started_at, ended_at, elapsed_ms only");
+    assert!(run_clock.values().all(serde_json::Value::is_null));
 }
 
 #[test]

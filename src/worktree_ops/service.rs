@@ -17,12 +17,18 @@
 //! rather than duplicated implementations, so a reader can see the whole
 //! difference in one place:
 //!
-//! * the TUI keeps its local recovery `skip_teardown` escape hatch and it is the
-//!   only caller that may grant `allow_known_dirty`, and only after a second,
-//!   explicitly destructive operator confirmation;
-//! * `/api/v2` is fail-closed on both and preserves a conflicted merge instead
-//!   of aborting it, because a remote client has no way to inspect or resolve
-//!   the intermediate state.
+//! * the TUI keeps its local recovery `skip_teardown` escape hatch and grants
+//!   `allow_known_dirty` / `allow_commits_ahead` only after a second, explicitly
+//!   destructive operator confirmation;
+//! * `/api/v2` `delete_worktree` is fail-closed on all three. The separate
+//!   `delete_worktree_confirmed` command reaches the same three permissions
+//!   only through [`WorktreeService::delete_worktree_with_consent`], which binds
+//!   them to an explicit consent re-verified under the root guard before
+//!   teardown and again before removal;
+//! * `/api/v2` `merge_worktree` preserves a conflicted merge instead of aborting
+//!   it, because a remote client has no way to inspect or resolve the
+//!   intermediate state; the separately chosen
+//!   `merge_worktree_abort_on_conflict` aborts with verified restoration.
 //!
 //! Every safety observation deletion depends on is tri-state. An observation
 //! that failed is [`SafetyFact::Unknown`] or [`DirtyState::Unknown`], never a
@@ -34,6 +40,15 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+
+use super::consent::{ConsentLimits, ContentObservation};
+
+mod confirmed;
+#[allow(unused_imports)] // The binary target compiles this tree privately.
+pub use confirmed::{
+    classify_confirmed_delete, classify_consent, ConfirmedDeleteOutcome, ConfirmedDeleteRefusal,
+    DeletePreview, OptionEligibility,
+};
 
 /// Recovery guidance reported for a preserved merge conflict.
 ///
@@ -284,6 +299,49 @@ pub enum WorktreeOpError {
         /// How the conflict must be resolved.
         recovery: &'static str,
     },
+    /// The fresh inspection predicted a conflict, so an aborting merge was
+    /// refused before any Git mutation.
+    PredictedConflict {
+        /// Repository-relative paths the inspection reported.
+        files: Vec<String>,
+    },
+    /// The base merge conflicted and `git merge --abort` was attempted.
+    ///
+    /// Whether the base was actually restored is `abort.restored`, read back
+    /// from the repository — never inferred from the attempt.
+    MergeConflictAborted {
+        /// Repository-relative conflicted paths.
+        files: Vec<String>,
+        /// The verified abort report.
+        abort: Box<crate::vcs::git::commands::AbortReport>,
+    },
+    /// An abort-on-conflict merge landed and its `on_merged` hook then failed.
+    ///
+    /// The base moved. `landing` is re-read from the repository after the
+    /// failure; nothing re-merges, aborts, resets, or re-runs the hook.
+    /// `Display` is exactly the untyped text this replaced.
+    MergedHookFailed {
+        /// The change whose `on_merged` hook failed.
+        change_id: String,
+        /// `HEAD` read before the merge; `None` when it could not be read.
+        premerge_head: Option<String>,
+        /// Landing evidence re-read after the failure.
+        landing: Box<crate::vcs::git::commands::LandingReport>,
+        /// The hook's own failure text.
+        hook_detail: String,
+    },
+    /// An abort-on-conflict merge failed after eligibility with a Git error
+    /// that was not a conflict (a dirty base, an unmergeable ref).
+    ///
+    /// `Display` is exactly the untyped text this replaced.
+    MergeFailed {
+        /// `HEAD` read before the merge; `None` when it could not be read.
+        premerge_head: Option<String>,
+        /// Landing evidence re-read after the failure.
+        landing: Box<crate::vcs::git::commands::LandingReport>,
+        /// The Git failure text.
+        detail: String,
+    },
     /// Sanitized failure from the underlying boundary.
     Internal(String),
 }
@@ -299,12 +357,29 @@ impl fmt::Display for WorktreeOpError {
             | Self::Ineligible(message)
             | Self::RootBusy(message)
             | Self::Internal(message) => write!(f, "{message}"),
+            Self::MergedHookFailed {
+                change_id,
+                hook_detail,
+                ..
+            } => write!(
+                f,
+                "on_merged hook failed for '{change_id}'; branch merged transition blocked: {hook_detail}"
+            ),
+            Self::MergeFailed { detail, .. } => write!(f, "{detail}"),
             Self::MergeConflict { files, recovery } => write!(
                 f,
                 "base merge conflicted in {} file(s) [{}]; intermediate merge state was preserved, recovery: {}",
                 files.len(),
                 files.join(", "),
                 recovery
+            ),
+            // Unchanged from the untyped refusal this replaced, so existing
+            // operator-facing text holds.
+            Self::PredictedConflict { .. } => write!(f, "the worktree conflicts with base"),
+            Self::MergeConflictAborted { files, abort } => write!(
+                f,
+                "{}",
+                crate::vcs::git::commands::abort_message(files, abort)
             ),
         }
     }
@@ -320,7 +395,8 @@ pub type WorktreeOpResult<T> = Result<T, WorktreeOpError>;
 /// How a conflicting base merge is disposed of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
-    /// Run `git merge --abort` and report the conflict as a failure (TUI).
+    /// Refuse a predicted conflict, abort a real one, and verify restoration
+    /// (TUI and `merge_worktree_abort_on_conflict`).
     AbortOnConflict,
     /// Leave `MERGE_HEAD` and the conflicted index in place (`/api/v2`).
     PreserveConflict,
@@ -329,14 +405,19 @@ pub enum ConflictPolicy {
 /// Caller-declared delete policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteOptions {
-    /// Skip `.wt/teardown`. Local recovery only; never reachable from `/api/v2`.
+    /// Skip `.wt/teardown`. A recovery escape hatch: set by the local TUI's
+    /// `S`, and remotely only by `delete_worktree_confirmed` with explicit
+    /// consent. `/api/v2` `delete_worktree` never sets it.
     pub skip_teardown: bool,
     /// Permission to discard *known* uncommitted work.
     ///
     /// This waives [`DirtyState::Dirty`] and nothing else. It never waives an
     /// unobservable fact, commits ahead of base, main-worktree status, or an
-    /// identity mismatch, and only the local TUI's second, explicitly
-    /// destructive confirmation may set it.
+    /// identity mismatch. It is set by the local TUI's second, explicitly
+    /// destructive confirmation, and remotely only by
+    /// `delete_worktree_confirmed`'s `discard_known_dirty` bound to a consent
+    /// whose content identities are re-verified before removal — where it also
+    /// covers known ignored content, which forced removal deletes too.
     pub allow_known_dirty: bool,
     /// Permission to discard *known* commits ahead of base, and to delete the
     /// confirmed branch that carries them.
@@ -344,8 +425,9 @@ pub struct DeleteOptions {
     /// A third, independent permission, not a stronger form of the second. It
     /// waives [`SafetyFact::Yes`] on [`WorktreeFacts::has_commits_ahead`] and
     /// nothing else — not an unobservable ahead state, not uncommitted work, not
-    /// teardown — and only the local TUI's dedicated uppercase-`X` confirmation
-    /// may set it.
+    /// teardown. It is set by the local TUI's dedicated uppercase-`X`
+    /// confirmation, and remotely only by `delete_worktree_confirmed`'s
+    /// `discard_commits_ahead` bound to a consented HEAD and merge base.
     pub allow_commits_ahead: bool,
 }
 
@@ -704,9 +786,9 @@ pub fn classify_merge_eligibility(
     // anyway. The preserving caller runs the merge so the evidence it promises
     // its clients actually exists in the repository.
     if policy == ConflictPolicy::AbortOnConflict && !facts.conflict_files.is_empty() {
-        return Err(WorktreeOpError::Ineligible(
-            "the worktree conflicts with base".to_string(),
-        ));
+        return Err(WorktreeOpError::PredictedConflict {
+            files: facts.conflict_files.clone(),
+        });
     }
     match facts.has_commits_ahead {
         SafetyFact::Yes => {}
@@ -751,10 +833,17 @@ use super::same_path;
 pub enum MergeAttempt {
     /// The merge produced a merge commit.
     Merged,
-    /// The merge conflicted. Whether state was preserved is the policy's business.
+    /// The merge conflicted and its intermediate state was preserved.
     Conflict {
         /// Repository-relative conflicted paths.
         files: Vec<String>,
+    },
+    /// The merge conflicted and `git merge --abort` was attempted and verified.
+    ConflictAborted {
+        /// Repository-relative conflicted paths.
+        files: Vec<String>,
+        /// The verified abort report.
+        abort: crate::vcs::git::commands::AbortReport,
     },
 }
 
@@ -809,8 +898,75 @@ pub trait WorktreeBackend: Send + Sync {
     ) -> WorktreeOpResult<MergeAttempt>;
     /// Run the `on_merged` hook exactly once for a completed merge.
     async fn run_on_merged(&self, change_id: &str, worktree_path: &Path) -> WorktreeOpResult<()>;
+    /// Re-read whether a base merge landed. Reads only; never mutates.
+    ///
+    /// Defaults to an unknown report: a backend that cannot re-read the
+    /// repository never claims a merge landed or did not.
+    async fn merge_landing(
+        &self,
+        _premerge_head: Option<&str>,
+    ) -> crate::vcs::git::commands::LandingReport {
+        crate::vcs::git::commands::LandingReport::unknown(
+            "this backend cannot re-read merge landing",
+        )
+    }
     /// True when `change_id` is a managed, non-archived change eligible for a worktree.
     async fn change_is_eligible(&self, change_id: &str) -> WorktreeOpResult<()>;
+    /// Bind a worktree's discardable and ignored content for a confirmed delete.
+    ///
+    /// Defaults to [`ContentObservation::Unobservable`]: a backend that cannot
+    /// bind content makes every confirmed delete fail closed.
+    async fn observe_content(&self, _path: &Path, _limits: ConsentLimits) -> ContentObservation {
+        ContentObservation::Unobservable
+    }
+    /// Merge base of `head` with the managed base, or `None` when unresolved.
+    async fn merge_base(&self, _head: &str) -> WorktreeOpResult<Option<String>> {
+        Err(WorktreeOpError::Internal(
+            "this backend cannot resolve a merge base".to_string(),
+        ))
+    }
+    /// `git rev-list --count merge_base..head`.
+    async fn commits_between(&self, _merge_base: &str, _head: &str) -> WorktreeOpResult<usize> {
+        Err(WorktreeOpError::Internal(
+            "this backend cannot count commits".to_string(),
+        ))
+    }
+    /// True exactly when [`Self::teardown`] would execute `.wt/teardown`.
+    async fn teardown_script_present(&self, _path: &Path) -> bool {
+        false
+    }
+    /// Create a worktree *without* running `.wt/setup`.
+    ///
+    /// Used only by the session provisioner, where setup is fatal and its
+    /// failure triggers cleanup exactly as for the TUI `+` key. [`Self::create`]
+    /// keeps setup non-fatal for change worktrees. The default refuses, so a
+    /// backend that does not provision sessions cannot pretend to.
+    async fn create_without_setup(
+        &self,
+        _path: &Path,
+        _branch: &str,
+        _base_commit: &str,
+    ) -> WorktreeOpResult<()> {
+        Err(WorktreeOpError::Internal(
+            "this worktree backend does not provision session worktrees".to_string(),
+        ))
+    }
+    /// Remove a session worktree whose setup failed: forced, teardown skipped,
+    /// and its branch retained, exactly as the TUI `+` key's cleanup.
+    async fn remove_after_setup_failure(&self, _path: &Path) -> WorktreeOpResult<()> {
+        Err(WorktreeOpError::Internal(
+            "this worktree backend does not provision session worktrees".to_string(),
+        ))
+    }
+}
+
+/// Whether a configured-command session is running in a worktree.
+///
+/// Consulted by [`WorktreeService::delete_worktree`] under the root guard, so
+/// the TUI and the API refuse deleting a directory a session is using alike.
+pub trait SessionProbe: Send + Sync {
+    /// True while a session runs (or is reserved to run) with `path` as cwd.
+    fn session_running(&self, path: &Path) -> bool;
 }
 
 /// A worktree operation event, published identically by every frontend.
@@ -885,6 +1041,20 @@ pub struct WorktreeOpOutcome {
     /// unqualified success would be hiding a resource the operator still owns.
     /// `detail` carries the reason.
     pub branch_retained: bool,
+    /// Landing and hook evidence of an abort-on-conflict merge; `None` for
+    /// every other operation.
+    pub merge_evidence: Option<MergeEvidence>,
+}
+
+/// What an abort-on-conflict merge that succeeded did, re-read afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeEvidence {
+    /// `HEAD` read before the merge; `None` when it could not be read.
+    pub premerge_head: Option<String>,
+    /// Landing evidence re-read after the merge.
+    pub landing: crate::vcs::git::commands::LandingReport,
+    /// Whether `on_merged` ran (it is skipped when no change ID is derivable).
+    pub hook_ran: bool,
 }
 
 /// The shared operation service.
@@ -898,7 +1068,14 @@ pub struct WorktreeService {
     /// `root_busy` immediately instead of queueing behind an operation it cannot
     /// see, which is what lets a remote client retry against a fresh revision.
     root_guard: Mutex<()>,
+    /// The content oracle's budget, shared by the preview and the command.
+    consent_limits: ConsentLimits,
+    /// Running configured-command sessions, when a registry is bound.
+    session_probe: Option<std::sync::Arc<dyn SessionProbe>>,
 }
+
+/// Refusal detail for deleting a worktree a session is running in.
+pub const SESSION_RUNNING_REFUSAL: &str = "a worktree session is running";
 
 impl WorktreeService {
     /// Build a service over a backend, an event sink, and the managed workspace root.
@@ -912,7 +1089,43 @@ impl WorktreeService {
             events,
             workspace_base_dir,
             root_guard: Mutex::new(()),
+            consent_limits: ConsentLimits::PRODUCTION,
+            session_probe: None,
         }
+    }
+
+    /// Replace the content oracle's budget.
+    ///
+    /// Production always runs [`ConsentLimits::PRODUCTION`]; tests inject small
+    /// limits instead of building multi-hundred-megabyte fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_consent_limits(mut self, limits: ConsentLimits) -> Self {
+        self.consent_limits = limits;
+        self
+    }
+
+    /// Refuse deleting any worktree `probe` reports a running session in.
+    pub fn with_session_probe(mut self, probe: std::sync::Arc<dyn SessionProbe>) -> Self {
+        self.session_probe = Some(probe);
+        self
+    }
+
+    /// The backend every effect goes through, for the session provisioner.
+    pub fn backend(&self) -> std::sync::Arc<dyn WorktreeBackend> {
+        self.backend.clone()
+    }
+
+    /// Where managed worktrees are created.
+    pub fn workspace_base_dir(&self) -> &Path {
+        &self.workspace_base_dir
+    }
+
+    /// Take the repository mutation guard for an operation outside this service.
+    ///
+    /// The session provisioner holds it for its creation steps, so a session
+    /// worktree is `root_busy` while a merge or deletion runs and vice versa.
+    pub fn acquire_mutation_guard(&self) -> WorktreeOpResult<tokio::sync::MutexGuard<'_, ()>> {
+        self.acquire_root()
     }
 
     /// Current worktree observations. Read-only; takes no mutation guard.
@@ -1002,6 +1215,17 @@ impl WorktreeService {
 
         let before = self.locate(path).await?;
         classify_delete_identity(&before, expected)?;
+        // A session's cwd is not something teardown may pull out from under
+        // it. Checked under the root guard, before teardown, for every frontend.
+        if self
+            .session_probe
+            .as_ref()
+            .is_some_and(|probe| probe.session_running(&before.path))
+        {
+            return Err(WorktreeOpError::Ineligible(
+                SESSION_RUNNING_REFUSAL.to_string(),
+            ));
+        }
         classify_delete_eligibility(&before, options)?;
 
         // Teardown must succeed before the resource is retired: a failed delete
@@ -1068,6 +1292,7 @@ impl WorktreeService {
             branch: after.branch,
             path: after.path,
             branch_retained,
+            merge_evidence: None,
         })
     }
 
@@ -1228,8 +1453,34 @@ impl WorktreeService {
             })
             .await;
 
+        // The abort-on-conflict merge reports typed landing evidence, so it
+        // needs the pre-merge HEAD it is compared against. Read under the root
+        // guard, immediately before the merge; the preserving merge is
+        // unchanged and reads nothing extra.
+        let typed = policy == ConflictPolicy::AbortOnConflict;
+        let premerge_head = if typed {
+            self.backend.base_head().await.ok()
+        } else {
+            None
+        };
+
         let attempt = match self.backend.merge_into_base(&facts.branch, policy).await {
             Ok(attempt) => attempt,
+            Err(WorktreeOpError::Internal(detail)) if typed => {
+                let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+                let error = WorktreeOpError::MergeFailed {
+                    premerge_head,
+                    landing: Box::new(landing),
+                    detail,
+                };
+                self.events
+                    .emit(WorktreeOperationEvent::MergeFailed {
+                        branch: facts.branch.clone(),
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
             Err(error) => {
                 self.events
                     .emit(WorktreeOperationEvent::MergeFailed {
@@ -1240,6 +1491,23 @@ impl WorktreeService {
                 return Err(error);
             }
         };
+
+        if let MergeAttempt::ConflictAborted { files, abort } = attempt {
+            let error = WorktreeOpError::MergeConflictAborted {
+                files,
+                abort: Box::new(abort),
+            };
+            self.events
+                .emit(WorktreeOperationEvent::MergeFailed {
+                    branch: facts.branch.clone(),
+                    error: error.to_string(),
+                })
+                .await;
+            // No `on_merged`, no retried abort, no further compensation: the
+            // report says what the repository looks like, and recovery from an
+            // unconfirmed restoration belongs to the local operator.
+            return Err(error);
+        }
 
         if let MergeAttempt::Conflict { files } = attempt {
             let error = WorktreeOpError::MergeConflict {
@@ -1259,20 +1527,35 @@ impl WorktreeService {
 
         // `on_merged` runs after the merge and before completion is announced, so
         // a hook failure blocks the merged transition exactly as it does in TUI.
+        let mut hook_ran = false;
         if let Some(change_id) =
             crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(&facts.branch)
         {
+            hook_ran = true;
             if let Err(error) = self.backend.run_on_merged(&change_id, &facts.path).await {
-                let message = format!(
-                    "on_merged hook failed for '{change_id}'; branch merged transition blocked: {error}"
-                );
+                let hook_detail = error.to_string();
+                let error = if typed {
+                    // The stage is what decides the outcome; whether the merge
+                    // really landed is re-read, never assumed.
+                    let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+                    WorktreeOpError::MergedHookFailed {
+                        change_id,
+                        premerge_head,
+                        landing: Box::new(landing),
+                        hook_detail,
+                    }
+                } else {
+                    WorktreeOpError::Internal(format!(
+                        "on_merged hook failed for '{change_id}'; branch merged transition blocked: {hook_detail}"
+                    ))
+                };
                 self.events
                     .emit(WorktreeOperationEvent::MergeFailed {
                         branch: facts.branch.clone(),
-                        error: message.clone(),
+                        error: error.to_string(),
                     })
                     .await;
-                return Err(WorktreeOpError::Internal(message));
+                return Err(error);
             }
         } else {
             debug!(
@@ -1288,11 +1571,23 @@ impl WorktreeService {
             .await;
         self.events.emit(WorktreeOperationEvent::Refreshed).await;
 
+        let merge_evidence = if typed {
+            let landing = self.backend.merge_landing(premerge_head.as_deref()).await;
+            Some(MergeEvidence {
+                premerge_head,
+                landing,
+                hook_ran,
+            })
+        } else {
+            None
+        };
+
         Ok(WorktreeOpOutcome {
             detail: format!("branch '{}' was merged into base", facts.branch),
             branch: facts.branch,
             path: facts.path,
             branch_retained: false,
+            merge_evidence,
         })
     }
 
@@ -1303,6 +1598,19 @@ impl WorktreeService {
     #[cfg(test)]
     pub fn acquire_root_for_test(&self) -> WorktreeOpResult<tokio::sync::MutexGuard<'_, ()>> {
         self.acquire_root()
+    }
+
+    /// Whether another operation holds the repository mutation guard now.
+    ///
+    /// A `try_lock` probe released immediately: callers that only need to
+    /// *refuse* while the root is busy never contend with the holder.
+    pub fn root_guard_is_held(&self) -> bool {
+        self.root_guard.try_lock().is_err()
+    }
+
+    /// Tell observers the worktree observation changed outside an operation.
+    pub async fn announce_refreshed(&self) {
+        self.events.emit(WorktreeOperationEvent::Refreshed).await;
     }
 
     fn acquire_root(&self) -> WorktreeOpResult<tokio::sync::MutexGuard<'_, ()>> {

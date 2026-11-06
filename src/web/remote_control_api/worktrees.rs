@@ -22,16 +22,58 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::worktree_ops::consent::{
+    ConfirmedDeleteReason, ContentObservationKind, DeleteConsent, CONFIRMED_DELETE_PERMISSIONS,
+    CONSENT_FIELDS, CONTENT_ID_ALGORITHM,
+};
 use crate::worktree_ops::service::{
     classify_delete_eligibility, classify_merge_eligibility, ConflictPolicy, DeleteOptions,
-    ExpectedTarget, WorktreeFacts, WorktreeOpError, WorktreeService, RECOVERY_LOCAL_OR_TUI,
+    ExpectedTarget, OptionEligibility, WorktreeFacts, WorktreeOpError, WorktreeService,
+    RECOVERY_LOCAL_OR_TUI,
 };
 
-use super::dto::{new_hex_id, ErrorCode};
+use super::dto::{
+    new_hex_id, CommandResult, ConfirmedDeleteParams, ConfirmedDeleteRefusalResult,
+    ConfirmedDeleteResult, ErrorCode, MergeAbortEvidence, MergeAbortOutcome, MergeAbortResult,
+    MergeHookEvidence, MergeLanded, MergeLandingEvidence,
+};
 use super::executor::{CommandFailure, ExecutionSummary};
 
 /// The worktree operations `/api/v2` advertises. Nothing else is reachable.
-pub const WORKTREE_OPERATIONS: [&str; 5] = ["list", "detail", "create", "delete", "merge"];
+pub const WORKTREE_OPERATIONS: [&str; 9] = [
+    "list",
+    "detail",
+    "create",
+    "delete",
+    "merge",
+    "merge_abort",
+    "delete_confirmed",
+    "text",
+    "session",
+];
+
+/// Command the `delete_confirmed` operation is submitted as.
+pub const CONFIRMED_DELETE_COMMAND: &str = "delete_worktree_confirmed";
+
+/// Route template of the read-only delete preview.
+pub const DELETE_PREVIEW_ROUTE: &str = "/api/v2/worktrees/{worktree_id}/delete-preview";
+
+/// Command the `merge_abort` operation is submitted as.
+pub const MERGE_ABORT_COMMAND: &str = "merge_worktree_abort_on_conflict";
+
+/// The three repository facts a confirmed restoration requires.
+pub const MERGE_ABORT_RESTORE_VERIFICATION: [&str; 3] =
+    ["head_equals_premerge", "no_merge_head", "root_clean"];
+
+/// Every stable reason an abort-on-conflict merge can settle with besides `merged`.
+pub const MERGE_ABORT_REASONS: [&str; 6] = [
+    "predicted_conflict",
+    "conflict_aborted",
+    "abort_failed",
+    "restore_unknown",
+    "merge_failed",
+    "merged_hook_failed",
+];
 
 // ============================================================================
 // Opaque process-local identity
@@ -369,17 +411,115 @@ pub struct WorktreeResponse {
     pub worktree: WorktreeResource,
 }
 
+/// Whether the abort-on-conflict merge is served, and what it verifies.
+///
+/// `Default` is the *unavailable* answer, which is what `#[serde(default)]`
+/// decodes an older owner's omission as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortCapability {
+    /// True when `merge_worktree_abort_on_conflict` is accepted.
+    pub available: bool,
+    /// Command type the operation is submitted as.
+    pub command: String,
+    /// True when a conflict the fresh inspection predicts is refused before
+    /// any Git mutation.
+    pub predicted_conflict_refused: bool,
+    /// Repository facts a `confirmed` restoration requires, all of them.
+    pub restore_verification: Vec<String>,
+    /// Every stable non-success settlement reason.
+    pub reasons: Vec<String>,
+}
+
+impl MergeAbortCapability {
+    /// The capability this build serves.
+    pub fn served() -> Self {
+        Self {
+            available: true,
+            command: MERGE_ABORT_COMMAND.to_string(),
+            predicted_conflict_refused: true,
+            restore_verification: MERGE_ABORT_RESTORE_VERIFICATION
+                .iter()
+                .map(|v| v.to_string())
+                .collect(),
+            reasons: MERGE_ABORT_REASONS.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+}
+
+/// Whether consent-bound destructive deletion is served, and how to use it.
+///
+/// The content observation budget behind `content_unbounded` is 500,000
+/// records, 256 MiB of hashed bytes, and `max_listing_name_bytes` — 64 MiB of
+/// directory-entry names per listing, charged entry by entry as it is read.
+/// A detached worktree is `detached_head` for every option.
+///
+/// `Default` is the *unavailable* answer, which is what `#[serde(default)]`
+/// decodes an older owner's omission as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteCapability {
+    /// True when `delete_worktree_confirmed` and its preview are served.
+    pub available: bool,
+    /// Command type the operation is submitted as.
+    pub command: String,
+    /// Route template of the read-only preview whose `consent` is echoed.
+    pub preview_route: String,
+    /// The three independent permissions the command accepts.
+    pub permissions: Vec<String>,
+    /// Exactly the fields of the `consent` object.
+    pub consent_fields: Vec<String>,
+    /// Hash algorithm both content identities use.
+    pub content_id_algorithm: String,
+    /// True when ignored content is disclosed and bound by its bytes.
+    pub binds_ignored_content: bool,
+    /// Every stable refusal and blocked-option reason.
+    pub reasons: Vec<String>,
+}
+
+impl ConfirmedDeleteCapability {
+    /// The capability this build serves.
+    pub fn served() -> Self {
+        Self {
+            available: true,
+            command: CONFIRMED_DELETE_COMMAND.to_string(),
+            preview_route: DELETE_PREVIEW_ROUTE.to_string(),
+            permissions: CONFIRMED_DELETE_PERMISSIONS
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+            consent_fields: CONSENT_FIELDS.iter().map(|f| f.to_string()).collect(),
+            content_id_algorithm: CONTENT_ID_ALGORITHM.to_string(),
+            binds_ignored_content: true,
+            reasons: ConfirmedDeleteReason::ALL
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Worktree section of `GET /api/v2/capabilities`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorktreeCapabilities {
     /// Advertised operations. Nothing outside this list is reachable.
     pub operations: Vec<String>,
-    /// How a merge conflict is recovered from. Always `local_or_tui_required`.
+    /// How a `merge_worktree` conflict is recovered from. Always `local_or_tui_required`.
     pub merge_conflict_recovery: String,
-    /// True when a conflicting merge leaves the intermediate Git state in place.
+    /// True when a conflicting `merge_worktree` leaves the intermediate Git state in place; the separately advertised `merge_abort` command aborts instead.
     pub merge_conflict_preserves_state: bool,
-    /// True when deletion always runs managed teardown with no bypass.
+    /// True when the `delete_worktree` command always runs managed teardown with no bypass. The only bypass is the separately advertised `confirmed_delete` command, which requires explicit consent.
     pub delete_requires_teardown: bool,
+    /// The explicit abort-on-conflict merge.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field means "unavailable".
+    #[serde(default)]
+    pub merge_abort: MergeAbortCapability,
+    /// Consent-bound destructive deletion.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field means "unavailable".
+    #[serde(default)]
+    pub confirmed_delete: ConfirmedDeleteCapability,
 }
 
 impl Default for WorktreeCapabilities {
@@ -389,8 +529,110 @@ impl Default for WorktreeCapabilities {
             merge_conflict_recovery: RECOVERY_LOCAL_OR_TUI.to_string(),
             merge_conflict_preserves_state: true,
             delete_requires_teardown: true,
+            merge_abort: MergeAbortCapability::served(),
+            confirmed_delete: ConfirmedDeleteCapability::served(),
         }
     }
+}
+
+/// One option's eligibility on a delete preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeleteOptionEligibility {
+    /// True when the command with this option would pass its guards now.
+    pub eligible: bool,
+    /// Why it would not; `null` when eligible.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub blocked_reason: Option<ConfirmedDeleteReason>,
+    /// Paths in the discardable identity (`discard_known_dirty` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<usize>,
+    /// Commits between the merge base and HEAD (`discard_commits_ahead` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<usize>,
+    /// True when the ahead option also discards known dirty or ignored
+    /// content (`discard_commits_ahead` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub also_discards_dirty: Option<bool>,
+}
+
+impl DeleteOptionEligibility {
+    fn from_result(result: &OptionEligibility) -> Self {
+        Self {
+            eligible: result.is_ok(),
+            blocked_reason: result.err(),
+            entries: None,
+            commits: None,
+            also_discards_dirty: None,
+        }
+    }
+}
+
+/// Per-option eligibility of a delete preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeletePreviewOptions {
+    /// All three permissions `false`: an ordinary delete with consent revalidation.
+    pub ordinary: DeleteOptionEligibility,
+    /// `skip_teardown` alone.
+    pub skip_teardown: DeleteOptionEligibility,
+    /// `discard_known_dirty` alone.
+    pub discard_known_dirty: DeleteOptionEligibility,
+    /// `discard_commits_ahead`, with `discard_known_dirty` when anything is dirty.
+    pub discard_commits_ahead: DeleteOptionEligibility,
+}
+
+/// `GET /api/v2/worktrees/{worktree_id}/delete-preview` body.
+///
+/// A read: it creates no command record and advances no revision. `consent`
+/// is exactly what `delete_worktree_confirmed` must be sent, unmodified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DeletePreviewResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the preview was read at.
+    pub state_revision: u64,
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// When the observation was taken (RFC 3339). Informational; not consent.
+    pub observed_at: String,
+    /// Branch, empty when detached.
+    pub branch: String,
+    /// Current HEAD commit.
+    pub head: String,
+    /// True for the main worktree, which is never deletable.
+    pub is_main: bool,
+    /// True when the worktree has a detached HEAD (no branch). Every option is
+    /// then ineligible with `detached_head`, and the empty `consent.branch`
+    /// cannot be echoed. Omitted by older owners, which decodes as `false`.
+    #[serde(default)]
+    pub is_detached: bool,
+    /// Uncommitted-change state (`--ignored=no`); `null` when unobservable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub dirty: Option<bool>,
+    /// Commits-ahead state; `null` when unobservable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub has_commits_ahead: Option<bool>,
+    /// How the ahead fact was obtained. Always a fresh targeted inspection.
+    pub inspection: crate::worktree_ops::InspectionState,
+    /// How the content observation came out.
+    pub content_observation: ContentObservationKind,
+    /// True when forced removal would also delete ignored content; `null`
+    /// unless content was observed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub has_ignored_content: Option<bool>,
+    /// Paths in the ignored identity; `null` unless content was observed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub ignored_entries: Option<usize>,
+    /// True exactly when teardown would execute `.wt/teardown`.
+    pub teardown_script_present: bool,
+    /// What each permission combination would decide right now.
+    pub options: DeletePreviewOptions,
+    /// The object to echo as `params.consent`.
+    pub consent: DeleteConsent,
 }
 
 // ============================================================================
@@ -408,6 +650,43 @@ pub trait WorktreeOperations: Send + Sync {
     async fn delete(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure>;
     /// Merge a worktree addressed by its opaque ID into base.
     async fn merge(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure>;
+    /// Merge a worktree into base, refusing a predicted conflict and aborting
+    /// a real one with verified restoration.
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure>;
+    /// Observe what a confirmed delete would act on. A read.
+    ///
+    /// `instance_id` and `state_revision` are the read route's to fill in.
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure>;
+    /// Delete a worktree on explicit, re-verified consent.
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure>;
+
+    /// The directory a live opaque ID is bound to, for the text surface.
+    ///
+    /// Registry-internal: the path is never serialized.
+    async fn text_root(&self, _worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Err(unbound())
+    }
+
+    /// Whether the repository root mutation guard is held right now.
+    ///
+    /// A port with no service behind it holds no guard.
+    async fn root_guard_is_held(&self) -> bool {
+        false
+    }
+
+    /// Refresh the worktree observation after a text write, so `dirty` and the
+    /// `Refreshed` worktree event follow from the file write alone.
+    async fn refresh_after_text_write(&self) {}
 }
 
 /// A complete worktree observation plus the repository it belongs to.
@@ -443,6 +722,25 @@ impl WorktreeOperations for UnboundWorktreeOperations {
     async fn merge(&self, _worktree_id: &str) -> Result<ExecutionSummary, CommandFailure> {
         Err(unbound())
     }
+    async fn merge_abort_on_conflict(
+        &self,
+        _worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        Err(unbound())
+    }
+    async fn delete_preview(
+        &self,
+        _worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure> {
+        Err(unbound())
+    }
+    async fn delete_confirmed(
+        &self,
+        _worktree_id: &str,
+        _params: &ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        Err(unbound())
+    }
 }
 
 /// Map a shared-service refusal onto a v2 error code.
@@ -461,9 +759,169 @@ pub fn map_worktree_error(error: &WorktreeOpError) -> CommandFailure {
         }
         WorktreeOpError::RootBusy(_) => ErrorCode::RootBusy,
         WorktreeOpError::MergeConflict { .. } => ErrorCode::MergeConflict,
-        WorktreeOpError::Internal(_) => ErrorCode::InternalError,
+        WorktreeOpError::PredictedConflict { .. } => ErrorCode::MergeConflictPredicted,
+        // Only a confirmed restoration is `merge_conflict_aborted`. A failed or
+        // unreadable verification is never reported as a successful abort.
+        WorktreeOpError::MergeConflictAborted { abort, .. } => match abort.restored {
+            crate::vcs::git::commands::Restoration::Confirmed => ErrorCode::MergeConflictAborted,
+            crate::vcs::git::commands::Restoration::Failed
+            | crate::vcs::git::commands::Restoration::Unknown => ErrorCode::MergeAbortFailed,
+        },
+        // The base moved: a 409-class state, not an owner fault.
+        WorktreeOpError::MergedHookFailed { .. } => ErrorCode::MergeHookFailed,
+        WorktreeOpError::MergeFailed { .. } | WorktreeOpError::Internal(_) => {
+            ErrorCode::InternalError
+        }
     };
     CommandFailure::new(code, error.to_string())
+}
+
+/// `merge_worktree` keeps its contract byte for byte: the typed merge
+/// failures an abort-on-conflict merge produces are `internal_error` there,
+/// with no result.
+fn map_preserving_merge_error(error: &WorktreeOpError) -> CommandFailure {
+    match error {
+        WorktreeOpError::MergedHookFailed { .. } | WorktreeOpError::MergeFailed { .. } => {
+            CommandFailure::new(ErrorCode::InternalError, error.to_string())
+        }
+        other => map_worktree_error(other),
+    }
+}
+
+/// How many bytes of a hook's failure text a result may quote.
+const MAX_HOOK_DETAIL_BYTES: usize = 1024;
+
+/// Last `MAX_HOOK_DETAIL_BYTES` of `text` after the shared detail sanitizer,
+/// control characters replaced, never splitting a character.
+fn bounded_hook_detail(text: &str) -> String {
+    let sanitized = crate::events::sanitize_detail(text);
+    let trimmed = sanitized.trim();
+    let mut start = trimmed.len().saturating_sub(MAX_HOOK_DETAIL_BYTES);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    trimmed[start..]
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Landing evidence of a conflicting merge, derived from its verified abort.
+fn landing_from_abort(abort: &crate::vcs::git::commands::AbortReport) -> MergeLandingEvidence {
+    let moved = abort
+        .head_after
+        .as_deref()
+        .is_some_and(|head| head != abort.premerge_head);
+    let (landed, detail) = if moved {
+        // The abort's reads include no ancestry check, so a moved HEAD is
+        // reported for what it is rather than as a failed read.
+        (
+            crate::vcs::git::commands::Landing::Unknown,
+            Some("HEAD differs from the pre-merge HEAD after the abort".to_string()),
+        )
+    } else {
+        crate::vcs::git::commands::classify_landing(
+            Some(&abort.premerge_head),
+            abort.head_after.as_deref(),
+            abort.merge_head_present,
+            None,
+        )
+    };
+    MergeLandingEvidence {
+        landed: landed.into(),
+        head_after: abort.head_after.clone(),
+        merge_head_present: abort.merge_head_present,
+        clean_after: abort.clean_after,
+        detail,
+    }
+}
+
+/// Typed `merge_abort` evidence for a refusal, when the refusal has any.
+///
+/// `None` for refusals before eligibility settled (root busy, not found,
+/// ineligible): those carry no merge-abort facts to report.
+pub fn merge_abort_failure_result(
+    worktree_id: &str,
+    branch: &str,
+    error: &WorktreeOpError,
+) -> Option<MergeAbortResult> {
+    use crate::vcs::git::commands::Restoration;
+    match error {
+        WorktreeOpError::PredictedConflict { files } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::PredictedConflict,
+            premerge_head: None,
+            conflict_files: files.clone(),
+            abort: None,
+            recovery: None,
+            // Refused before any Git mutation: positively nothing landed.
+            merge: Some(MergeLandingEvidence {
+                landed: MergeLanded::NotLanded,
+                head_after: None,
+                merge_head_present: None,
+                clean_after: None,
+                detail: Some("refused before any Git mutation".to_string()),
+            }),
+            hook: Some(MergeHookEvidence::not_run()),
+        }),
+        WorktreeOpError::MergeConflictAborted { files, abort } => {
+            let confirmed = abort.restored == Restoration::Confirmed;
+            Some(MergeAbortResult {
+                worktree_id: worktree_id.to_string(),
+                branch: branch.to_string(),
+                outcome: if confirmed {
+                    MergeAbortOutcome::ConflictAborted
+                } else {
+                    MergeAbortOutcome::AbortFailed
+                },
+                premerge_head: Some(abort.premerge_head.clone()),
+                conflict_files: files.clone(),
+                abort: Some(MergeAbortEvidence::from_report(abort)),
+                recovery: (!confirmed).then(|| RECOVERY_LOCAL_OR_TUI.to_string()),
+                merge: Some(landing_from_abort(abort)),
+                hook: Some(MergeHookEvidence::not_run()),
+            })
+        }
+        WorktreeOpError::MergedHookFailed {
+            premerge_head,
+            landing,
+            hook_detail,
+            ..
+        } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::MergedHookFailed,
+            premerge_head: premerge_head.clone(),
+            conflict_files: Vec::new(),
+            abort: None,
+            recovery: Some(RECOVERY_LOCAL_OR_TUI.to_string()),
+            merge: Some(MergeLandingEvidence::from_report(landing)),
+            hook: Some(MergeHookEvidence {
+                ran: true,
+                exit_ok: Some(false),
+                detail: Some(bounded_hook_detail(hook_detail)),
+            }),
+        }),
+        WorktreeOpError::MergeFailed {
+            premerge_head,
+            landing,
+            ..
+        } => Some(MergeAbortResult {
+            worktree_id: worktree_id.to_string(),
+            branch: branch.to_string(),
+            outcome: MergeAbortOutcome::MergeFailed,
+            premerge_head: premerge_head.clone(),
+            conflict_files: Vec::new(),
+            abort: None,
+            recovery: None,
+            merge: Some(MergeLandingEvidence::from_report(landing)),
+            hook: Some(MergeHookEvidence::not_run()),
+        }),
+        _ => None,
+    }
 }
 
 /// Production port: the shared operation service plus this process's ID registry.
@@ -518,6 +976,40 @@ impl RemoteWorktreeOperations {
             },
             facts,
         ))
+    }
+
+    /// Resolve a live opaque ID against a fresh observation, returning the
+    /// internal key and the redacted resource it currently projects to.
+    pub(crate) async fn resolve_live(
+        &self,
+        worktree_id: &str,
+    ) -> Result<(WorktreeKey, WorktreeResource), CommandFailure> {
+        let (listing, _) = self.observe().await?;
+        let key = self.resolve(worktree_id)?;
+        let resource = listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.worktree_id == worktree_id)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    ErrorCode::WorktreeNotFound,
+                    format!("worktree '{worktree_id}' is not a current resource in this instance"),
+                )
+            })?;
+        Ok((key, resource))
+    }
+
+    /// The opaque ID a fresh observation allocates for `path`, if it is a
+    /// registered worktree.
+    pub(crate) async fn identify(&self, path: &Path) -> Option<String> {
+        let (listing, _) = self.observe().await.ok()?;
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let display = repository_relative_display(&self.repo_root, &canonical);
+        listing
+            .worktrees
+            .into_iter()
+            .find(|resource| resource.path == display)
+            .map(|resource| resource.worktree_id)
     }
 
     /// Resolve an opaque ID, distinguishing "never existed" from "retired".
@@ -607,9 +1099,202 @@ impl WorktreeOperations for RemoteWorktreeOperations {
             .service
             .merge_worktree(&key.path, ConflictPolicy::PreserveConflict)
             .await
-            .map_err(|error| map_worktree_error(&error))?;
+            .map_err(|error| map_preserving_merge_error(&error))?;
 
         let _ = self.observe().await;
         Ok(ExecutionSummary::changed(outcome.detail))
+    }
+
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let result = self
+            .service
+            .merge_worktree(&key.path, ConflictPolicy::AbortOnConflict)
+            .await;
+
+        // Refresh after every outcome, so `root_busy` and conflict facts a
+        // failed abort left behind are what the next read reports.
+        let refreshed = self.observe().await.ok();
+        match result {
+            Ok(outcome) => {
+                let evidence = outcome.merge_evidence.as_ref();
+                Ok(
+                    ExecutionSummary::changed(outcome.detail.clone()).with_result(
+                        CommandResult::MergeAbort(Box::new(MergeAbortResult {
+                            worktree_id: worktree_id.to_string(),
+                            branch: outcome.branch,
+                            outcome: MergeAbortOutcome::Merged,
+                            premerge_head: None,
+                            conflict_files: Vec::new(),
+                            abort: None,
+                            recovery: None,
+                            merge: evidence.map(|e| MergeLandingEvidence::from_report(&e.landing)),
+                            hook: evidence.map(|e| {
+                                if e.hook_ran {
+                                    MergeHookEvidence {
+                                        ran: true,
+                                        exit_ok: Some(true),
+                                        detail: None,
+                                    }
+                                } else {
+                                    MergeHookEvidence::not_run()
+                                }
+                            }),
+                        })),
+                    ),
+                )
+            }
+            Err(error) => {
+                let branch = refreshed
+                    .as_ref()
+                    .and_then(|(_, facts)| facts.iter().find(|f| f.path == key.path))
+                    .map(|f| f.branch.clone())
+                    .unwrap_or_default();
+                let failure = map_worktree_error(&error);
+                Err(
+                    match merge_abort_failure_result(worktree_id, &branch, &error) {
+                        Some(result) => {
+                            failure.with_result(CommandResult::MergeAbort(Box::new(result)))
+                        }
+                        None => failure,
+                    },
+                )
+            }
+        }
+    }
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<DeletePreviewResponse, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let preview = self
+            .service
+            .delete_preview(&key.path, &key.identity)
+            .await
+            .map_err(|error| map_worktree_error(&error))?;
+
+        let mut discard_known_dirty =
+            DeleteOptionEligibility::from_result(&preview.discard_known_dirty);
+        discard_known_dirty.entries = preview.content.observed().map(|c| c.entries);
+        let mut discard_commits_ahead =
+            DeleteOptionEligibility::from_result(&preview.discard_commits_ahead);
+        discard_commits_ahead.commits = preview.commits_ahead;
+        discard_commits_ahead.also_discards_dirty = Some(preview.also_discards_dirty);
+
+        Ok(DeletePreviewResponse {
+            instance_id: String::new(),
+            state_revision: 0,
+            worktree_id: worktree_id.to_string(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            branch: preview.facts.branch.clone(),
+            head: preview.facts.head.clone(),
+            is_main: preview.facts.is_main,
+            is_detached: preview.facts.is_detached || preview.facts.branch.is_empty(),
+            dirty: preview.observation.dirty,
+            has_commits_ahead: preview.observation.has_commits_ahead,
+            inspection: preview.facts.inspection,
+            content_observation: preview.observation.content_observation,
+            has_ignored_content: preview.observation.has_ignored_content,
+            ignored_entries: preview.content.observed().map(|c| c.ignored_entries),
+            teardown_script_present: preview.teardown_script_present,
+            options: DeletePreviewOptions {
+                ordinary: DeleteOptionEligibility::from_result(&preview.ordinary),
+                skip_teardown: DeleteOptionEligibility::from_result(&preview.skip_teardown),
+                discard_known_dirty,
+                discard_commits_ahead,
+            },
+            consent: preview.observation.consent(),
+        })
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        let key = self.resolve(worktree_id)?;
+        let consent = &params.consent;
+        // The opaque ID pins the Git identity; the consent pins branch and
+        // HEAD. All three are revalidated under the service's root guard.
+        let expected = ExpectedTarget::on_branch(consent.branch.clone())
+            .with_identity(key.identity.clone())
+            .with_head(consent.head.clone());
+        let result = self
+            .service
+            .delete_worktree_with_consent(&key.path, &expected, consent, params.options())
+            .await;
+
+        match result {
+            Ok(deleted) => {
+                self.registry.retire(worktree_id);
+                let _ = self.observe().await;
+                let detail = format!(
+                    "{}; worktree_id {worktree_id} retired",
+                    deleted.outcome.detail
+                );
+                Ok(ExecutionSummary::changed(detail).with_result(
+                    CommandResult::DeleteWorktreeConfirmed(Box::new(ConfirmedDeleteResult {
+                        worktree_id: worktree_id.to_string(),
+                        branch: deleted.outcome.branch.clone(),
+                        head: deleted.head.clone(),
+                        outcome: Some("deleted".to_string()),
+                        teardown: deleted.teardown,
+                        dirty_discarded: deleted.dirty_discarded,
+                        commits_discarded: deleted.commits_discarded,
+                        branch_deleted: deleted.branch_deleted,
+                        branch_retained_reason: deleted.branch_retained_reason.clone(),
+                        refusal: None,
+                    })),
+                ))
+            }
+            Err(refusal) => {
+                let failure = if refusal.stale {
+                    CommandFailure::new(ErrorCode::DeleteConsentStale, refusal.error.to_string())
+                } else {
+                    map_worktree_error(&refusal.error)
+                };
+                let (branch, head) = refusal
+                    .observed
+                    .as_ref()
+                    .map(|o| (o.branch.clone(), o.head.clone()))
+                    .unwrap_or_else(|| (consent.branch.clone(), consent.head.clone()));
+                Err(
+                    failure.with_result(CommandResult::DeleteWorktreeConfirmed(Box::new(
+                        ConfirmedDeleteResult {
+                            worktree_id: worktree_id.to_string(),
+                            branch,
+                            head,
+                            outcome: None,
+                            teardown: refusal.teardown,
+                            dirty_discarded: false,
+                            commits_discarded: false,
+                            branch_deleted: false,
+                            branch_retained_reason: None,
+                            refusal: Some(ConfirmedDeleteRefusalResult {
+                                reason: refusal.reason,
+                                teardown_ran: refusal.teardown_ran(),
+                                observed: refusal.observed.as_deref().cloned(),
+                            }),
+                        },
+                    ))),
+                )
+            }
+        }
+    }
+
+    async fn text_root(&self, worktree_id: &str) -> Result<PathBuf, CommandFailure> {
+        Ok(self.resolve(worktree_id)?.path)
+    }
+
+    async fn root_guard_is_held(&self) -> bool {
+        self.service.root_guard_is_held()
+    }
+
+    async fn refresh_after_text_write(&self) {
+        let _ = self.observe().await;
+        self.service.announce_refreshed().await;
     }
 }

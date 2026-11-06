@@ -525,6 +525,15 @@ impl crate::orchestration::operator_command::ManagedProcessTermination for LiveM
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         crate::orchestration::operator_command::ImmediateKillEvidence::confirmed(1)
     }
+
+    // Coverage is not what these doubles exercise; `Clear` keeps every
+    // force-stop case meaning what it meant before coverage existed.
+    async fn writer_coverage_under(
+        &self,
+        _root: &std::path::Path,
+    ) -> crate::orchestration::operator_command::WriterCoverage {
+        crate::orchestration::operator_command::WriterCoverage::Clear
+    }
 }
 
 /// The episode transitions a completion subscription would be delivered.

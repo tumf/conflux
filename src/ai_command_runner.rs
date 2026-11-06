@@ -123,6 +123,10 @@ impl ExecutionPhase {
 struct ScopeEntry {
     operation: Option<String>,
     change_id: Option<String>,
+    /// Canonical working directory the execution spawns in, recorded at
+    /// registration — before the spawn — so writer coverage can bind it to a
+    /// root without ever reading it back from the process.
+    cwd: WriterCwd,
     phase: ExecutionPhase,
     /// Owned process identities (PGID == leader PID) whose quiescence is not
     /// yet proven. Retained across attempts so an earlier unproven attempt
@@ -182,13 +186,50 @@ impl Default for RunCommandScope {
 impl RunCommandScope {
     /// Create one fresh, open scope for a single orchestration invocation.
     pub fn new() -> Self {
-        Self {
+        let scope = Self {
             inner: Arc::new(RunCommandScopeInner {
                 state: std::sync::Mutex::new(ScopeState::default()),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 quiescence: tokio::sync::Notify::new(),
             }),
+        };
+        // An owner process that installed a writer ledger accounts for every
+        // scope it ever creates, so no run path can launch writers the remote
+        // editor cannot see.
+        if let Some(ledger) = process_writer_ledger() {
+            ledger.register_scope(&scope);
         }
+        scope
+    }
+
+    /// Every registration's writer binding, with a bounded description.
+    ///
+    /// Every phase counts: a registration waiting to spawn is a spawn that is
+    /// imminent, and a retained one is an identity nobody proved dead.
+    fn writer_bindings(&self) -> Vec<(WriterCwd, String)> {
+        self.lock()
+            .entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.cwd.clone(),
+                    format!(
+                        "op={}, change_id={}, phase={:?}, pgids={:?}",
+                        entry.operation.as_deref().unwrap_or("unknown"),
+                        entry.change_id.as_deref().unwrap_or("none"),
+                        entry.phase,
+                        entry.unproven_pids
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether this scope can never account for a writer again: admission is
+    /// closed and every registration was released with confirmed quiescence.
+    fn is_resolved(&self) -> bool {
+        let state = self.lock();
+        state.closed && state.entries.is_empty()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ScopeState> {
@@ -254,6 +295,18 @@ impl RunCommandScope {
             .entries
             .values()
             .filter(|entry| entry.phase.is_active())
+            .count()
+    }
+
+    /// Registrations past their retry delay and parked before the next spawn
+    /// (stagger wait or admission). Lets a test that holds the stagger lock
+    /// know the runner reached the spawn boundary without a timing guess.
+    #[cfg(test)]
+    pub(crate) fn waiting_to_spawn_for_test(&self) -> usize {
+        self.lock()
+            .entries
+            .values()
+            .filter(|entry| entry.phase == ExecutionPhase::WaitingToSpawn)
             .count()
     }
 
@@ -367,7 +420,15 @@ impl RunCommandScope {
     ///
     /// Returns `None` when the scope is already closing, which is what refuses
     /// a command that raced shutdown before anything was launched.
-    fn register(&self, operation: Option<&str>, change_id: Option<&str>) -> Option<ScopeExecution> {
+    fn register(
+        &self,
+        operation: Option<&str>,
+        change_id: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Option<ScopeExecution> {
+        // Canonicalized outside the lock: it touches the filesystem, and a
+        // failure is recorded as `Unknown`, never as "no cwd".
+        let cwd = WriterCwd::resolve(cwd);
         let mut state = self.lock();
         if state.closed {
             return None;
@@ -379,6 +440,7 @@ impl RunCommandScope {
             ScopeEntry {
                 operation: operation.map(|s| s.to_string()),
                 change_id: change_id.map(|s| s.to_string()),
+                cwd,
                 phase: ExecutionPhase::WaitingToSpawn,
                 unproven_pids: Vec::new(),
                 detail: None,
@@ -557,6 +619,571 @@ impl RunCommandScopeCleanup {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Managed writer coverage
+// ---------------------------------------------------------------------------
+
+/// Longest coverage diagnostic published to a client.
+pub const MAX_WRITER_COVERAGE_DETAIL_BYTES: usize = 512;
+
+/// Where one owner-managed writer runs, recorded before it is spawned.
+///
+/// Never "absent": a spawn without a working directory runs in the owner's own
+/// directory, and a directory that could not be canonicalized is a binding
+/// nobody can decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterCwd {
+    /// Canonical working directory.
+    Known(std::path::PathBuf),
+    /// No `cwd` was given, so the child inherits the owner's working directory.
+    OwnerCwd,
+    /// The `cwd` could not be canonicalized; the reason never names the path.
+    Unknown(String),
+}
+
+impl WriterCwd {
+    /// Canonicalize the `cwd` a spawn is about to use.
+    ///
+    /// The spawn itself keeps the path it was given; only the binding is
+    /// canonical, so a symlink alias of a worktree compares equal to the real
+    /// directory on both sides.
+    pub fn resolve(cwd: Option<&Path>) -> Self {
+        match cwd {
+            None => Self::OwnerCwd,
+            Some(path) => match std::fs::canonicalize(path) {
+                Ok(canonical) => Self::Known(canonical),
+                Err(error) => Self::Unknown(format!(
+                    "the working directory could not be canonicalized ({})",
+                    error.kind()
+                )),
+            },
+        }
+    }
+}
+
+/// Whether owner-managed writers may be writing under one root.
+///
+/// A tri-state on purpose: "nothing is bound here" and "this owner cannot
+/// prove nothing is" are different answers, and a boolean would collapse the
+/// second into the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterCoverage {
+    /// Every owner-managed writer is accounted for and none is bound to the root.
+    Clear,
+    /// At least one accounted writer is bound to the root or below it.
+    Busy {
+        /// Bounded diagnostic naming the writer; never parsed by clients.
+        detail: String,
+    },
+    /// Coverage is incomplete: some writer's binding cannot be decided.
+    Unknown {
+        /// Bounded diagnostic saying why; never parsed by clients.
+        detail: String,
+    },
+}
+
+impl WriterCoverage {
+    /// The bounded diagnostic, when there is one.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Clear => None,
+            Self::Busy { detail } | Self::Unknown { detail } => Some(detail),
+        }
+    }
+}
+
+/// Truncate a diagnostic to [`MAX_WRITER_COVERAGE_DETAIL_BYTES`] on a char boundary.
+pub fn bound_coverage_detail(detail: &str) -> String {
+    if detail.len() <= MAX_WRITER_COVERAGE_DETAIL_BYTES {
+        return detail.to_string();
+    }
+    let mut end = MAX_WRITER_COVERAGE_DETAIL_BYTES - 3;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &detail[..end])
+}
+
+#[derive(Debug, Clone)]
+enum LeaseState {
+    /// The direct child has not been reaped yet.
+    Running,
+    /// The direct child is gone, but quiescence of its group was not proven.
+    ///
+    /// No timer expires this. It resolves only when every recorded group is
+    /// positively observed empty.
+    Unresolved { detail: String },
+}
+
+/// What the runner positively knows about a lease's latest spawn.
+///
+/// Only `NotAttempted` and `Failed` prove that the latest spawn created no
+/// writer, and only for a lease that never bound a process group: a retry
+/// whose spawn failed still accounts for the earlier attempt's group. An
+/// attempted spawn whose result was never reported, and a spawn without a
+/// process-group identity, are retained: nothing can prove such a writer
+/// quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnOutcome {
+    /// `Command::spawn` was not called.
+    NotAttempted,
+    /// `Command::spawn` was called and its result was never reported.
+    Attempted,
+    /// `Command::spawn` returned an error: no process exists.
+    Failed,
+    /// A process was spawned; `pgid` is its owned process group, if known.
+    Spawned { pgid: Option<u32> },
+}
+
+impl SpawnOutcome {
+    /// Whether the latest spawn positively created no process.
+    fn created_no_process(self) -> bool {
+        matches!(self, SpawnOutcome::NotAttempted | SpawnOutcome::Failed)
+    }
+
+    /// The typed detail of a retained lease whose writer has no group to probe.
+    fn identityless_detail(self) -> Option<&'static str> {
+        match self {
+            SpawnOutcome::Attempted => {
+                Some("spawn was attempted and its outcome was never reported")
+            }
+            SpawnOutcome::Spawned { pgid: None } => {
+                Some("spawned without a process-group identity")
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LeaseEntry {
+    cwd: WriterCwd,
+    operation: String,
+    /// Process groups this lease's spawn owns.
+    pgids: Vec<u32>,
+    /// What is known about the spawn this lease accounts for.
+    spawn: SpawnOutcome,
+    state: LeaseState,
+}
+
+impl LeaseEntry {
+    /// Whether this lease positively accounts for no writer: its latest spawn
+    /// created no process and no earlier attempt bound a process group.
+    fn proves_no_writer(&self) -> bool {
+        self.spawn.created_no_process() && self.pgids.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct LedgerState {
+    scopes: Vec<RunCommandScope>,
+    next_lease: u64,
+    leases: std::collections::BTreeMap<u64, LeaseEntry>,
+}
+
+struct LedgerInner {
+    /// The owner's own working directory, canonicalized once at creation.
+    owner_cwd: std::result::Result<std::path::PathBuf, String>,
+    state: std::sync::Mutex<LedgerState>,
+}
+
+/// Process-local account of every writer this owner can launch.
+///
+/// The union of every run scope the owner ever installed — kept until it is
+/// resolved by confirmed quiescence, never merely because a later run replaced
+/// it — and every unscoped spawn, each bound to its canonical working
+/// directory. It lives exactly as long as the owner process, is never written
+/// anywhere, and is consulted only by the remote text editor's eligibility.
+#[derive(Clone)]
+pub struct ManagedWriterLedger {
+    inner: Arc<LedgerInner>,
+}
+
+static PROCESS_WRITER_LEDGER: std::sync::OnceLock<ManagedWriterLedger> = std::sync::OnceLock::new();
+
+/// The ledger the owner process installed, if it installed one.
+///
+/// Only the owner entry points install it, so a test binary never shares one
+/// accidentally; tests attach their own ledger explicitly.
+pub fn process_writer_ledger() -> Option<ManagedWriterLedger> {
+    PROCESS_WRITER_LEDGER.get().cloned()
+}
+
+impl Default for ManagedWriterLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedWriterLedger {
+    /// An empty ledger whose owner directory is this process's working directory.
+    pub fn new() -> Self {
+        let owner_cwd = std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| {
+                format!(
+                    "the owner working directory could not be canonicalized ({})",
+                    error.kind()
+                )
+            });
+        Self::with_owner_cwd(owner_cwd)
+    }
+
+    /// An empty ledger with an explicit owner-directory observation.
+    pub fn with_owner_cwd(owner_cwd: std::result::Result<std::path::PathBuf, String>) -> Self {
+        Self {
+            inner: Arc::new(LedgerInner {
+                owner_cwd,
+                state: std::sync::Mutex::new(LedgerState::default()),
+            }),
+        }
+    }
+
+    /// The one ledger of this owner process, created and installed on first use.
+    ///
+    /// Called by the TUI and `cflx run` entry points before any run starts, so
+    /// every scope and unscoped runner the process later builds reports into it.
+    pub fn for_owner_process() -> Self {
+        PROCESS_WRITER_LEDGER.get_or_init(Self::new).clone()
+    }
+
+    /// Whether both handles are the same ledger.
+    #[allow(dead_code)] // Read by ledger-wiring coverage, not by the binary.
+    pub fn is_same(&self, other: &ManagedWriterLedger) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Account for a run scope. Idempotent per scope identity.
+    pub fn register_scope(&self, scope: &RunCommandScope) {
+        let mut state = self.lock();
+        if !state.scopes.iter().any(|known| known.is_same(scope)) {
+            state.scopes.push(scope.clone());
+        }
+    }
+
+    /// Take a lease for one unscoped spawn, before `Command::spawn`.
+    pub fn take_lease(&self, operation: &str, cwd: Option<&Path>) -> WriterLease {
+        let cwd = WriterCwd::resolve(cwd);
+        let mut state = self.lock();
+        state.next_lease += 1;
+        let id = state.next_lease;
+        state.leases.insert(
+            id,
+            LeaseEntry {
+                cwd,
+                operation: operation.to_string(),
+                pgids: Vec::new(),
+                spawn: SpawnOutcome::NotAttempted,
+                state: LeaseState::Running,
+            },
+        );
+        WriterLease {
+            ledger: self.clone(),
+            id,
+            settled: false,
+        }
+    }
+
+    fn update_lease(&self, id: u64, update: impl FnOnce(&mut LeaseEntry)) {
+        if let Some(entry) = self.lock().leases.get_mut(&id) {
+            update(entry);
+        }
+    }
+
+    fn remove_lease(&self, id: u64) {
+        self.lock().leases.remove(&id);
+    }
+
+    /// Classify one root against every accounted writer.
+    ///
+    /// `Unknown` wins over `Busy`, and `Busy` over `Clear`. Containment is
+    /// component-wise on canonical paths and checked in both directions (see
+    /// [`bind_writer`]), so `/w/alpha2` is never bound to `/w/alpha`.
+    pub fn coverage_under(&self, root: &Path) -> WriterCoverage {
+        let root = match std::fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(error) => {
+                return WriterCoverage::Unknown {
+                    detail: format!(
+                        "the target root could not be canonicalized ({})",
+                        error.kind()
+                    ),
+                }
+            }
+        };
+
+        let (scopes, leases) = {
+            let mut state = self.lock();
+            state.scopes.retain(|scope| !scope.is_resolved());
+            (
+                state.scopes.clone(),
+                state
+                    .leases
+                    .iter()
+                    .map(|(id, entry)| (*id, entry.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let owner_cwd = &self.inner.owner_cwd;
+        let mut unknown: Vec<String> = Vec::new();
+        let mut busy: Vec<String> = Vec::new();
+        let mut account =
+            |cwd: &WriterCwd, description: String| match bind_writer(cwd, owner_cwd, &root) {
+                WriterBinding::Elsewhere => {}
+                WriterBinding::Under => busy.push(description),
+                WriterBinding::Undecidable(reason) => {
+                    unknown.push(format!("{description}: {reason}"))
+                }
+            };
+
+        for scope in &scopes {
+            for (cwd, description) in scope.writer_bindings() {
+                account(&cwd, format!("run-scoped writer ({description})"));
+            }
+        }
+
+        let mut unresolved: Vec<String> = Vec::new();
+        for (id, lease) in leases {
+            match &lease.state {
+                LeaseState::Running => account(
+                    &lease.cwd,
+                    format!(
+                        "unscoped writer (op={}, pgids={:?}) is running",
+                        lease.operation, lease.pgids
+                    ),
+                ),
+                LeaseState::Unresolved { detail } => {
+                    // Positive quiescence is the only way out: every recorded
+                    // group must be observed empty right now.
+                    let proven = !lease.pgids.is_empty()
+                        && lease.pgids.iter().all(|pgid| {
+                            crate::process_manager::process_group_is_empty(*pgid) == Some(true)
+                        });
+                    if proven {
+                        self.remove_lease(id);
+                    } else {
+                        unresolved.push(format!(
+                            "unscoped writer (op={}, pgids={:?}) is unresolved: {detail}",
+                            lease.operation, lease.pgids
+                        ));
+                    }
+                }
+            }
+        }
+        unknown.extend(unresolved);
+
+        if !unknown.is_empty() {
+            WriterCoverage::Unknown {
+                detail: bound_coverage_detail(&format!(
+                    "managed writer coverage is unknown: {}",
+                    unknown.join("; ")
+                )),
+            }
+        } else if !busy.is_empty() {
+            WriterCoverage::Busy {
+                detail: bound_coverage_detail(&format!(
+                    "a managed writer is bound to this root: {}",
+                    busy.join("; ")
+                )),
+            }
+        } else {
+            WriterCoverage::Clear
+        }
+    }
+}
+
+/// How one writer's working directory relates to a root.
+enum WriterBinding {
+    /// Not under the root.
+    Elsewhere,
+    /// Under the root or equal to it.
+    Under,
+    /// The binding cannot be decided.
+    Undecidable(String),
+}
+
+/// Bind a writer to a root by component-wise containment, in both directions.
+///
+/// A writer below the root writes into it, and a writer *above* the root —
+/// one running in the project root, say — can write into every directory
+/// beneath its own, the root included. Both are `Under`; only disjoint paths
+/// are `Elsewhere`, so `/w/alpha2` never binds to `/w/alpha`.
+fn bind_writer(
+    cwd: &WriterCwd,
+    owner_cwd: &std::result::Result<std::path::PathBuf, String>,
+    root: &Path,
+) -> WriterBinding {
+    let overlaps = |path: &Path| path.starts_with(root) || root.starts_with(path);
+    match cwd {
+        WriterCwd::Known(path) if overlaps(path) => WriterBinding::Under,
+        WriterCwd::Known(_) => WriterBinding::Elsewhere,
+        WriterCwd::OwnerCwd => match owner_cwd {
+            Ok(owner) if overlaps(owner) => WriterBinding::Under,
+            Ok(_) => WriterBinding::Elsewhere,
+            Err(reason) => WriterBinding::Undecidable(reason.clone()),
+        },
+        WriterCwd::Unknown(reason) => WriterBinding::Undecidable(reason.clone()),
+    }
+}
+
+/// One unscoped spawn's account in a [`ManagedWriterLedger`].
+///
+/// Released only by positive proof: a reaped direct child *and* an empty owned
+/// process group. Reaping a shell alone is not that proof, a handle dropped
+/// without it retains the lease as unresolved, and no timer ever expires one.
+pub struct WriterLease {
+    ledger: ManagedWriterLedger,
+    id: u64,
+    settled: bool,
+}
+
+impl WriterLease {
+    /// Record that `Command::spawn` is about to be called.
+    pub(crate) fn mark_attempted(&self) {
+        self.ledger
+            .update_lease(self.id, |entry| entry.spawn = SpawnOutcome::Attempted);
+    }
+
+    /// Record that `Command::spawn` returned an error: no process exists.
+    pub(crate) fn mark_failed(&self) {
+        self.ledger.update_lease(self.id, |entry| {
+            if entry.spawn == SpawnOutcome::Attempted {
+                entry.spawn = SpawnOutcome::Failed;
+            }
+        });
+    }
+
+    /// Record the process group the spawn now owns.
+    ///
+    /// `0` is a spawn without a process-group identity: it is recorded as
+    /// spawned, and nothing can ever prove that writer quiescent.
+    pub(crate) fn bind_pgid(&self, pgid: u32) {
+        self.ledger.update_lease(self.id, |entry| {
+            if pgid == 0 {
+                if !matches!(entry.spawn, SpawnOutcome::Spawned { pgid: Some(_) }) {
+                    entry.spawn = SpawnOutcome::Spawned { pgid: None };
+                }
+                return;
+            }
+            entry.spawn = SpawnOutcome::Spawned { pgid: Some(pgid) };
+            if !entry.pgids.contains(&pgid) {
+                entry.pgids.push(pgid);
+            }
+        });
+    }
+
+    /// Nothing was spawned after all: the lease accounts for no writer.
+    ///
+    /// Honoured only while the outcome proves it (`NotAttempted` or `Failed`,
+    /// with no group ever bound). After an attempted or successful spawn this
+    /// is a no-op that leaves the lease accounting for its writer.
+    pub(crate) fn release_unspawned(self) {
+        if self.proves_no_writer() {
+            let mut lease = self;
+            lease.settled = true;
+            lease.ledger.remove_lease(lease.id);
+        }
+    }
+
+    fn proves_no_writer(&self) -> bool {
+        self.ledger
+            .lock()
+            .leases
+            .get(&self.id)
+            .is_some_and(LeaseEntry::proves_no_writer)
+    }
+
+    /// Keep accounting for the writer: the caller lost the proof it needed.
+    fn retain_unresolved(mut self, detail: &str) {
+        self.settled = true;
+        let detail = detail.to_string();
+        self.ledger.update_lease(self.id, |entry| {
+            entry.state = LeaseState::Unresolved { detail }
+        });
+    }
+
+    /// The direct child was reaped; release only when every owned group is
+    /// positively observed empty, otherwise retain the lease as unresolved.
+    fn settle_after_reap(mut self) {
+        self.settled = true;
+        let Some((proves_no_writer, spawn, pgids)) = self
+            .ledger
+            .lock()
+            .leases
+            .get(&self.id)
+            .map(|entry| (entry.proves_no_writer(), entry.spawn, entry.pgids.clone()))
+        else {
+            return;
+        };
+        if proves_no_writer {
+            // The runner positively knows no process exists.
+            self.ledger.remove_lease(self.id);
+            return;
+        }
+        if let Some(detail) = spawn.identityless_detail() {
+            // A writer may exist and has no group to probe: retain it.
+            self.ledger.update_lease(self.id, |entry| {
+                entry.state = LeaseState::Unresolved {
+                    detail: detail.to_string(),
+                }
+            });
+            return;
+        }
+        if pgids
+            .iter()
+            .all(|pgid| crate::process_manager::process_group_is_empty(*pgid) == Some(true))
+        {
+            self.ledger.remove_lease(self.id);
+        } else {
+            self.ledger.update_lease(self.id, |entry| {
+                entry.state = LeaseState::Unresolved {
+                    detail: "the direct child was reaped but its process group was not \
+                             observed empty"
+                        .to_string(),
+                }
+            });
+        }
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // A handle dropped or a wait that failed proved nothing about the
+        // writer: keep accounting for it, unless the runner positively knows
+        // no process was ever created.
+        let ledger = self.ledger.clone();
+        let id = self.id;
+        let mut release = false;
+        ledger.update_lease(id, |entry| {
+            if entry.proves_no_writer() {
+                release = true;
+                return;
+            }
+            let detail = entry
+                .spawn
+                .identityless_detail()
+                .unwrap_or("the spawn's handle was released without a reap");
+            entry.state = LeaseState::Unresolved {
+                detail: detail.to_string(),
+            }
+        });
+        if release {
+            ledger.remove_lease(id);
+        }
+    }
+}
+
 /// A run-owned execution reserved in a [`RunCommandScope`].
 ///
 /// Held by the detached runner task for its whole life. Dropping it without
@@ -664,6 +1291,29 @@ impl ScopeTestRegistration {
     pub(crate) fn release_confirmed(self) {
         self.0.finish();
     }
+
+    /// Drive the registration to `UnconfirmedRetained` the way a runner task
+    /// that ended without proving quiescence leaves it, keeping the handle so
+    /// a test can later supply the proof.
+    pub(crate) fn retain_unconfirmed(&self) {
+        self.0
+            .scope
+            .set_phase(self.0.id, ExecutionPhase::UnconfirmedRetained);
+    }
+
+    /// Record confirmed quiescence for `pid`, then release: the path a runner
+    /// task takes when its cleanup proved the owned group empty.
+    pub(crate) fn release_proven(self, pid: u32) {
+        self.0.record_cleanup(
+            pid,
+            &ProcessGroupCleanupReport::for_test(
+                crate::process_manager::ProcessGroupQuiescence::Confirmed,
+                Some(pid),
+                "test proved the group empty",
+            ),
+        );
+        self.0.finish();
+    }
 }
 
 #[cfg(test)]
@@ -674,7 +1324,7 @@ impl RunCommandScope {
         operation: &str,
         change_id: Option<&str>,
     ) -> Option<ScopeTestRegistration> {
-        self.register(Some(operation), change_id)
+        self.register(Some(operation), change_id, None)
             .map(ScopeTestRegistration)
     }
 
@@ -685,8 +1335,30 @@ impl RunCommandScope {
         change_id: Option<&str>,
         pid: u32,
     ) -> ScopeTestRegistration {
+        self.register_unproven_in_for_test(operation, change_id, pid, None)
+    }
+
+    /// Reserve an execution with any operation/change shape, spawned in `cwd`.
+    pub(crate) fn register_in_for_test(
+        &self,
+        operation: Option<&str>,
+        change_id: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Option<ScopeTestRegistration> {
+        self.register(operation, change_id, cwd)
+            .map(ScopeTestRegistration)
+    }
+
+    /// [`Self::register_unproven_for_test`] for an execution spawned in `cwd`.
+    pub(crate) fn register_unproven_in_for_test(
+        &self,
+        operation: &str,
+        change_id: Option<&str>,
+        pid: u32,
+        cwd: Option<&Path>,
+    ) -> ScopeTestRegistration {
         let execution = self
-            .register(Some(operation), change_id)
+            .register(Some(operation), change_id, cwd)
             .expect("an open scope admits the registration");
         {
             let mut state = self.lock();
@@ -730,6 +1402,241 @@ pub enum OutputLine {
     Stderr(String),
 }
 
+/// Why the retry loop scheduled another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The command exited non-zero and the retry policy admitted another attempt.
+    Crash,
+    /// The inactivity timeout terminated the attempt and its retry budget remains.
+    InactivityTimeout,
+}
+
+/// One fact the retry loop itself observed, as opposed to a line the child wrote.
+///
+/// Published only by [`AiCommandRunner::execute_streaming_with_retry_observed`],
+/// on a channel of its own, so no child output can forge one. The text entry
+/// point formats the same facts as the stderr lines it always emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerNotice {
+    /// Another attempt was scheduled; it starts only after the delay, if admitted.
+    RetryScheduled {
+        next_attempt: u32,
+        /// The configured retry bound for `cause`, as the text form prints it.
+        max_attempts: u32,
+        cause: RetryCause,
+        delay_ms: u64,
+    },
+    /// `attempt` was spawned successfully.
+    AttemptStarted { attempt: u32 },
+    /// The inactivity timeout terminated `attempt`.
+    InactivityTerminated { attempt: u32, timeout_secs: u64 },
+    /// The absolute runtime limit terminated `attempt`.
+    RuntimeLimitReached { attempt: u32 },
+    /// `attempt` could not be launched at `stage`.
+    LaunchFailed { attempt: u32, stage: &'static str },
+    /// Scope shutdown refused the execution at `stage`.
+    ShutdownRefused { stage: &'static str },
+    /// The owned process group could not be proven empty.
+    ProcessGroupCleanupUnconfirmed { pgid: u32, force_killed: bool },
+    /// The leader of `attempt` was reaped with this status.
+    LeaderReaped {
+        attempt: u32,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// The leader of `attempt` was not reaped; its status is unknown.
+    LeaderNotReaped { attempt: u32 },
+    /// The handle's stop arrived before `next_attempt` was spawned, so it never
+    /// was. `stage` is `retry` (before or during the retry delay), `stagger`
+    /// (during the stagger wait), or `spawn` (at spawn admission).
+    StopRefusedAttempt {
+        next_attempt: u32,
+        stage: &'static str,
+    },
+}
+
+/// How the retry loop treats the handle's cancellation while no child runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAdmission {
+    /// The cancel is observed by the next child monitoring loop, so a stop
+    /// during a delay cancels the *next* attempt after it spawned. Every
+    /// text-emitting caller keeps this.
+    SpawnThenCancel,
+    /// A stop received before the next spawn refuses that spawn.
+    RefuseBeforeSpawn,
+}
+
+/// Verdict of a cancellation checkpoint at a spawn boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelCheck {
+    Proceed,
+    Refuse,
+}
+
+/// Non-blocking read of the handle's cancellation at a spawn boundary.
+///
+/// A pending receiver is left armed and nothing is consumed. A received stop
+/// refuses; a dropped handle refuses a scoped runner (losing the handle is
+/// never permission to detach) and is a neutralised no-op for an unscoped one
+/// — the same rule the child monitoring loops apply. Once observed, the
+/// receiver is neutralised, so a later call never re-reads it.
+fn cancel_check(
+    cancel_rx_opt: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cancel_observed: &mut bool,
+    scoped: bool,
+) -> CancelCheck {
+    use tokio::sync::oneshot::error::TryRecvError;
+    if *cancel_observed {
+        return CancelCheck::Proceed;
+    }
+    let Some(rx) = cancel_rx_opt.as_mut() else {
+        return CancelCheck::Proceed;
+    };
+    let stopped = match rx.try_recv() {
+        Err(TryRecvError::Empty) => return CancelCheck::Proceed,
+        Ok(()) => true,
+        Err(TryRecvError::Closed) => scoped,
+    };
+    *cancel_observed = true;
+    *cancel_rx_opt = None;
+    if stopped {
+        CancelCheck::Refuse
+    } else {
+        CancelCheck::Proceed
+    }
+}
+
+/// Resolve when `wait` completes, or earlier with `Refuse` when the handle was
+/// cancelled (or dropped, for a scoped runner). Biased to the cancel.
+///
+/// The receiver is polled by reference, so it is not consumed unless it
+/// yields. A dropped handle on an unscoped runner neutralises the receiver and
+/// keeps awaiting `wait`: it never shortens the wait.
+async fn race_with_cancel<F: std::future::Future<Output = ()>>(
+    wait: F,
+    cancel_rx_opt: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cancel_observed: &mut bool,
+    scoped: bool,
+) -> CancelCheck {
+    tokio::pin!(wait);
+    if !*cancel_observed && cancel_rx_opt.is_some() {
+        tokio::select! {
+            biased;
+            result = async {
+                match cancel_rx_opt {
+                    Some(ref mut rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                *cancel_observed = true;
+                *cancel_rx_opt = None;
+                if result.is_ok() || scoped {
+                    return CancelCheck::Refuse;
+                }
+            }
+            _ = &mut wait => return CancelCheck::Proceed,
+        }
+    }
+    wait.await;
+    CancelCheck::Proceed
+}
+
+/// Publish the refusal of `next_attempt` at `stage`. Typed only: the text
+/// sink never runs under [`StopAdmission::RefuseBeforeSpawn`].
+async fn emit_stop_refused(
+    sink: &NoticeSink,
+    out_tx: &mpsc::Sender<OutputLine>,
+    next_attempt: u32,
+    stage: &'static str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+) {
+    warn!(
+        op = ?operation_type,
+        change_id = ?change_id,
+        next_attempt,
+        stage,
+        "Stop received before the next attempt spawned; refusing it"
+    );
+    sink.emit(
+        out_tx,
+        RunnerNotice::StopRefusedAttempt {
+            next_attempt,
+            stage,
+        },
+        None,
+    )
+    .await;
+}
+
+impl RunnerNotice {
+    /// The reaped notice for one attempt's real wait status.
+    fn reaped(attempt: u32, status: &std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self::LeaderReaped {
+            attempt,
+            exit_code: status.code(),
+            signal,
+        }
+    }
+
+    /// The leader notice for a termination that waited for the leader.
+    fn from_termination(
+        attempt: u32,
+        outcome: &std::io::Result<crate::process_manager::TerminationOutcome>,
+    ) -> Self {
+        use crate::process_manager::TerminationOutcome;
+        match outcome {
+            Ok(TerminationOutcome::Exited(status))
+            | Ok(TerminationOutcome::ForceKilled(status)) => Self::reaped(attempt, status),
+            Ok(TerminationOutcome::TimedOut) | Err(_) => Self::LeaderNotReaped { attempt },
+        }
+    }
+}
+
+/// Where the retry loop's own notices go.
+#[derive(Clone)]
+enum NoticeSink {
+    /// The existing stderr lines on the output channel, byte for byte.
+    Text,
+    /// Typed notices on their own channel; nothing runner-generated reaches output.
+    Typed(mpsc::UnboundedSender<RunnerNotice>),
+}
+
+impl NoticeSink {
+    /// Publish `notice`; in text mode, `text` is the line that carries it.
+    async fn emit(
+        &self,
+        out_tx: &mpsc::Sender<OutputLine>,
+        notice: RunnerNotice,
+        text: Option<String>,
+    ) {
+        match self {
+            Self::Text => {
+                if let Some(text) = text {
+                    let _ = out_tx.send(OutputLine::Stderr(text)).await;
+                }
+            }
+            Self::Typed(tx) => {
+                let _ = tx.send(notice);
+            }
+        }
+    }
+
+    /// A line with no typed equivalent: emitted in text mode only.
+    async fn text_only(&self, out_tx: &mpsc::Sender<OutputLine>, text: String) {
+        if matches!(self, Self::Text) {
+            let _ = out_tx.send(OutputLine::Stderr(text)).await;
+        }
+    }
+}
+
 /// Common AI command runner with shared stagger state.
 ///
 /// This runner wraps CommandQueue and provides streaming execution
@@ -758,6 +1665,11 @@ pub struct AiCommandRunner {
     /// TUI's standalone worktree command and in-crate tests): such a command is
     /// deliberately not attached to a later run's scope.
     run_command_scope: Option<RunCommandScope>,
+    /// Ledger an unscoped spawn takes its writer lease from.
+    ///
+    /// `None` falls back to the ledger the owner process installed, so a runner
+    /// built anywhere in an owner is covered without being handed one.
+    writer_ledger: Option<ManagedWriterLedger>,
 }
 
 impl AiCommandRunner {
@@ -778,6 +1690,7 @@ impl AiCommandRunner {
             process_group_cleanup_timeout_ms: DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS,
             command_envs: HashMap::new(),
             run_command_scope: None,
+            writer_ledger: None,
         }
     }
 
@@ -817,6 +1730,16 @@ impl AiCommandRunner {
     /// Bind (or rebind) this runner to an invocation scope.
     pub fn set_run_command_scope(&mut self, scope: RunCommandScope) {
         self.run_command_scope = Some(scope);
+    }
+
+    /// Bind the ledger this runner's unscoped spawns lease from.
+    pub fn set_writer_ledger(&mut self, ledger: ManagedWriterLedger) {
+        self.writer_ledger = Some(ledger);
+    }
+
+    /// The explicit ledger, else the one this owner process installed.
+    fn effective_writer_ledger(&self) -> Option<ManagedWriterLedger> {
+        self.writer_ledger.clone().or_else(process_writer_ledger)
     }
 
     pub fn set_command_envs(&mut self, envs: HashMap<String, String>) {
@@ -898,17 +1821,76 @@ impl AiCommandRunner {
         operation_type: Option<&str>,
         change_id: Option<&str>,
     ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
+        self.execute_streaming_with_retry_sink(
+            command,
+            cwd,
+            operation_type,
+            change_id,
+            NoticeSink::Text,
+            StopAdmission::SpawnThenCancel,
+        )
+        .await
+    }
+
+    /// [`Self::execute_streaming_with_retry`] with the runner's own notices on
+    /// a typed channel.
+    ///
+    /// The output receiver carries only what the child wrote; every retry,
+    /// launch-failure, shutdown, limit, cleanup, and leader-reap fact is a
+    /// [`RunnerNotice`] on the third receiver instead. The notice channel
+    /// closes when the runner task ends, after the last notice. Behaviour is
+    /// otherwise identical, retry policy and escalation included, except that
+    /// a `terminate()` received while no child runs — before or during a retry
+    /// delay, during the stagger wait, or at spawn admission — refuses the next
+    /// attempt ([`RunnerNotice::StopRefusedAttempt`]) instead of spawning it
+    /// and cancelling it afterwards.
+    pub async fn execute_streaming_with_retry_observed(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        mpsc::UnboundedReceiver<RunnerNotice>,
+    )> {
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let (handle, out_rx) = self
+            .execute_streaming_with_retry_sink(
+                command,
+                cwd,
+                operation_type,
+                change_id,
+                NoticeSink::Typed(notice_tx),
+                StopAdmission::RefuseBeforeSpawn,
+            )
+            .await?;
+        Ok((handle, out_rx, notice_rx))
+    }
+
+    async fn execute_streaming_with_retry_sink(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
+        sink: NoticeSink,
+        stop_admission: StopAdmission,
+    ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
+        let refuse_before_spawn = stop_admission == StopAdmission::RefuseBeforeSpawn;
         // Admission is reserved before anything is launched. A scope that is
         // already closing refuses the execution outright, so a command that
         // raced shutdown never reaches stagger, retry, or `Command::spawn`.
         let scope_execution = match &self.run_command_scope {
-            Some(scope) => match scope.register(operation_type, change_id) {
+            Some(scope) => match scope.register(operation_type, change_id, cwd) {
                 Some(execution) => Some(execution),
                 None => {
                     return Ok(refused_after_shutdown(
                         "run command admission is closed",
                         operation_type,
                         change_id,
+                        &sink,
                     ));
                 }
             },
@@ -951,6 +1933,15 @@ impl AiCommandRunner {
         let strict_process_cleanup = self.strict_process_cleanup;
         let cleanup_timeout_ms = self.process_group_cleanup_timeout_ms;
         let command_envs = self.command_envs.clone();
+        // An unscoped spawn is invisible to every run scope, so it is accounted
+        // for by a lease instead. Taken before the task exists, so even a spawn
+        // parked in stagger is already covered.
+        let writer_lease = match (&scope_execution, self.effective_writer_ledger()) {
+            (None, Some(ledger)) => {
+                Some(ledger.take_lease(operation_type.unwrap_or("unscoped"), cwd))
+            }
+            _ => None,
+        };
 
         // Spawn the background retry task. It owns the real child processes and responds
         // to the cancel signal by terminating the current process group via SIGTERM/SIGKILL.
@@ -961,6 +1952,7 @@ impl AiCommandRunner {
             let scope_execution = scope_execution;
             let scope_cancel = scope_execution.as_ref().map(ScopeExecution::cancel_token);
             let scoped = scope_execution.is_some();
+            let mut writer_lease = writer_lease;
 
             let max_retries = command_queue.config().max_retries;
             let retry_delay_ms = command_queue.config().retry_delay_ms;
@@ -1006,14 +1998,17 @@ impl AiCommandRunner {
                 // attempt, so the counter never advances after closure.
                 if let Some(execution) = &scope_execution {
                     if execution.is_shutdown() {
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::ShutdownRefused { stage: "retry" },
+                            Some(shutdown_refusal_line(
                                 "retry",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt + 1,
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                     execution.mark_waiting_to_spawn();
@@ -1052,26 +2047,86 @@ impl AiCommandRunner {
                 // admission and spawn inside one critical section. Checking
                 // admission before the delay would leave a window in which
                 // shutdown starts and a process is still launched.
-                command_queue.wait_for_stagger_slot().await;
+                if refuse_before_spawn {
+                    // Under RefuseBeforeSpawn the stagger wait races the
+                    // handle's stop, and the stop is read once more right
+                    // before admission. Dropping the stagger future mid-wait
+                    // releases the shared lock without claiming the slot.
+                    let refused_at = if race_with_cancel(
+                        command_queue.wait_for_stagger_slot(),
+                        &mut cancel_rx_opt,
+                        &mut cancel_observed,
+                        scoped,
+                    )
+                    .await
+                        == CancelCheck::Refuse
+                    {
+                        Some("stagger")
+                    } else if cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                        == CancelCheck::Refuse
+                    {
+                        Some("spawn")
+                    } else {
+                        None
+                    };
+                    if let Some(stage) = refused_at {
+                        emit_stop_refused(
+                            &sink,
+                            &out_tx,
+                            attempt,
+                            stage,
+                            operation_type_owned.as_deref(),
+                            change_id_owned.as_deref(),
+                        )
+                        .await;
+                        final_termination = CommandTermination::Cancelled;
+                        break 'retry;
+                    }
+                } else {
+                    command_queue.wait_for_stagger_slot().await;
+                }
                 let spawned = match &scope_execution {
                     Some(execution) => execution.admit_spawn(|| cmd.spawn()),
-                    None => Some(cmd.spawn()),
+                    None => {
+                        // Marked immediately before the call, so a task that
+                        // dies between spawn and its report keeps the lease.
+                        if let Some(lease) = &writer_lease {
+                            lease.mark_attempted();
+                        }
+                        let spawned = cmd.spawn();
+                        if let Some(lease) = &writer_lease {
+                            match &spawned {
+                                Ok(child) => lease.bind_pgid(child.id().unwrap_or(0)),
+                                Err(_) => lease.mark_failed(),
+                            }
+                        }
+                        Some(spawned)
+                    }
                 };
                 let child = match spawned {
                     None => {
                         // Admission closed between registration and spawn: the
                         // command body never runs.
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::ShutdownRefused { stage: "spawn" },
+                            Some(shutdown_refusal_line(
                                 "spawn",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
-                    Some(Ok(c)) => c,
+                    Some(Ok(c)) => {
+                        // Published only once the process exists, so a retry
+                        // that was scheduled but never spawned is not counted.
+                        sink.emit(&out_tx, RunnerNotice::AttemptStarted { attempt }, None)
+                            .await;
+                        c
+                    }
                     Some(Err(e)) => {
                         error!(
                             op = ?operation_type_owned,
@@ -1086,15 +2141,21 @@ impl AiCommandRunner {
                         // launch failure into Apply history, the Acceptance
                         // command diagnostic, and the cleanup-review diagnosis
                         // instead of leaving them with a bare exit code.
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(launch_failure_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::LaunchFailed {
+                                attempt,
+                                stage: "spawn",
+                            },
+                            Some(launch_failure_line(
                                 "spawn",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
                                 &e.to_string(),
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                 };
@@ -1108,15 +2169,21 @@ impl AiCommandRunner {
                             "Failed to wrap child in ManagedChild: {}",
                             e
                         );
-                        let _ = out_tx
-                            .send(OutputLine::Stderr(launch_failure_line(
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::LaunchFailed {
+                                attempt,
+                                stage: "process-manager",
+                            },
+                            Some(launch_failure_line(
                                 "process-manager",
                                 operation_type_owned.as_deref(),
                                 change_id_owned.as_deref(),
                                 attempt,
                                 &e.to_string(),
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         break 'retry;
                     }
                 };
@@ -1230,15 +2297,22 @@ impl AiCommandRunner {
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -1250,6 +2324,7 @@ impl AiCommandRunner {
                                     &mut termination_tx,
                                     CommandTermination::Cancelled,
                                 );
+                                settle_writer_lease(&mut writer_lease);
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1280,9 +2355,15 @@ impl AiCommandRunner {
                                     if let Some(execution) = &scope_execution {
                                         execution.mark_cleaning();
                                     }
-                                    let _ = managed_child
+                                    let outcome = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    sink.emit(
+                                        &out_tx,
+                                        RunnerNotice::from_termination(attempt, &outcome),
+                                        None,
+                                    )
+                                    .await;
                                     // Reaping the leader is not proof that the
                                     // group is empty: verify quiescence before
                                     // the caller may touch the worktree.
@@ -1292,6 +2373,7 @@ impl AiCommandRunner {
                                         operation_type_owned.as_deref(),
                                         change_id_owned.as_deref(),
                                         &out_tx,
+                                        &sink,
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
@@ -1303,6 +2385,7 @@ impl AiCommandRunner {
                                         &mut termination_tx,
                                         CommandTermination::Cancelled,
                                     );
+                                    settle_writer_lease(&mut writer_lease);
                                     let _ = status_tx.send(make_fail_status());
                                     if let Some(execution) = &scope_execution {
                                         execution.finish();
@@ -1327,26 +2410,36 @@ impl AiCommandRunner {
                                      (pid={}, limit={}s)",
                                     pid, max_runtime_secs
                                 );
-                                let _ = out_tx
-                                    .send(OutputLine::Stderr(runtime_limit_line(
-                                        max_runtime_secs,
-                                        operation_type_owned.as_deref(),
-                                        change_id_owned.as_deref(),
-                                        pid,
-                                    )))
-                                    .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::RuntimeLimitReached { attempt },
+                                    Some(runtime_limit_line(
+                                    max_runtime_secs,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    pid,
+                                    )),
+                                )
+                                .await;
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -1362,6 +2455,7 @@ impl AiCommandRunner {
                                     &mut termination_tx,
                                     CommandTermination::RuntimeLimit,
                                 );
+                                settle_writer_lease(&mut writer_lease);
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1423,7 +2517,15 @@ impl AiCommandRunner {
                                     pid,
                                     last_activity_age_secs,
                                 );
-                                let _ = out_tx.send(OutputLine::Stderr(timeout_msg)).await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::InactivityTerminated {
+                                        attempt,
+                                        timeout_secs: inactivity_timeout_secs,
+                                    },
+                                    Some(timeout_msg),
+                                )
+                                .await;
 
                                 tokio::time::sleep(Duration::from_secs(kill_grace_secs)).await;
                                 if managed_child.id().is_some() {
@@ -1516,15 +2618,22 @@ impl AiCommandRunner {
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -1536,6 +2645,7 @@ impl AiCommandRunner {
                                     &mut termination_tx,
                                     CommandTermination::Cancelled,
                                 );
+                                settle_writer_lease(&mut writer_lease);
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1562,15 +2672,22 @@ impl AiCommandRunner {
                                     if let Some(execution) = &scope_execution {
                                         execution.mark_cleaning();
                                     }
-                                    let _ = managed_child
+                                    let outcome = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    sink.emit(
+                                        &out_tx,
+                                        RunnerNotice::from_termination(attempt, &outcome),
+                                        None,
+                                    )
+                                    .await;
                                     let report = verify_owned_process_group(
                                         pid,
                                         cleanup_timeout_ms,
                                         operation_type_owned.as_deref(),
                                         change_id_owned.as_deref(),
                                         &out_tx,
+                                        &sink,
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
@@ -1582,6 +2699,7 @@ impl AiCommandRunner {
                                         &mut termination_tx,
                                         CommandTermination::Cancelled,
                                     );
+                                    settle_writer_lease(&mut writer_lease);
                                     let _ = status_tx.send(make_fail_status());
                                     if let Some(execution) = &scope_execution {
                                         execution.finish();
@@ -1604,26 +2722,36 @@ impl AiCommandRunner {
                                      (pid={}, limit={}s)",
                                     pid, max_runtime_secs
                                 );
-                                let _ = out_tx
-                                    .send(OutputLine::Stderr(runtime_limit_line(
-                                        max_runtime_secs,
-                                        operation_type_owned.as_deref(),
-                                        change_id_owned.as_deref(),
-                                        pid,
-                                    )))
-                                    .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::RuntimeLimitReached { attempt },
+                                    Some(runtime_limit_line(
+                                    max_runtime_secs,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    pid,
+                                    )),
+                                )
+                                .await;
                                 if let Some(execution) = &scope_execution {
                                     execution.mark_cleaning();
                                 }
-                                let _ = managed_child
+                                let outcome = managed_child
                                     .terminate_with_timeout(Duration::from_secs(5))
                                     .await;
+                                sink.emit(
+                                    &out_tx,
+                                    RunnerNotice::from_termination(attempt, &outcome),
+                                    None,
+                                )
+                                .await;
                                 let report = verify_owned_process_group(
                                     pid,
                                     cleanup_timeout_ms,
                                     operation_type_owned.as_deref(),
                                     change_id_owned.as_deref(),
                                     &out_tx,
+                                    &sink,
                                 )
                                 .await;
                                 pid_arc.store(0, Ordering::SeqCst);
@@ -1635,6 +2763,7 @@ impl AiCommandRunner {
                                     &mut termination_tx,
                                     CommandTermination::RuntimeLimit,
                                 );
+                                settle_writer_lease(&mut writer_lease);
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1666,9 +2795,13 @@ impl AiCommandRunner {
                             change_id = ?change_id_owned,
                             "Failed to wait for child process: {}", e
                         );
+                        sink.emit(&out_tx, RunnerNotice::LeaderNotReaped { attempt }, None)
+                            .await;
                         break 'retry;
                     }
                 };
+                sink.emit(&out_tx, RunnerNotice::reaped(attempt, &status), None)
+                    .await;
 
                 pid_arc.store(0, Ordering::SeqCst);
                 if let Some(execution) = &scope_execution {
@@ -1685,6 +2818,7 @@ impl AiCommandRunner {
                         operation_type_owned.as_deref(),
                         change_id_owned.as_deref(),
                         &out_tx,
+                        &sink,
                     )
                     .await
                 } else {
@@ -1725,6 +2859,22 @@ impl AiCommandRunner {
                         let _ = managed_child.terminate();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         let _ = managed_child.force_kill().await;
+                        if refuse_before_spawn
+                            && cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                                == CancelCheck::Refuse
+                        {
+                            emit_stop_refused(
+                                &sink,
+                                &out_tx,
+                                attempt + 1,
+                                "retry",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                            )
+                            .await;
+                            final_termination = CommandTermination::Cancelled;
+                            break 'retry;
+                        }
                         let retry_msg = format!(
                             "[Retry {}/{}] Inactivity timeout, retrying in {}ms \
                              (op={}, change_id={})",
@@ -1734,8 +2884,42 @@ impl AiCommandRunner {
                             operation_type_owned.as_deref().unwrap_or("unknown"),
                             change_id_owned.as_deref().unwrap_or("none"),
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(retry_msg)).await;
-                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::RetryScheduled {
+                                next_attempt: attempt + 1,
+                                max_attempts: inactivity_timeout_max_retries,
+                                cause: RetryCause::InactivityTimeout,
+                                delay_ms: retry_delay_ms,
+                            },
+                            Some(retry_msg),
+                        )
+                        .await;
+                        if refuse_before_spawn {
+                            if race_with_cancel(
+                                tokio::time::sleep(Duration::from_millis(retry_delay_ms)),
+                                &mut cancel_rx_opt,
+                                &mut cancel_observed,
+                                scoped,
+                            )
+                            .await
+                                == CancelCheck::Refuse
+                            {
+                                emit_stop_refused(
+                                    &sink,
+                                    &out_tx,
+                                    attempt + 1,
+                                    "retry",
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                )
+                                .await;
+                                final_termination = CommandTermination::Cancelled;
+                                break 'retry;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        }
                         continue 'retry;
                     }
 
@@ -1748,7 +2932,7 @@ impl AiCommandRunner {
                             operation_type_owned.as_deref().unwrap_or("unknown"),
                             change_id_owned.as_deref().unwrap_or("none"),
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(exhausted_msg)).await;
+                        sink.text_only(&out_tx, exhausted_msg).await;
                     }
 
                     // Do not fall through to the crash/pattern retry check.
@@ -1788,12 +2972,62 @@ impl AiCommandRunner {
                         let _ = managed_child.terminate();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         let _ = managed_child.force_kill().await;
+                        if refuse_before_spawn
+                            && cancel_check(&mut cancel_rx_opt, &mut cancel_observed, scoped)
+                                == CancelCheck::Refuse
+                        {
+                            emit_stop_refused(
+                                &sink,
+                                &out_tx,
+                                attempt + 1,
+                                "retry",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                            )
+                            .await;
+                            final_termination = CommandTermination::Cancelled;
+                            break 'retry;
+                        }
                         let retry_msg = format!(
                             "[Retry {}/{}] Command crashed, retrying in {}ms...",
                             attempt, max_retries, retry_delay_ms
                         );
-                        let _ = out_tx.send(OutputLine::Stderr(retry_msg)).await;
-                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        sink.emit(
+                            &out_tx,
+                            RunnerNotice::RetryScheduled {
+                                next_attempt: attempt + 1,
+                                max_attempts: max_retries,
+                                cause: RetryCause::Crash,
+                                delay_ms: retry_delay_ms,
+                            },
+                            Some(retry_msg),
+                        )
+                        .await;
+                        if refuse_before_spawn {
+                            if race_with_cancel(
+                                tokio::time::sleep(Duration::from_millis(retry_delay_ms)),
+                                &mut cancel_rx_opt,
+                                &mut cancel_observed,
+                                scoped,
+                            )
+                            .await
+                                == CancelCheck::Refuse
+                            {
+                                emit_stop_refused(
+                                    &sink,
+                                    &out_tx,
+                                    attempt + 1,
+                                    "retry",
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                )
+                                .await;
+                                final_termination = CommandTermination::Cancelled;
+                                break 'retry;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        }
                         continue 'retry;
                     }
                 }
@@ -1819,6 +3053,7 @@ impl AiCommandRunner {
             }
             publish_cleanup_report(&mut cleanup_tx, cleanup_report);
             publish_termination(&mut termination_tx, final_termination);
+            settle_writer_lease(&mut writer_lease);
             let _ = status_tx.send(final_status);
             // The registration is released only here: the runner task has
             // ended, and it disappears from the scope only when every owned
@@ -1864,9 +3099,20 @@ impl AiCommandRunner {
             "Executing shell command with stagger: sh -c {} (cwd: {:?})", command, cwd
         );
 
-        let child = self
+        // This path registers in no run scope, so the writer it launches is
+        // accounted for by a lease taken before the spawn.
+        let lease = self
+            .effective_writer_ledger()
+            .map(|ledger| ledger.take_lease("shell", cwd));
+
+        let attempted = lease.as_ref();
+        let spawned = self
             .command_queue
             .execute_with_stagger(move || {
+                // The closure runs immediately before `Command::spawn`.
+                if let Some(lease) = attempted {
+                    lease.mark_attempted();
+                }
                 let mut cmd = Command::new("sh");
                 cmd.arg("-c")
                     .arg(command)
@@ -1877,12 +3123,44 @@ impl AiCommandRunner {
                 if let Some(dir) = cwd {
                     cmd.current_dir(dir);
                 }
+                // Its own group, so quiescence of everything the shell started
+                // can be proven by membership rather than assumed from its exit.
+                crate::process_manager::configure_process_group(&mut cmd);
                 cmd
             })
-            .await?;
+            .await;
+        let child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                // Nothing was launched, so the lease goes back before the error
+                // is reported.
+                if let Some(lease) = lease {
+                    lease.mark_failed();
+                    lease.release_unspawned();
+                }
+                return Err(error);
+            }
+        };
+
+        // The group is recorded before anything else can fail, so even a lease
+        // dropped on an error path below stays resolvable by observation.
+        let lease = lease.and_then(|lease| match child.id() {
+            Some(pid) => {
+                lease.bind_pgid(pid);
+                Some(lease)
+            }
+            None => {
+                lease.bind_pgid(0);
+                lease.retain_unresolved("spawned without a process-group identity");
+                None
+            }
+        });
 
         // Wrap in ManagedChild for proper cleanup
         let mut managed = ManagedChild::new(child)?;
+        if let Some(lease) = lease {
+            managed.on_reaped(move || lease.settle_after_reap());
+        }
 
         // Take stdout/stderr from the child field
         let stdout = managed.child.stdout.take().ok_or_else(|| {
@@ -1992,6 +3270,7 @@ fn refused_after_shutdown(
     reason: &str,
     operation_type: Option<&str>,
     change_id: Option<&str>,
+    sink: &NoticeSink,
 ) -> (StreamingChildHandle, mpsc::Receiver<OutputLine>) {
     let (out_tx, out_rx) = mpsc::channel::<OutputLine>(1);
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1999,12 +3278,19 @@ fn refused_after_shutdown(
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
     let (termination_tx, termination_rx) = tokio::sync::oneshot::channel::<CommandTermination>();
 
-    let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
-        "admission",
-        operation_type,
-        change_id,
-        1,
-    )));
+    match sink {
+        NoticeSink::Text => {
+            let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
+                "admission",
+                operation_type,
+                change_id,
+                1,
+            )));
+        }
+        NoticeSink::Typed(tx) => {
+            let _ = tx.send(RunnerNotice::ShutdownRefused { stage: "admission" });
+        }
+    }
     let _ = cleanup_tx.send(ProcessGroupCleanupReport::not_applicable(reason));
     let _ = termination_tx.send(CommandTermination::NotStarted);
     let _ = status_tx.send(make_fail_status());
@@ -2082,6 +3368,7 @@ async fn verify_owned_process_group(
     op: Option<&str>,
     change_id: Option<&str>,
     out_tx: &mpsc::Sender<OutputLine>,
+    sink: &NoticeSink,
 ) -> ProcessGroupCleanupReport {
     if pid == 0 {
         return ProcessGroupCleanupReport::not_applicable(
@@ -2099,10 +3386,28 @@ async fn verify_owned_process_group(
     .await;
 
     if !report.is_confirmed() {
-        let _ = out_tx.send(OutputLine::Stderr(report.diagnostics())).await;
+        sink.emit(
+            out_tx,
+            RunnerNotice::ProcessGroupCleanupUnconfirmed {
+                pgid: report.pgid().unwrap_or(pid),
+                force_killed: report.force_killed(),
+            },
+            Some(report.diagnostics()),
+        )
+        .await;
     }
 
     report
+}
+
+/// Settle an unscoped spawn's writer lease before its final status is published.
+///
+/// Settling first is what lets a caller that observed completion also observe
+/// the coverage that follows from it.
+fn settle_writer_lease(lease: &mut Option<WriterLease>) {
+    if let Some(lease) = lease.take() {
+        lease.settle_after_reap();
+    }
 }
 
 /// Publishes cleanup evidence exactly once for this execution.
@@ -2962,6 +4267,713 @@ mod tests {
         }
     }
 
+    /// A stop that arrives while no attempt runs: refused before the next spawn
+    /// on the observed entry point, unchanged on the text entry point.
+    ///
+    /// The helper cases are unit tests over the oneshot alone. The rest drive
+    /// real `sh` processes and are integration evidence behind `heavy-tests`;
+    /// the shared stagger lock held by the test is the spawn-boundary barrier,
+    /// and the scope's `WaitingToSpawn` phase is how the test knows the runner
+    /// reached it. Timeouts are hang guards only.
+    mod session_retry_stop {
+        use super::*;
+        use std::future::Future;
+        use std::task::Poll;
+        use tokio::sync::oneshot;
+
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+
+        // ---- checkpoint helpers (unit) -----------------------------------
+
+        #[test]
+        fn session_retry_stop_cancel_check_leaves_pending_receiver_armed() {
+            let (tx, rx) = oneshot::channel::<()>();
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Proceed
+            );
+            assert!(rx_opt.is_some(), "a pending receiver is not consumed");
+            assert!(!observed);
+
+            tx.send(()).unwrap();
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Refuse,
+                "the stop sent after the first check is still read"
+            );
+        }
+
+        #[test]
+        fn session_retry_stop_cancel_check_refuses_sent_cancel_once() {
+            let (tx, rx) = oneshot::channel::<()>();
+            tx.send(()).unwrap();
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Refuse
+            );
+            assert!(observed);
+            assert!(
+                rx_opt.is_none(),
+                "an observed stop neutralises the receiver"
+            );
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Proceed,
+                "a second read neither panics nor re-reads"
+            );
+        }
+
+        #[test]
+        fn session_retry_stop_cancel_check_treats_dropped_handle_by_scope() {
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, true),
+                CancelCheck::Refuse,
+                "a scoped runner never detaches on a dropped handle"
+            );
+            assert!(observed && rx_opt.is_none());
+
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let mut rx_opt = Some(rx);
+            let mut observed = false;
+            assert_eq!(
+                cancel_check(&mut rx_opt, &mut observed, false),
+                CancelCheck::Proceed,
+                "an unscoped runner is not stopped by a dropped handle"
+            );
+            assert!(
+                observed && rx_opt.is_none(),
+                "but the receiver is neutralised"
+            );
+        }
+
+        #[tokio::test]
+        async fn session_retry_stop_race_prefers_cancel_over_elapsed_wait() {
+            // A pre-sent stop wins over a wait that never completes.
+            let (tx, rx) = oneshot::channel::<()>();
+            tx.send(()).unwrap();
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let never = std::sync::Arc::new(tokio::sync::Notify::new());
+            let verdict =
+                race_with_cancel(never.notified(), &mut rx_opt, &mut observed, true).await;
+            assert_eq!(verdict, CancelCheck::Refuse);
+            assert!(rx_opt.is_none());
+
+            // No stop: a completed wait proceeds and leaves the receiver armed.
+            let (_tx, rx) = oneshot::channel::<()>();
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let verdict = race_with_cancel(async {}, &mut rx_opt, &mut observed, true).await;
+            assert_eq!(verdict, CancelCheck::Proceed);
+            assert!(rx_opt.is_some() && !observed);
+
+            // A dropped handle on an unscoped runner never shortens the wait:
+            // the race is still pending after it observed the closure, and
+            // proceeds only once the wait completes.
+            let (tx, rx) = oneshot::channel::<()>();
+            drop(tx);
+            let (mut rx_opt, mut observed) = (Some(rx), false);
+            let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+            let verdict = {
+                let mut race = Box::pin(race_with_cancel(
+                    gate.notified(),
+                    &mut rx_opt,
+                    &mut observed,
+                    false,
+                ));
+                let first = std::future::poll_fn(|cx| Poll::Ready(race.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "a dropped handle did not end the wait");
+                gate.notify_one();
+                race.await
+            };
+            assert_eq!(verdict, CancelCheck::Proceed);
+            assert!(observed && rx_opt.is_none());
+        }
+
+        // ---- real processes (integration) --------------------------------
+
+        fn config(retry_delay_ms: u64) -> CommandQueueConfig {
+            CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
+                stagger_delay_ms: 0,
+                // Counts attempts: 3 admits two retries.
+                max_retries: 3,
+                retry_delay_ms,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+                max_runtime_secs: 0,
+            }
+        }
+
+        fn scoped(
+            config: CommandQueueConfig,
+            stagger: SharedStaggerState,
+        ) -> (AiCommandRunner, RunCommandScope) {
+            let scope = RunCommandScope::new();
+            let mut runner = AiCommandRunner::new(config, stagger);
+            runner.set_run_command_scope(scope.clone());
+            (runner, scope)
+        }
+
+        fn pid_lines(path: &std::path::Path) -> Vec<i32> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        }
+
+        fn mkfifo(path: &std::path::Path) {
+            let status = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .expect("mkfifo runs");
+            assert!(status.success());
+        }
+
+        /// Open the FIFO for writing (blocks until the script reads it).
+        async fn release_fifo(path: std::path::PathBuf) {
+            tokio::time::timeout(
+                HANG_GUARD,
+                tokio::task::spawn_blocking(move || std::fs::write(path, "go\n").unwrap()),
+            )
+            .await
+            .expect("the script never read its barrier")
+            .unwrap();
+        }
+
+        /// Drain child output in the background so the runner never blocks on it.
+        fn drain_output(mut rx: mpsc::Receiver<OutputLine>) {
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        }
+
+        /// Notices up to and including the first that matches `until`.
+        async fn notices_until(
+            rx: &mut mpsc::UnboundedReceiver<RunnerNotice>,
+            until: impl Fn(&RunnerNotice) -> bool,
+        ) -> Vec<RunnerNotice> {
+            let mut seen = Vec::new();
+            loop {
+                let notice = tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                    .unwrap_or_else(|| panic!("notice channel closed early: {seen:?}"));
+                let done = until(&notice);
+                seen.push(notice);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
+        /// Every remaining notice until the runner task ends.
+        async fn notices_to_end(
+            rx: &mut mpsc::UnboundedReceiver<RunnerNotice>,
+        ) -> Vec<RunnerNotice> {
+            let mut seen = Vec::new();
+            while let Some(notice) = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("the runner task never ended")
+            {
+                seen.push(notice);
+            }
+            seen
+        }
+
+        /// Block until the scope reports the execution parked before a spawn.
+        async fn parked_before_spawn(scope: &RunCommandScope) {
+            tokio::time::timeout(HANG_GUARD, async {
+                while scope.waiting_to_spawn_for_test() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the runner never reached the spawn boundary");
+        }
+
+        fn is_retry_scheduled(next: u32) -> impl Fn(&RunnerNotice) -> bool {
+            move |n| matches!(n, RunnerNotice::RetryScheduled { next_attempt, .. } if *next_attempt == next)
+        }
+
+        fn started(notices: &[RunnerNotice], attempt: u32) -> bool {
+            notices.contains(&RunnerNotice::AttemptStarted { attempt })
+        }
+
+        fn refusals(notices: &[RunnerNotice]) -> Vec<(u32, &'static str)> {
+            notices
+                .iter()
+                .filter_map(|n| match n {
+                    RunnerNotice::StopRefusedAttempt {
+                        next_attempt,
+                        stage,
+                    } => Some((*next_attempt, *stage)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Common evidence of a refused retry after attempt 1 ran.
+        async fn assert_refused_after_attempt_one(
+            mut handle: StreamingChildHandle,
+            scope: &RunCommandScope,
+            pids_file: &std::path::Path,
+            notices: &[RunnerNotice],
+            stages: &[&str],
+        ) {
+            let refused = refusals(notices);
+            assert_eq!(refused.len(), 1, "{notices:?}");
+            assert_eq!(refused[0].0, 2, "{notices:?}");
+            assert!(stages.contains(&refused[0].1), "{notices:?}");
+            assert!(!started(notices, 2), "attempt 2 never started: {notices:?}");
+            assert!(
+                matches!(
+                    notices.last(),
+                    Some(RunnerNotice::StopRefusedAttempt { .. })
+                ),
+                "the refusal is the last fact: {notices:?}"
+            );
+
+            let status = handle.wait().await.expect("a final status");
+            assert!(!status.success());
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            let pids = pid_lines(pids_file);
+            assert_eq!(pids.len(), 1, "exactly one process ran: {pids:?}");
+            let cleanup = handle.process_group_cleanup().await;
+            assert!(cleanup.is_confirmed(), "{}", cleanup.diagnostics());
+            assert_eq!(
+                cleanup.pgid(),
+                Some(pids[0] as u32),
+                "the published cleanup is attempt 1's sweep"
+            );
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_retry_after_crash_delay_stop() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let (runner, scope) = scoped(config(60_000), Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert!(seen.iter().any(|n| matches!(
+                n,
+                RunnerNotice::LeaderReaped {
+                    attempt: 1,
+                    exit_code: Some(3),
+                    signal: None
+                }
+            )));
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["retry"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_retry_after_inactivity_delay_stop() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(60_000);
+            cfg.inactivity_timeout_secs = 1;
+            cfg.inactivity_kill_grace_secs = 0;
+            cfg.inactivity_timeout_max_retries = 2;
+            let (runner, scope) = scoped(cfg, Arc::new(Mutex::new(None)));
+            // No output at all, so the inactivity timeout ends attempt 1.
+            let command = format!("echo $$ >> '{}'; exec sleep 300", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, |n| {
+                matches!(
+                    n,
+                    RunnerNotice::RetryScheduled {
+                        next_attempt: 2,
+                        cause: RetryCause::InactivityTimeout,
+                        ..
+                    }
+                )
+            })
+            .await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert!(
+                matches!(
+                    seen.first(),
+                    Some(RunnerNotice::AttemptStarted { attempt: 1 })
+                ),
+                "{seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .any(|n| matches!(n, RunnerNotice::InactivityTerminated { attempt: 1, .. })),
+                "{seen:?}"
+            );
+            assert!(
+                seen.iter().any(|n| matches!(
+                    n,
+                    RunnerNotice::LeaderReaped {
+                        attempt: 1,
+                        signal: Some(_),
+                        ..
+                    }
+                )),
+                "attempt 1 was reaped by a signal: {seen:?}"
+            );
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["retry"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_spawn_parked_in_stagger() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(0);
+            // Attempt 1 claims the empty stagger slot and arms it, so attempt 2
+            // parks in a 60 s stagger wait.
+            cfg.stagger_delay_ms = 60_000;
+            let (runner, scope) = scoped(cfg, Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            parked_before_spawn(&scope).await;
+            handle.terminate().unwrap();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_refused_after_attempt_one(handle, &scope, &pids_file, &seen, &["stagger"]).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_refuses_spawn_at_held_boundary() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let barrier = dir.path().join("crash.barrier");
+            mkfifo(&barrier);
+            let stagger: SharedStaggerState = Arc::new(Mutex::new(None));
+            let (runner, scope) = scoped(config(0), stagger.clone());
+            let command = format!(
+                "echo $$ >> '{}'; read x < '{}'; exit 3",
+                pids_file.display(),
+                barrier.display()
+            );
+
+            // Attempt 1 is admitted only once the test lets go of the lock.
+            let held = stagger.lock().await;
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+            drop(held);
+            let mut seen = notices_until(&mut notices, |n| {
+                *n == RunnerNotice::AttemptStarted { attempt: 1 }
+            })
+            .await;
+
+            // Re-take the lock before attempt 1 can crash, then let it crash.
+            let held = stagger.lock().await;
+            release_fifo(barrier).await;
+            seen.extend(notices_until(&mut notices, is_retry_scheduled(2)).await);
+            parked_before_spawn(&scope).await;
+
+            handle.terminate().unwrap();
+            drop(held);
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_refused_after_attempt_one(
+                handle,
+                &scope,
+                &pids_file,
+                &seen,
+                &["stagger", "spawn"],
+            )
+            .await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_running_child_still_escalates() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let ready = dir.path().join("ready");
+            mkfifo(&ready);
+            let (runner, scope) = scoped(config(0), Arc::new(Mutex::new(None)));
+            let command = format!(
+                "trap '' TERM; echo $$ >> '{}'; echo ready > '{}'; sleep 60",
+                pids_file.display(),
+                ready.display()
+            );
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+            let ready_path = ready.clone();
+            tokio::time::timeout(
+                HANG_GUARD,
+                tokio::task::spawn_blocking(move || std::fs::read_to_string(ready_path).unwrap()),
+            )
+            .await
+            .expect("hang guard")
+            .unwrap();
+
+            handle.terminate().unwrap();
+            let seen = notices_to_end(&mut notices).await;
+
+            assert!(
+                seen.iter().any(|n| matches!(
+                    n,
+                    RunnerNotice::LeaderReaped {
+                        attempt: 1,
+                        signal: Some(9),
+                        ..
+                    }
+                )),
+                "the running-child cancel branch still escalates: {seen:?}"
+            );
+            assert!(refusals(&seen).is_empty(), "{seen:?}");
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            assert_eq!(pid_lines(&pids_file).len(), 1);
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_observed_scope_shutdown_in_delay_is_still_shutdown() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            // The delay does not race scope shutdown (unchanged): the loop head
+            // refuses once it ends, so the delay is kept short.
+            let (runner, scope) = scoped(config(1_000), Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (mut handle, out, mut notices) = runner
+                .execute_streaming_with_retry_observed(
+                    &command,
+                    None,
+                    Some("worktree_session"),
+                    None,
+                )
+                .await
+                .expect("admitted");
+            drain_output(out);
+
+            let mut seen = notices_until(&mut notices, is_retry_scheduled(2)).await;
+            scope.close();
+            seen.extend(notices_to_end(&mut notices).await);
+
+            assert_eq!(
+                seen.last(),
+                Some(&RunnerNotice::ShutdownRefused { stage: "retry" }),
+                "{seen:?}"
+            );
+            assert!(refusals(&seen).is_empty(), "{seen:?}");
+            assert!(!started(&seen, 2));
+            assert_ne!(handle.termination().await, CommandTermination::Cancelled);
+            assert_eq!(pid_lines(&pids_file).len(), 1);
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        // ---- the text entry point keeps spawn-then-cancel ------------------
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_text_entry_point_keeps_spawn_then_cancel() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let barrier = dir.path().join("crash.barrier");
+            mkfifo(&barrier);
+            let stagger: SharedStaggerState = Arc::new(Mutex::new(None));
+            let (runner, scope) = scoped(config(0), stagger.clone());
+            // Attempt 1 waits on the barrier and crashes; attempt 2 (the FIFO
+            // is gone by then) runs until it is cancelled.
+            let command = format!(
+                "echo $$ >> '{pids}'; if [ -p '{b}' ]; then read x < '{b}'; rm -f '{b}'; exit 3; fi; sleep 60",
+                pids = pids_file.display(),
+                b = barrier.display()
+            );
+
+            let held = stagger.lock().await;
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("admitted");
+            drop(held);
+            // Attempt 1 has spawned once its PID line exists.
+            tokio::time::timeout(HANG_GUARD, async {
+                while pid_lines(&pids_file).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("attempt 1 never started");
+
+            let held = stagger.lock().await;
+            release_fifo(barrier.clone()).await;
+            let mut stderr = Vec::new();
+            loop {
+                match tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Some(OutputLine::Stderr(line)) => {
+                        let retry = line.starts_with("[Retry 1/");
+                        stderr.push(line);
+                        if retry {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("output closed before the retry: {stderr:?}"),
+                }
+            }
+            parked_before_spawn(&scope).await;
+
+            handle.terminate().unwrap();
+            drop(held);
+            while let Some(line) = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("hang guard")
+            {
+                if let OutputLine::Stderr(line) = line {
+                    stderr.push(line);
+                }
+            }
+            let _ = handle.wait().await;
+
+            // Attempt 2 may be cancelled before its shell writes a PID line, so
+            // the spawn is proven by the cleanup report: the cancel branch
+            // swept a process group other than attempt 1's.
+            let pids = pid_lines(&pids_file);
+            assert!(!pids.is_empty() && pids.len() <= 2, "{pids:?}");
+            assert!(stderr.iter().all(|l| !l.contains("stage=")), "{stderr:?}");
+            assert_eq!(handle.termination().await, CommandTermination::Cancelled);
+            let cleanup = handle.process_group_cleanup().await;
+            let second = cleanup.pgid().expect("the cancelled attempt's group") as i32;
+            assert_ne!(
+                second, pids[0],
+                "the default policy spawned attempt 2 and then cancelled it: {stderr:?}"
+            );
+            if let Some(&logged) = pids.get(1) {
+                assert_eq!(logged, second);
+            }
+            assert!(
+                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(second), None)
+                    == Err(nix::errno::Errno::ESRCH),
+                "attempt 2's group is gone"
+            );
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        async fn session_retry_stop_text_entry_point_unscoped_dropped_handle_does_not_shorten_delay(
+        ) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pids_file = dir.path().join("pids");
+            let mut cfg = config(300);
+            cfg.max_retries = 2;
+            let runner = AiCommandRunner::new(cfg, Arc::new(Mutex::new(None)));
+            let command = format!("echo $$ >> '{}'; exit 3", pids_file.display());
+
+            let (handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("admitted");
+            // Wait for the retry line: attempt 1 crashed and the delay runs.
+            loop {
+                match tokio::time::timeout(HANG_GUARD, rx.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Some(OutputLine::Stderr(line)) if line.starts_with("[Retry 1/") => break,
+                    Some(_) => {}
+                    None => panic!("output closed before the retry"),
+                }
+            }
+            drop(handle);
+            while tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("hang guard")
+                .is_some()
+            {}
+
+            assert_eq!(
+                pid_lines(&pids_file).len(),
+                2,
+                "a dropped handle on an unscoped runner does not stop the retry"
+            );
+        }
+    }
+
     /// A command that never starts still owes the caller its cause.
     ///
     /// Apply history, the Acceptance command diagnostic, and the cleanup-review
@@ -3610,5 +5622,443 @@ mod tests {
             pid,
             errno
         );
+    }
+}
+
+/// Writer coverage of the two unscoped spawn paths.
+///
+/// Integration-shaped on purpose: what is proven is that a real child bound to
+/// a real directory is accounted for until a real reap *and* an observed-empty
+/// process group, which no in-memory double can stand in for. Liveness is read
+/// from the reap and from coverage itself; timeouts are hang guards only.
+#[cfg(test)]
+mod writer_coverage_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const HANG_GUARD: Duration = Duration::from_secs(20);
+
+    fn quick_config(strict_process_cleanup: bool) -> CommandQueueConfig {
+        CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 0,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 0,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup,
+            max_runtime_secs: 0,
+        }
+    }
+
+    struct Dirs {
+        _dir: TempDir,
+        wt: std::path::PathBuf,
+        sibling: std::path::PathBuf,
+        owner: std::path::PathBuf,
+    }
+
+    fn dirs() -> Dirs {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path().join("alpha");
+        // The string-prefix trap: `alpha2` starts with the string `alpha`.
+        let sibling = dir.path().join("alpha2");
+        let owner = dir.path().join("owner");
+        for path in [&wt, &sibling, &owner] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        Dirs {
+            _dir: dir,
+            wt,
+            sibling,
+            owner,
+        }
+    }
+
+    fn runner(ledger: &ManagedWriterLedger, strict: bool) -> AiCommandRunner {
+        let mut runner = AiCommandRunner::new(quick_config(strict), Arc::new(Mutex::new(None)));
+        runner.set_strict_process_cleanup(strict);
+        runner.set_writer_ledger(ledger.clone());
+        runner
+    }
+
+    /// Re-read coverage until it is `Clear`. Each read re-probes unresolved
+    /// groups, so this observes positive quiescence rather than elapsed time.
+    async fn until_clear(ledger: &ManagedWriterLedger, root: &Path) {
+        tokio::time::timeout(HANG_GUARD, async {
+            while ledger.coverage_under(root) != WriterCoverage::Clear {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("coverage never cleared: {:?}", ledger.coverage_under(root)));
+    }
+
+    #[tokio::test]
+    async fn remote_text_edit_unscoped_spawn_paths_are_covered() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+        let runner = runner(&ledger, true);
+
+        // The shell path.
+        let (mut child, _rx) = runner
+            .execute_streaming("sleep 30", Some(&dirs.wt))
+            .await
+            .expect("the shell spawns");
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt),
+            WriterCoverage::Busy { .. }
+        ));
+        assert_eq!(ledger.coverage_under(&dirs.sibling), WriterCoverage::Clear);
+        assert_eq!(ledger.coverage_under(&dirs.owner), WriterCoverage::Clear);
+        child.terminate().expect("SIGTERM reaches the group");
+        tokio::time::timeout(HANG_GUARD, child.wait())
+            .await
+            .expect("hang guard")
+            .expect("the shell is reaped");
+        until_clear(&ledger, &dirs.wt).await;
+
+        // `execute_streaming_with_retry` with no run scope — the exact call the
+        // configured `worktree_command` session makes.
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry("sleep 30", Some(&dirs.wt), None, None)
+            .await
+            .expect("the command is admitted");
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tokio::time::timeout(HANG_GUARD, async {
+            while handle.id().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child spawned");
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt),
+            WriterCoverage::Busy { .. }
+        ));
+        assert_eq!(ledger.coverage_under(&dirs.sibling), WriterCoverage::Clear);
+        handle.terminate().expect("termination is requested");
+        tokio::time::timeout(HANG_GUARD, handle.wait())
+            .await
+            .expect("hang guard")
+            .expect("the runner task settles");
+        assert!(handle.process_group_cleanup().await.is_confirmed());
+        until_clear(&ledger, &dirs.wt).await;
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_text_edit_shell_exit_with_surviving_descendant_retains_coverage() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        // Strict cleanup off, so nothing sweeps the group: the shell exits and
+        // its background writer survives it.
+        let runner = runner(&ledger, false);
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(
+                "sleep 30 >/dev/null 2>&1 & echo $$",
+                Some(&dirs.wt),
+                None,
+                None,
+            )
+            .await
+            .expect("the command is admitted");
+        let mut pgid = None;
+        while let Some(line) = rx.recv().await {
+            if let OutputLine::Stdout(text) = line {
+                pgid = text.trim().parse::<i32>().ok().or(pgid);
+            }
+        }
+        let pgid = pgid.expect("the shell printed its own PID, which is its PGID");
+        tokio::time::timeout(HANG_GUARD, handle.wait())
+            .await
+            .expect("hang guard")
+            .expect("the shell is reaped");
+
+        // Reaping the shell is not proof its writers exited.
+        let coverage = ledger.coverage_under(&dirs.wt);
+        assert!(
+            matches!(coverage, WriterCoverage::Unknown { .. }),
+            "a surviving descendant must keep coverage: {coverage:?}"
+        );
+        assert!(matches!(
+            ledger.coverage_under(&dirs.sibling),
+            WriterCoverage::Unknown { .. }
+        ));
+
+        // The test itself ends the descendant; coverage clears only once the
+        // group is observed empty.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        until_clear(&ledger, &dirs.wt).await;
+    }
+
+    #[test]
+    fn remote_text_edit_cwd_canonicalization_decides_binding() {
+        let dirs = dirs();
+        let alias = dirs.wt.parent().unwrap().join("alpha-alias");
+        std::os::unix::fs::symlink(&dirs.wt, &alias).unwrap();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+
+        let lease = ledger.take_lease("session", Some(&alias));
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt),
+            WriterCoverage::Busy { .. }
+        ));
+        // A root reached through the alias compares equal to the real path.
+        assert!(matches!(
+            ledger.coverage_under(&alias),
+            WriterCoverage::Busy { .. }
+        ));
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt.join("..")),
+            WriterCoverage::Busy { .. }
+        ));
+        assert_eq!(ledger.coverage_under(&dirs.sibling), WriterCoverage::Clear);
+        assert_eq!(ledger.coverage_under(&dirs.owner), WriterCoverage::Clear);
+        lease.release_unspawned();
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+
+        // A cwd removed before registration cannot be bound anywhere.
+        let gone = dirs.wt.parent().unwrap().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let dangling = ledger.take_lease("session", Some(&gone));
+        for root in [&dirs.wt, &dirs.sibling, &dirs.owner] {
+            assert!(matches!(
+                ledger.coverage_under(root),
+                WriterCoverage::Unknown { .. }
+            ));
+        }
+        dangling.release_unspawned();
+
+        // An owner directory that could not be canonicalized makes every
+        // cwd-less writer undecidable.
+        let blind = ManagedWriterLedger::with_owner_cwd(Err("unreadable".to_string()));
+        let inherited = blind.take_lease("shell", None);
+        assert!(matches!(
+            blind.coverage_under(&dirs.sibling),
+            WriterCoverage::Unknown { .. }
+        ));
+        inherited.release_unspawned();
+        assert_eq!(blind.coverage_under(&dirs.sibling), WriterCoverage::Clear);
+    }
+
+    #[test]
+    fn remote_text_edit_dropped_lease_stays_unresolved_without_a_timer() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        drop(lease);
+        for _ in 0..3 {
+            assert!(matches!(
+                ledger.coverage_under(&dirs.sibling),
+                WriterCoverage::Unknown { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn remote_text_edit_retained_scope_entries_stay_covered_after_replacement() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let run_a = RunCommandScope::new();
+        ledger.register_scope(&run_a);
+        let retained =
+            run_a.register_unproven_in_for_test("apply", Some("alpha"), 4_000_000, Some(&dirs.wt));
+        // Run A is replaced and shut down; nothing proved its identity dead.
+        run_a.close();
+        let run_b = RunCommandScope::new();
+        ledger.register_scope(&run_b);
+
+        let coverage = ledger.coverage_under(&dirs.wt);
+        match &coverage {
+            WriterCoverage::Busy { detail } => assert!(detail.contains("4000000"), "{detail}"),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert_eq!(ledger.coverage_under(&dirs.sibling), WriterCoverage::Clear);
+
+        retained.release_proven(4_000_000);
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+    fn unknown_detail(ledger: &ManagedWriterLedger, root: &Path) -> String {
+        match ledger.coverage_under(root) {
+            WriterCoverage::Unknown { detail } => detail,
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_not_attempted_lease_releases_on_drop() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        assert!(matches!(
+            ledger.coverage_under(&dirs.wt),
+            WriterCoverage::Busy { .. }
+        ));
+        drop(lease);
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_attempted_lease_stays_unknown() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        drop(lease);
+        let detail = "spawn was attempted and its outcome was never reported";
+        assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        // No timer releases it: a generous wait and repeated reads change nothing.
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        }
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_failed_spawn_releases() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        drop(lease);
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+
+        // Settlement after a failed spawn releases too.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        lease.settle_after_reap();
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+
+        // So does an explicit release.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.mark_failed();
+        lease.release_unspawned();
+        assert_eq!(ledger.coverage_under(&dirs.wt), WriterCoverage::Clear);
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_spawned_without_pgid_stays_unknown() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let detail = "spawned without a process-group identity";
+        // Settled after a reap: the removed "no pgids means never spawned" rule.
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(0);
+        lease.settle_after_reap();
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(detail));
+        }
+
+        // Dropped without settlement.
+        let other = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = other.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(0);
+        drop(lease);
+        assert!(unknown_detail(&other, &dirs.wt).contains(detail));
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_release_unspawned_after_attempt_is_noop() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.release_unspawned();
+        assert!(unknown_detail(&ledger, &dirs.wt)
+            .contains("spawn was attempted and its outcome was never reported"));
+
+        // A spawned lease is not released either; it keeps its group (this
+        // test's own, which is never empty while it runs).
+        let other = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = other.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        // SAFETY: `getpgrp` has no preconditions.
+        lease.bind_pgid(unsafe { libc::getpgrp() } as u32);
+        lease.release_unspawned();
+        assert!(matches!(
+            other.coverage_under(&dirs.wt),
+            WriterCoverage::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn remote_contract_gap_ledger_failed_retry_keeps_the_earlier_bound_group() {
+        let dirs = dirs();
+        // SAFETY: `getpgrp` has no preconditions. This test's own group is
+        // never empty while it runs: it stands in for attempt 1's survivors.
+        let survivors = unsafe { libc::getpgrp() } as u32;
+        for settle in [true, false] {
+            let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+            let lease = ledger.take_lease("shell", Some(&dirs.wt));
+            lease.mark_attempted();
+            lease.bind_pgid(survivors);
+            // Attempt 2: the spawn fails outright.
+            lease.mark_attempted();
+            lease.mark_failed();
+            if settle {
+                lease.settle_after_reap();
+            } else {
+                drop(lease);
+            }
+            let detail = unknown_detail(&ledger, &dirs.wt);
+            assert!(
+                detail.contains(&survivors.to_string()),
+                "settle={settle}: the earlier group is still accounted for: {detail}"
+            );
+        }
+
+        // A retry whose outcome was never reported is identity-less, never
+        // released either.
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        lease.bind_pgid(survivors);
+        lease.mark_attempted();
+        lease.release_unspawned();
+        assert!(unknown_detail(&ledger, &dirs.wt)
+            .contains("spawn was attempted and its outcome was never reported"));
+    }
+
+    #[tokio::test]
+    async fn remote_contract_gap_ledger_bound_group_drop_is_probe_clearable() {
+        let dirs = dirs();
+        let ledger = ManagedWriterLedger::with_owner_cwd(Ok(dirs.owner.clone()));
+        let lease = ledger.take_lease("shell", Some(&dirs.wt));
+        lease.mark_attempted();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 30").current_dir(&dirs.wt);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().expect("sh spawns");
+        let pgid = child.id();
+        lease.bind_pgid(pgid);
+        // Released without a reap: the group is alive, so coverage is unknown.
+        drop(lease);
+        for _ in 0..3 {
+            assert!(unknown_detail(&ledger, &dirs.wt).contains(&pgid.to_string()));
+        }
+        // The ledger killed nothing: the group is still alive.
+        assert_eq!(
+            crate::process_manager::process_group_is_empty(pgid),
+            Some(false)
+        );
+
+        // The test itself ends the group; coverage clears only once the group
+        // is observed empty.
+        unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+        child.wait().expect("the leader is reaped");
+        until_clear(&ledger, &dirs.wt).await;
     }
 }

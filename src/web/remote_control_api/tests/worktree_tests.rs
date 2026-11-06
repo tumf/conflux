@@ -38,6 +38,8 @@ pub(crate) struct FakeWorktreePort {
     creates: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
     merges: Mutex<Vec<String>>,
+    abort_merges: Mutex<Vec<String>>,
+    confirmed_deletes: Mutex<Vec<String>>,
     outcome: Mutex<Option<CommandFailure>>,
 }
 
@@ -60,6 +62,14 @@ impl FakeWorktreePort {
 
     pub(crate) fn merges(&self) -> Vec<String> {
         self.merges.lock().unwrap().clone()
+    }
+
+    pub(crate) fn confirmed_deletes(&self) -> Vec<String> {
+        self.confirmed_deletes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn abort_merges(&self) -> Vec<String> {
+        self.abort_merges.lock().unwrap().clone()
     }
 
     fn answer(&self) -> Result<ExecutionSummary, CommandFailure> {
@@ -90,6 +100,40 @@ impl WorktreeOperations for FakeWorktreePort {
 
     async fn merge(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure> {
         self.merges.lock().unwrap().push(worktree_id.to_string());
+        self.answer()
+    }
+
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        self.abort_merges
+            .lock()
+            .unwrap()
+            .push(worktree_id.to_string());
+        self.answer()
+    }
+
+    async fn delete_preview(
+        &self,
+        _worktree_id: &str,
+    ) -> Result<crate::web::remote_control_api::worktrees::DeletePreviewResponse, CommandFailure>
+    {
+        Err(CommandFailure::new(
+            ErrorCode::LifecycleConflict,
+            "no preview configured",
+        ))
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        _params: &crate::web::remote_control_api::dto::ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        self.confirmed_deletes
+            .lock()
+            .unwrap()
+            .push(worktree_id.to_string());
         self.answer()
     }
 }
@@ -730,6 +774,25 @@ async fn remote_worktree_capabilities_report_the_operations_and_recovery_boundar
         serde_json::from_value(body["worktrees"]["operations"].clone()).unwrap();
     assert_eq!(operations, WORKTREE_OPERATIONS.to_vec());
     assert_eq!(
+        operations,
+        [
+            "list",
+            "detail",
+            "create",
+            "delete",
+            "merge",
+            "merge_abort",
+            "delete_confirmed",
+            "text",
+            "session"
+        ]
+    );
+    assert_eq!(body["worktrees"]["merge_abort"]["available"], true);
+    assert_eq!(
+        body["worktrees"]["merge_abort"]["command"],
+        "merge_worktree_abort_on_conflict"
+    );
+    assert_eq!(
         body["worktrees"]["merge_conflict_recovery"],
         RECOVERY_LOCAL_OR_TUI
     );
@@ -1171,7 +1234,14 @@ fn remote_worktree_dirty_discard_capabilities_advertise_no_bypass() {
             .collect::<Vec<_>>()
     );
 
-    let json = serde_json::to_string(&capabilities).unwrap();
+    // The consented bypass is its own, separately advertised block and names
+    // its permissions on purpose. Everything else must advertise none.
+    let mut published = serde_json::to_value(&capabilities).unwrap();
+    published
+        .as_object_mut()
+        .unwrap()
+        .remove("confirmed_delete");
+    let json = published.to_string();
     for forbidden in [
         "dirty_discard",
         "allow_dirty",

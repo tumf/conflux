@@ -9,7 +9,8 @@ use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
 use crate::web::remote_control_api::dto::{
     AttentionState, BlockerKind as RemoteBlockerKind, ChangeActivity, ChangeBlocker, ChangeTiming,
-    ChangeWorktree, ParallelEligibility, ParallelRuntimeState, QueueIntent as RemoteQueueIntent,
+    ChangeWorktree, NetActiveTiming, ParallelEligibility, ParallelRuntimeState,
+    QueueIntent as RemoteQueueIntent, RunClock as RunClockView,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,13 @@ pub struct ChangeStatus {
     #[serde(default)]
     pub acceptance_provenance:
         Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
+    /// Whether the reducer's archive record contains this change, read in the
+    /// same reducer hold as `queue_status`. Process-local presentation only.
+    #[serde(default)]
+    pub archive_complete: bool,
+    /// Cumulative net-active execution time from the shared clock.
+    #[serde(default)]
+    pub net_active: NetActiveTiming,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -120,6 +128,8 @@ impl From<&Change> for ChangeStatus {
             attention: AttentionState::None,
             managed_process_live: false,
             acceptance_provenance: None,
+            archive_complete: false,
+            net_active: NetActiveTiming::default(),
         }
     }
 }
@@ -167,6 +177,9 @@ pub struct OrchestratorStateSnapshot {
     /// client reads is the same value the start guard and the TUI toggle use.
     #[serde(default)]
     pub parallel: ParallelRuntimeState,
+    /// Run-level elapsed clock, filled from the process-local facts store.
+    #[serde(default)]
+    pub run_clock: RunClockView,
 }
 
 impl OrchestratorStateSnapshot {
@@ -193,6 +206,7 @@ impl OrchestratorStateSnapshot {
                 if display != "not queued" {
                     status.queue_status = Some(display.to_string());
                 }
+                status.archive_complete = shared.archived_changes().contains(&status.id);
 
                 // Set iteration_number from apply_count if available
                 let apply_count = shared.apply_count(&status.id);
@@ -219,6 +233,7 @@ impl OrchestratorStateSnapshot {
             is_resolving: false,
             process_error: None,
             parallel: ParallelRuntimeState::default(),
+            run_clock: RunClockView::default(),
         };
         refresh_summary(&mut snapshot);
         snapshot
@@ -254,6 +269,10 @@ fn apply_reducer_derived_queue_statuses(
         } else {
             Some(display.to_string())
         };
+        // The archive milestone comes from the same reducer hold as the status
+        // it is distinct from: `resolving` after archive and a fresh-process
+        // resolve retry look identical by status alone.
+        change.archive_complete = shared.archived_changes().contains(&change.id);
 
         let apply_count = shared.apply_count(&change.id);
         if apply_count > 0 {
@@ -386,6 +405,110 @@ fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
     state.last_updated = chrono::Utc::now().to_rfc3339();
 }
 
+/// One monotonic and wall sample shared by everything a single observation
+/// records, so one event yields one instant.
+type ObservationSample = (std::time::Instant, chrono::DateTime<chrono::Utc>);
+
+/// A run-clock transition that needs frontend context to decide.
+///
+/// `Stopped` and `AllCompleted` freeze unconditionally and are applied by the
+/// facts store itself; these are the two rows of the TUI event table that read
+/// the mode or the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextualRunClockStep {
+    Open,
+    Freeze,
+}
+
+/// Display statuses that keep the TUI from settling to Select after a resolve.
+///
+/// The exact list `AppState::try_transition_to_select` checks — not the shared
+/// active vocabulary, which differs (`preparing` and `rejecting` are absent
+/// here, `queued`, `blocked`, and `resolve pending` are present).
+const RESOLVE_SETTLEMENT_PROCESSING_STATUSES: [&str; 7] = [
+    "queued",
+    "blocked",
+    "applying",
+    "accepting",
+    "archiving",
+    "resolving",
+    "resolve pending",
+];
+
+/// Mirror the TUI's mode- and row-dependent run-clock boundaries for one event.
+///
+/// - An accepted Start opens exactly when `admit_run_targets` would reset the
+///   TUI clock: the mode before the event is not running.
+/// - A resolve-side settlement freezes exactly when `try_transition_to_select`
+///   would: the mode is running and, after the handler's own row rewrite, no
+///   row is processing. `MergeCompleted` reaches that check only during a
+///   resolve lifecycle, and `ResolveFailed` for an already-merged row returns
+///   early without it.
+///
+/// `pre_status` is the target row's display status before this event; `rows`
+/// are the reducer display statuses after it.
+fn contextual_run_clock_step(
+    event: &ExecutionEvent,
+    pre_app_mode: &str,
+    pre_is_resolving: bool,
+    pre_status: Option<&str>,
+    rows: &[(String, String)],
+) -> Option<ContextualRunClockStep> {
+    use crate::events::OperatorCommandEffect as Effect;
+
+    let (target, rewrite) = match event {
+        // A dispatch that committed no target is not an accepted Start — run
+        // control refuses an empty Start before it can dispatch — so it opens
+        // nothing and publishes no revision.
+        ExecutionEvent::OperatorCommandApplied {
+            effect: Effect::RunDispatched { change_ids, .. },
+        } => {
+            return (pre_app_mode != "running" && !change_ids.is_empty())
+                .then_some(ContextualRunClockStep::Open);
+        }
+        ExecutionEvent::ResolveCompleted { change_id, .. } => (change_id, "merged"),
+        ExecutionEvent::MergeCompleted { change_id, .. } => {
+            let resolve_lifecycle =
+                pre_is_resolving || rows.iter().any(|(_, status)| status == "resolve pending");
+            if !resolve_lifecycle {
+                return None;
+            }
+            (change_id, "merged")
+        }
+        ExecutionEvent::ResolveFailed { change_id, .. } => {
+            if pre_status == Some("merged") {
+                return None;
+            }
+            (change_id, "merge wait")
+        }
+        ExecutionEvent::HookFailed {
+            change_id,
+            hook_type,
+            ..
+        } if hook_type == "on_merged" => {
+            if pre_status == Some("merged") {
+                (change_id, "merged")
+            } else {
+                (change_id, "merge wait")
+            }
+        }
+        _ => return None,
+    };
+
+    if pre_app_mode != "running" {
+        return None;
+    }
+    let processing = rows.iter().any(|(id, status)| {
+        let status = if id == target {
+            rewrite
+        } else {
+            status.as_str()
+        };
+        RESOLVE_SETTLEMENT_PROCESSING_STATUSES.contains(&status)
+    });
+    (!processing).then_some(ContextualRunClockStep::Freeze)
+}
+
 /// Event sink implementation for web monitoring state updates.
 pub struct WebEventSink {
     web_state: Arc<WebState>,
@@ -481,6 +604,8 @@ pub struct WebState {
     /// coordinator asking "which revision did *my* dispatch produce" must not
     /// have to await anything that could reorder it against another command.
     dispatch_revisions: std::sync::Mutex<DispatchRevisions>,
+    /// Injected observation sample for tests; production samples the clocks.
+    observation_clock: std::sync::Mutex<Option<ObservationSample>>,
 }
 
 /// Bounded map from dispatch identity to the revision that dispatch produced.
@@ -572,7 +697,32 @@ impl WebState {
             execution_facts: tokio::sync::RwLock::new(None),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
             dispatch_revisions: std::sync::Mutex::new(DispatchRevisions::default()),
+            observation_clock: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Sample the monotonic and wall clocks once for one observation.
+    fn observation_sample(&self) -> ObservationSample {
+        self.observation_clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|| (std::time::Instant::now(), chrono::Utc::now()))
+    }
+
+    /// Pin the observation sample every later observation uses, test-only.
+    ///
+    /// Lets parity tests feed this frontend and the TUI's `_at` entry points
+    /// identical instants, so equality is exact rather than tolerance-based.
+    #[cfg(test)]
+    pub(crate) fn pin_observation_clock_for_tests(
+        &self,
+        now: std::time::Instant,
+        wall: chrono::DateTime<chrono::Utc>,
+    ) {
+        *self
+            .observation_clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((now, wall));
     }
 
     /// The `/api/v2` runtime for this process incarnation.
@@ -691,7 +841,8 @@ impl WebState {
     /// state, the execution marks, and the process-local facts are read at one
     /// instant and published at one revision rather than trickling in.
     async fn operator_snapshot(&self) -> OrchestratorStateSnapshot {
-        self.operator_snapshot_with(None).await
+        self.operator_snapshot_with(None, self.observation_sample())
+            .await
     }
 
     /// The monitoring snapshot, preferring an authoritative reducer state.
@@ -703,8 +854,10 @@ impl WebState {
     async fn operator_snapshot_with(
         &self,
         authoritative: Option<&crate::orchestration::state::OrchestratorState>,
+        (now, wall): ObservationSample,
     ) -> OrchestratorStateSnapshot {
         let mut snapshot = self.get_state().await;
+        let mut reducer_observed = false;
 
         // The reducer is the authority for display status, queue intent,
         // blocker detail, and change-local error. Reading all of them here — not
@@ -715,13 +868,44 @@ impl WebState {
         if let Some(shared) = authoritative {
             apply_reducer_derived_queue_statuses(&mut snapshot, shared);
             refresh_summary(&mut snapshot);
+            reducer_observed = true;
         } else if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
             if let Some(shared_arc) = shared_state_opt.as_ref() {
                 if let Ok(shared) = shared_arc.try_read() {
                     apply_reducer_derived_queue_statuses(&mut snapshot, &shared);
                     refresh_summary(&mut snapshot);
+                    reducer_observed = true;
                 }
             }
+        }
+
+        // The web counterpart of the TUI's reducer synchronization: the same
+        // reducer display statuses drive the same shared net-active clock. Only
+        // a real reducer read is observed, and an unchanged status changes
+        // nothing, so a refresh over an idle process cannot move a clock.
+        if reducer_observed {
+            let rows: Vec<(String, String)> = snapshot
+                .changes
+                .iter()
+                .map(|change| {
+                    (
+                        change.id.clone(),
+                        change
+                            .queue_status
+                            .clone()
+                            .unwrap_or_else(|| "not queued".to_string()),
+                    )
+                })
+                .collect();
+            self.operator_facts
+                .write()
+                .await
+                .observe_display_statuses_at(
+                    rows.iter()
+                        .map(|(id, status)| (id.as_str(), status.as_str())),
+                    now,
+                    wall,
+                );
         }
 
         let marks = self.execution_marks.read().await.clone();
@@ -738,7 +922,9 @@ impl WebState {
         let facts = self.operator_facts.read().await;
         let managed_termination = self.managed_termination.read().await.clone();
         snapshot.process_error = facts.process_error();
+        snapshot.run_clock = facts.run_clock();
         for change in &mut snapshot.changes {
+            change.net_active = facts.net_active(&change.id);
             change.execution_marked = marks
                 .as_ref()
                 .is_some_and(|marks| marks.is_marked(&change.id));
@@ -796,6 +982,7 @@ impl WebState {
         event: &ExecutionEvent,
         ownership: EventOwnership,
         authoritative: Option<&crate::orchestration::state::OrchestratorState>,
+        sample: ObservationSample,
     ) -> u64 {
         use crate::web::remote_control_api::projection as v2;
 
@@ -819,7 +1006,7 @@ impl WebState {
             EventOwnership::State => {
                 let (event_type, change_id, payload) = v2::describe_event(event);
                 let candidate =
-                    v2::project_snapshot(&self.operator_snapshot_with(authoritative).await);
+                    v2::project_snapshot(&self.operator_snapshot_with(authoritative, sample).await);
                 projection
                     .apply_state(event_type, change_id, payload, candidate)
                     .state_revision
@@ -1065,9 +1252,17 @@ impl WebState {
         }
         self.observe_execution_facts(dispatch).await;
         let event = dispatch.event;
+        let sample = self.observation_sample();
+        let pre_app_mode;
+        let pre_is_resolving;
         {
             let mut state = self.state.write().await;
             let mut updated = false;
+            // Read before any arm moves them: the run clock opens on the mode a
+            // Start *arrived* in, exactly as the TUI's `admit_run_targets` reads
+            // its mode before `begin_run` sets Running.
+            pre_app_mode = state.app_mode.clone();
+            pre_is_resolving = state.is_resolving;
 
             // Typed work-start evidence owns the Ready-to-Running transition,
             // and it runs before the per-variant arms so an arm that reads
@@ -1472,16 +1667,21 @@ impl WebState {
             }
         }
 
+        let run_clock_step = self
+            .contextual_run_clock_step(event, &pre_app_mode, pre_is_resolving, dispatch.state)
+            .await;
+
         // Absorb the same event into the process-local operator facts before the
-        // snapshot is projected, so timing, latest activity, eligibility, and
-        // the worktree relation all reach the client at the revision this event
-        // produced rather than one revision late.
-        self.absorb_operator_facts(event).await;
+        // snapshot is projected, so timing, latest activity, eligibility, the
+        // worktree relation, and both clocks all reach the client at the
+        // revision this event produced rather than one revision late.
+        self.absorb_operator_facts(event, sample, run_clock_step)
+            .await;
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
         // against is the one this event just produced.
         let produced = self
-            .project_execution_event(event, dispatch.ownership, dispatch.state)
+            .project_execution_event(event, dispatch.ownership, dispatch.state, sample)
             .await;
 
         // Bind the revision this dispatch produced to its identity. The value
@@ -1496,9 +1696,72 @@ impl WebState {
             .record(dispatch.id, produced);
     }
 
+    /// Decide the mode- and row-dependent run-clock step for one event.
+    ///
+    /// Rows are the reducer display statuses this event produced — the
+    /// authoritative dispatch state when one travelled with it, otherwise a
+    /// non-blocking read-back, otherwise the statuses already held.
+    async fn contextual_run_clock_step(
+        &self,
+        event: &ExecutionEvent,
+        pre_app_mode: &str,
+        pre_is_resolving: bool,
+        authoritative: Option<&crate::orchestration::state::OrchestratorState>,
+    ) -> Option<ContextualRunClockStep> {
+        let ids: Vec<(String, Option<String>)> = self
+            .state
+            .read()
+            .await
+            .changes
+            .iter()
+            .map(|change| (change.id.clone(), change.queue_status.clone()))
+            .collect();
+        let from_reducer = |shared: &crate::orchestration::state::OrchestratorState| {
+            ids.iter()
+                .map(|(id, _)| (id.clone(), shared.display_status(id).to_string()))
+                .collect::<Vec<_>>()
+        };
+        let rows = match authoritative {
+            Some(shared) => from_reducer(shared),
+            None => {
+                let shared = self.shared_orchestrator_state.read().await.clone();
+                let guard = shared.as_ref().and_then(|shared| shared.try_read().ok());
+                match guard {
+                    Some(guard) => from_reducer(&guard),
+                    None => ids
+                        .iter()
+                        .map(|(id, status)| {
+                            (
+                                id.clone(),
+                                status.clone().unwrap_or_else(|| "not queued".to_string()),
+                            )
+                        })
+                        .collect(),
+                }
+            }
+        };
+        // The pre-event status is the last *reducer* observation. A frontend
+        // with no reducer attached has none, so a late `ResolveFailed` there is
+        // not recognized as already-merged; every production owner attaches one.
+        let (_, target, _) = crate::web::remote_control_api::projection::describe_event(event);
+        let facts = self.operator_facts.read().await;
+        let pre_status = target.as_deref().and_then(|id| facts.observed_status(id));
+        contextual_run_clock_step(event, pre_app_mode, pre_is_resolving, pre_status, &rows)
+    }
+
     /// Update the process-local operator facts from one execution event.
-    async fn absorb_operator_facts(&self, event: &ExecutionEvent) {
+    async fn absorb_operator_facts(
+        &self,
+        event: &ExecutionEvent,
+        (now, wall): ObservationSample,
+        run_clock_step: Option<ContextualRunClockStep>,
+    ) {
         let mut facts = self.operator_facts.write().await;
+        match run_clock_step {
+            Some(ContextualRunClockStep::Open) => facts.open_run_at(now, wall),
+            Some(ContextualRunClockStep::Freeze) => facts.freeze_run_at(now, wall),
+            None => {}
+        }
         match event {
             ExecutionEvent::ChangesRefreshed {
                 changes,
@@ -1522,7 +1785,7 @@ impl WebState {
             }
             _ => {}
         }
-        facts.record_event(event);
+        facts.record_event_at(event, now, wall);
     }
 
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1630,6 +1893,40 @@ impl crate::web::remote_control_api::proposal_refresh::RefreshPathSource for Web
     async fn locate(&self, change_id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let facts = self.operator_facts.read().await;
         Some((facts.repo_root()?, facts.worktree_path(change_id)?))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::web::remote_control_api::text_edit::TextEditSource for WebState {
+    async fn project_root(&self) -> Option<std::path::PathBuf> {
+        self.operator_facts.read().await.repo_root()
+    }
+
+    async fn worktree_owner(&self, worktree: &std::path::Path) -> Option<String> {
+        self.operator_facts.read().await.worktree_owner(worktree)
+    }
+
+    /// Coverage comes from the same managed-termination port the snapshot's
+    /// change-keyed `managed_process_live` reads. That mapping keeps its
+    /// `None => false` default because it feeds `force_stop_change`; this one
+    /// does not, so an unbound port is `Unknown`, never `Clear`.
+    async fn writer_coverage_under(
+        &self,
+        root: &std::path::Path,
+    ) -> crate::orchestration::operator_command::WriterCoverage {
+        let port = self.managed_termination.read().await.clone();
+        match port {
+            Some(port) => port.writer_coverage_under(root).await,
+            None => crate::orchestration::operator_command::WriterCoverage::Unknown {
+                detail: "managed writer coverage is unknown: no managed-process port is bound \
+                         to this owner"
+                    .to_string(),
+            },
+        }
+    }
+
+    async fn after_text_write(&self) {
+        self.sync_remote_control_projection().await;
     }
 }
 

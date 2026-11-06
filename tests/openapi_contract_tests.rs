@@ -41,9 +41,10 @@ use conflux::web::remote_control_api::dto::{
     ChangeActivity, ChangeBlocker, ChangeExecutionState, ChangeExecutionStatus, ChangeResource,
     ChangeTiming, ChangeWorktree, CommandRecord, CommandResult, CommandState, ErrorCode,
     EventCategory, EventEnvelope, ExecutionPhase, ExecutionStatusResponse, InstanceSnapshot,
-    LatestLogProjection, ParallelEligibility, ParallelRuntimeState, ProcessExecutionStatus,
-    QueueIntent, SnapshotTotals, StateResponse, ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES,
-    ALL_EXECUTION_PHASES, ALL_TERMINAL_MODES, SUPPORTED_COMMANDS,
+    LatestLogProjection, NetActiveTiming, ParallelEligibility, ParallelRuntimeState,
+    ProcessExecutionStatus, QueueIntent, RunClock, SnapshotTotals, StateResponse,
+    ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES, ALL_EXECUTION_PHASES, ALL_TERMINAL_MODES,
+    SUPPORTED_COMMANDS,
 };
 use conflux::web::remote_control_api::worktrees::{
     WorktreeConflict, WorktreeEligibility, WorktreeResource, WorktreeResponse,
@@ -1094,6 +1095,514 @@ fn force_stop_change_contract_is_published_end_to_end() {
     }
 }
 
+/// Everything a client of the abort-on-conflict merge branches on.
+fn merge_abort_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let spec = schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["type"]["enum"][0] == "merge_worktree_abort_on_conflict"
+            })
+        })
+        .cloned();
+    match spec {
+        None => errors.push("the merge_worktree_abort_on_conflict command is not published".into()),
+        Some(spec) => {
+            let properties: BTreeSet<&str> = spec["properties"]
+                .as_object()
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if properties != BTreeSet::from(["type", "target", "params"]) {
+                errors.push(format!(
+                    "merge_worktree_abort_on_conflict must accept only target and params: {properties:?}"
+                ));
+            }
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants
+                .iter()
+                .any(|variant| variant.to_string().contains("\"merge_abort\""))
+        });
+    if !result_published {
+        errors.push("the merge_abort result kind is not published".into());
+    }
+    let result = &schemas(doc)["MergeAbortResult"];
+    let required: BTreeSet<&str> = result["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for member in [
+        "worktree_id",
+        "branch",
+        "outcome",
+        "premerge_head",
+        "conflict_files",
+        "abort",
+        "recovery",
+    ] {
+        if !required.contains(member) {
+            errors.push(format!("MergeAbortResult must require `{member}`"));
+        }
+    }
+    let evidence: BTreeSet<&str> = schemas(doc)["MergeAbortEvidence"]["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for member in [
+        "exit_ok",
+        "head_after",
+        "merge_head_present",
+        "clean_after",
+        "restored",
+        "detail",
+    ] {
+        if !evidence.contains(member) {
+            errors.push(format!("MergeAbortEvidence must require `{member}`"));
+        }
+    }
+    let restored = published_enum(doc, "MergeAbortRestoration");
+    if restored != BTreeSet::from(["confirmed", "failed", "unknown"].map(String::from)) {
+        errors.push(format!("MergeAbortRestoration vocabulary: {restored:?}"));
+    }
+
+    let codes = published_enum(doc, "ErrorCode");
+    for code in [
+        "merge_conflict",
+        "merge_conflict_predicted",
+        "merge_conflict_aborted",
+        "merge_abort_failed",
+    ] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    let worktrees = &schemas(doc)["WorktreeCapabilities"];
+    if worktrees["properties"]["merge_abort"].is_null() {
+        errors.push("capabilities.worktrees.merge_abort is not published".into());
+    }
+    let worktree_required: BTreeSet<&str> = worktrees["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !worktree_required.contains("merge_conflict_preserves_state") {
+        errors.push("merge_conflict_preserves_state must stay required".into());
+    }
+    if worktree_required.contains("merge_abort") {
+        errors.push("merge_abort must decode as absent from an older owner".into());
+    }
+    errors
+}
+
+#[test]
+fn remote_merge_abort_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        MergeAbortEvidence, MergeAbortOutcome, MergeAbortRestoration, MergeAbortResult,
+    };
+    use conflux::web::remote_control_api::worktrees::WorktreeCapabilities;
+
+    let doc = generated();
+    assert_eq!(merge_abort_contract_errors(&doc), Vec::<String>::new());
+
+    // What the server serializes is what the schema describes.
+    let record = CommandRecord {
+        command_type: "merge_worktree_abort_on_conflict".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::MergeAbortFailed),
+        result: Some(CommandResult::MergeAbort(Box::new(MergeAbortResult {
+            worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+            branch: "alpha".to_string(),
+            outcome: MergeAbortOutcome::AbortFailed,
+            premerge_head: Some("a".repeat(40)),
+            conflict_files: vec!["src/lib.rs".to_string()],
+            abort: Some(MergeAbortEvidence {
+                exit_ok: false,
+                head_after: Some("a".repeat(40)),
+                merge_head_present: Some(true),
+                clean_after: None,
+                restored: MergeAbortRestoration::Unknown,
+                detail: "fatal: injected".to_string(),
+            }),
+            recovery: Some("local_or_tui_required".to_string()),
+            merge: None,
+            hook: None,
+        }))),
+        ..command_record()
+    };
+    let capabilities = WorktreeCapabilities::default();
+    assert!(capabilities.merge_conflict_preserves_state);
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("WorktreeCapabilities", to_value(&capabilities)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        to_value(&capabilities)["merge_conflict_preserves_state"],
+        true
+    );
+    assert_eq!(to_value(&record)["result"]["kind"], "merge_abort");
+
+    // Negative controls: the predicate notices a dropped result kind and a
+    // dropped error code.
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("\"merge_abort\""));
+    assert_ne!(without_kind, doc);
+    assert!(merge_abort_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("merge_abort result kind")));
+
+    let mut without_code = doc.clone();
+    without_code["components"]["schemas"]["ErrorCode"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|code| code != "merge_abort_failed");
+    assert_ne!(without_code, doc);
+    assert!(merge_abort_contract_errors(&without_code)
+        .iter()
+        .any(|error| error.contains("merge_abort_failed")));
+}
+
+/// Everything a client of consent-bound confirmed deletion branches on.
+fn confirmed_delete_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let properties_of = |schema: &Value| -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let required_of = |schema: &Value| -> BTreeSet<String> {
+        schema["required"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let spec = schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["type"]["enum"][0] == "delete_worktree_confirmed"
+            })
+        })
+        .cloned();
+    match spec {
+        None => errors.push("the delete_worktree_confirmed command is not published".into()),
+        Some(spec) => {
+            let properties = properties_of(&spec);
+            if properties != BTreeSet::from(["type", "target", "params"].map(String::from)) {
+                errors.push(format!(
+                    "delete_worktree_confirmed must accept only target and params: {properties:?}"
+                ));
+            }
+            if !spec["properties"]["params"]
+                .to_string()
+                .contains("ConfirmedDeleteParams")
+            {
+                errors
+                    .push("delete_worktree_confirmed params must be ConfirmedDeleteParams".into());
+            }
+        }
+    }
+
+    let params = &schemas(doc)["ConfirmedDeleteParams"];
+    let expected_params = BTreeSet::from(
+        [
+            "skip_teardown",
+            "discard_known_dirty",
+            "discard_commits_ahead",
+            "consent",
+        ]
+        .map(String::from),
+    );
+    if properties_of(params) != expected_params || required_of(params) != expected_params {
+        errors.push(format!(
+            "ConfirmedDeleteParams must require exactly the three permissions and consent: {params}"
+        ));
+    }
+    if params["additionalProperties"] != Value::Bool(false) {
+        errors.push("ConfirmedDeleteParams must refuse unknown members".into());
+    }
+    let consent = &schemas(doc)["DeleteConsent"];
+    let consent_fields = BTreeSet::from(
+        [
+            "branch",
+            "head",
+            "dirty",
+            "has_commits_ahead",
+            "has_ignored_content",
+            "merge_base",
+            "discardable_content_id",
+            "ignored_content_id",
+        ]
+        .map(String::from),
+    );
+    if properties_of(consent) != consent_fields {
+        errors.push(format!(
+            "DeleteConsent must hold exactly the eight consent fields: {:?}",
+            properties_of(consent)
+        ));
+    }
+    if consent["additionalProperties"] != Value::Bool(false) {
+        errors.push("DeleteConsent must refuse unknown members".into());
+    }
+
+    let preview = &doc["paths"]["/api/v2/worktrees/{worktree_id}/delete-preview"]["get"];
+    if preview.is_null() {
+        errors.push("the delete-preview route is not published".into());
+    } else if !preview.to_string().contains("DeletePreviewResponse") {
+        errors.push("the delete-preview route must answer DeletePreviewResponse".into());
+    }
+    let response = &schemas(doc)["DeletePreviewResponse"];
+    for member in [
+        "observed_at",
+        "branch",
+        "head",
+        "is_main",
+        "dirty",
+        "has_commits_ahead",
+        "inspection",
+        "content_observation",
+        "has_ignored_content",
+        "ignored_entries",
+        "teardown_script_present",
+        "options",
+        "consent",
+    ] {
+        if !required_of(response).contains(member) {
+            errors.push(format!("DeletePreviewResponse must require `{member}`"));
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants.iter().any(|variant| {
+                variant
+                    .to_string()
+                    .contains("\"delete_worktree_confirmed\"")
+            })
+        });
+    if !result_published {
+        errors.push("the delete_worktree_confirmed result kind is not published".into());
+    }
+    let result = &schemas(doc)["ConfirmedDeleteResult"];
+    for member in [
+        "worktree_id",
+        "outcome",
+        "teardown",
+        "dirty_discarded",
+        "commits_discarded",
+        "branch_deleted",
+        "branch_retained_reason",
+        "refusal",
+    ] {
+        if !required_of(result).contains(member) {
+            errors.push(format!("ConfirmedDeleteResult must require `{member}`"));
+        }
+    }
+    let teardown = published_enum(doc, "TeardownDisposition");
+    if teardown != BTreeSet::from(["ran", "skipped", "absent", "not_reached"].map(String::from)) {
+        errors.push(format!("TeardownDisposition vocabulary: {teardown:?}"));
+    }
+    let observation = published_enum(doc, "ContentObservationKind");
+    if observation
+        != BTreeSet::from(
+            [
+                "observed",
+                "status_failed",
+                "unbounded",
+                "nested_repository",
+            ]
+            .map(String::from),
+        )
+    {
+        errors.push(format!(
+            "ContentObservationKind vocabulary: {observation:?}"
+        ));
+    }
+    let reasons = published_enum(doc, "ConfirmedDeleteReason");
+    for reason in [
+        "content_changed",
+        "content_unbounded",
+        "nested_repository",
+        "ignored_content",
+        "teardown_failed",
+    ] {
+        if !reasons.contains(reason) {
+            errors.push(format!("ConfirmedDeleteReason must publish `{reason}`"));
+        }
+    }
+
+    if !published_enum(doc, "ErrorCode").contains("delete_consent_stale") {
+        errors.push("the error code `delete_consent_stale` is not published".into());
+    }
+
+    let worktrees = &schemas(doc)["WorktreeCapabilities"];
+    if worktrees["properties"]["confirmed_delete"].is_null() {
+        errors.push("capabilities.worktrees.confirmed_delete is not published".into());
+    }
+    let worktree_required = required_of(worktrees);
+    if worktree_required.contains("confirmed_delete") {
+        errors.push("confirmed_delete must decode as absent from an older owner".into());
+    }
+    if !worktree_required.contains("delete_requires_teardown") {
+        errors.push("delete_requires_teardown must stay required".into());
+    }
+    let description = worktrees["properties"]["delete_requires_teardown"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    if !description.contains("`delete_worktree` command") {
+        errors.push(format!(
+            "delete_requires_teardown must describe the delete_worktree command: {description}"
+        ));
+    }
+    errors
+}
+
+#[test]
+fn remote_confirmed_delete_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        ConfirmedDeleteRefusalResult, ConfirmedDeleteResult,
+    };
+    use conflux::web::remote_control_api::worktrees::WorktreeCapabilities;
+    use conflux::worktree_ops::consent::{
+        ConfirmedDeleteReason, ConsentObservation, ContentObservationKind, TeardownDisposition,
+    };
+
+    let doc = generated();
+    assert_eq!(confirmed_delete_contract_errors(&doc), Vec::<String>::new());
+    assert!(SUPPORTED_V2_PATHS.contains(&"/api/v2/worktrees/{worktree_id}/delete-preview"));
+    assert!(SUPPORTED_COMMANDS.contains(&"delete_worktree_confirmed"));
+
+    // What the server serializes is what the schema describes.
+    let record = CommandRecord {
+        command_type: "delete_worktree_confirmed".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::DeleteConsentStale),
+        result: Some(CommandResult::DeleteWorktreeConfirmed(Box::new(
+            ConfirmedDeleteResult {
+                worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+                branch: "alpha".to_string(),
+                head: "a".repeat(40),
+                outcome: None,
+                teardown: TeardownDisposition::NotReached,
+                dirty_discarded: false,
+                commits_discarded: false,
+                branch_deleted: false,
+                branch_retained_reason: None,
+                refusal: Some(ConfirmedDeleteRefusalResult {
+                    reason: Some(ConfirmedDeleteReason::ContentChanged),
+                    teardown_ran: false,
+                    observed: Some(ConsentObservation {
+                        branch: "alpha".to_string(),
+                        head: "a".repeat(40),
+                        dirty: Some(true),
+                        has_commits_ahead: Some(false),
+                        has_ignored_content: Some(false),
+                        merge_base: Some("b".repeat(40)),
+                        discardable_content_id: Some(format!("sha256:{}", "c".repeat(64))),
+                        ignored_content_id: Some(format!("sha256:{}", "d".repeat(64))),
+                        content_observation: ContentObservationKind::Observed,
+                    }),
+                }),
+            },
+        ))),
+        ..command_record()
+    };
+    let capabilities = WorktreeCapabilities::default();
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("WorktreeCapabilities", to_value(&capabilities)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        to_value(&record)["result"]["kind"],
+        "delete_worktree_confirmed"
+    );
+    // `delete_requires_teardown` keeps its value; only its description narrowed.
+    assert_eq!(to_value(&capabilities)["delete_requires_teardown"], true);
+    assert_eq!(
+        to_value(&capabilities)["confirmed_delete"]["available"],
+        true
+    );
+
+    // An older owner omits the block: it decodes as unavailable, and its
+    // `delete_requires_teardown: true` still reads the same.
+    let mut older = to_value(&capabilities);
+    older.as_object_mut().unwrap().remove("confirmed_delete");
+    let decoded: WorktreeCapabilities = serde_json::from_value(older).unwrap();
+    assert!(!decoded.confirmed_delete.available);
+    assert!(decoded.delete_requires_teardown);
+
+    // Negative controls: the predicate notices a dropped route, a dropped
+    // result kind, and a delete_requires_teardown that stopped being required.
+    let mut without_route = doc.clone();
+    without_route["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktrees/{worktree_id}/delete-preview");
+    assert_ne!(without_route, doc);
+    assert!(confirmed_delete_contract_errors(&without_route)
+        .iter()
+        .any(|error| error.contains("delete-preview route")));
+
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| {
+            !variant
+                .to_string()
+                .contains("\"delete_worktree_confirmed\"")
+        });
+    assert_ne!(without_kind, doc);
+    assert!(confirmed_delete_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("delete_worktree_confirmed result kind")));
+
+    let mut optional_teardown = doc.clone();
+    optional_teardown["components"]["schemas"]["WorktreeCapabilities"]["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|member| member != "delete_requires_teardown");
+    assert!(confirmed_delete_contract_errors(&optional_teardown)
+        .iter()
+        .any(|error| error.contains("delete_requires_teardown must stay required")));
+}
+
 /// The server always publishes refresh eligibility even though the client
 /// decoder accepts its absence from owners built before refresh existed.
 #[test]
@@ -1126,6 +1635,178 @@ fn refresh_eligibility_remains_required_and_non_null_in_published_schema() {
         "refresh eligibility must not admit a null type"
     );
     assert!(property.get("anyOf").is_none() && property.get("oneOf").is_none());
+}
+
+/// Archive completion and both execution clocks, as a client meets them.
+///
+/// Each top-level member is required and non-null: this server always writes
+/// it, and only an older owner omits it. The nested members are required too —
+/// always serialized — with the instants and the frozen duration nullable.
+/// `ChangeTiming` keeps exactly its three per-run members.
+fn progress_timing_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let defs = schemas(doc);
+
+    for (schema, member, reference) in [
+        ("ChangeResource", "archive_complete", None),
+        ("ChangeResource", "net_active", Some("NetActiveTiming")),
+        ("InstanceSnapshot", "run_clock", Some("RunClock")),
+    ] {
+        let published = &defs[schema];
+        let required = published["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|name| name == member));
+        if !required {
+            errors.push(format!("{schema}.{member} must be published as required"));
+        }
+        let property = &published["properties"][member];
+        if property.is_null() {
+            errors.push(format!("{schema}.{member} is not published"));
+            continue;
+        }
+        let admits_null = property.get("nullable").is_some_and(|n| n == true)
+            || property["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "null"))
+            || property.get("anyOf").is_some()
+            || property.get("oneOf").is_some();
+        if admits_null {
+            errors.push(format!("{schema}.{member} must not be nullable"));
+        }
+        match reference {
+            Some(target) => {
+                if property["$ref"] != format!("#/components/schemas/{target}") {
+                    errors.push(format!("{schema}.{member} must reference {target}"));
+                }
+            }
+            None => {
+                if property["type"] != "boolean" {
+                    errors.push(format!("{schema}.{member} must be a boolean"));
+                }
+            }
+        }
+    }
+
+    for (schema, members, nullable) in [
+        (
+            "NetActiveTiming",
+            &["accumulated_ms", "active_since", "has_history"][..],
+            &["active_since"][..],
+        ),
+        (
+            "RunClock",
+            &["started_at", "ended_at", "elapsed_ms"][..],
+            &["started_at", "ended_at", "elapsed_ms"][..],
+        ),
+    ] {
+        let published = &defs[schema];
+        if published.is_null() {
+            errors.push(format!("{schema} is not published"));
+            continue;
+        }
+        let required: BTreeSet<&str> = published["required"]
+            .as_array()
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let properties: BTreeSet<&str> = published["properties"]
+            .as_object()
+            .map(|props| props.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let expected: BTreeSet<&str> = members.iter().copied().collect();
+        if properties != expected || required != expected {
+            errors.push(format!(
+                "{schema} must publish exactly {expected:?} as required (properties {properties:?}, required {required:?})"
+            ));
+        }
+        for member in members {
+            let admits_null = published["properties"][member]["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "null"));
+            if admits_null != nullable.contains(member) {
+                errors.push(format!(
+                    "{schema}.{member} nullability must be {}",
+                    nullable.contains(member)
+                ));
+            }
+        }
+    }
+
+    let timing = &defs["ChangeTiming"];
+    let timing_members: BTreeSet<&str> = timing["properties"]
+        .as_object()
+        .map(|props| props.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if timing_members != BTreeSet::from(["started_at", "completed_at", "elapsed_ms"]) {
+        errors.push(format!("ChangeTiming members changed: {timing_members:?}"));
+    }
+    if !timing["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("not cumulative"))
+    {
+        errors.push("ChangeTiming must say it is per run and not cumulative".to_string());
+    }
+    errors
+}
+
+#[test]
+fn remote_progress_timing_members_are_published_required_and_non_null() {
+    let doc = generated();
+    assert_eq!(progress_timing_errors(&doc), Vec::<String>::new());
+
+    // The DTO values constructed field by field validate against the document.
+    let payload = to_value(&state_response());
+    assert_eq!(payload["snapshot"]["changes"][0]["archive_complete"], true);
+    assert!(payload["snapshot"]["changes"][0]["net_active"].is_object());
+    assert!(payload["snapshot"]["run_clock"].is_object());
+    let mut errors = Vec::new();
+    validate(
+        &payload,
+        &schemas(&doc)["StateResponse"],
+        schemas(&doc),
+        "StateResponse",
+        &mut errors,
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+/// Negative control: a document that drops `net_active` fails both the
+/// publication check and payload validation, so the positive case is not
+/// passing vacuously.
+#[test]
+fn remote_progress_timing_omitting_a_member_fails_the_contract() {
+    let mut doc = generated();
+    let change = doc["components"]["schemas"]["ChangeResource"]
+        .as_object_mut()
+        .expect("ChangeResource schema");
+    change["required"]
+        .as_array_mut()
+        .expect("required list")
+        .retain(|member| member != "net_active");
+    change["properties"]
+        .as_object_mut()
+        .expect("properties")
+        .remove("net_active")
+        .expect("net_active was published");
+
+    let errors = progress_timing_errors(&doc);
+    assert!(
+        errors.iter().any(|error| error.contains("net_active")),
+        "{errors:?}"
+    );
+    let mut payload_errors = Vec::new();
+    validate(
+        &to_value(&state_response()),
+        &schemas(&doc)["StateResponse"],
+        schemas(&doc),
+        "StateResponse",
+        &mut payload_errors,
+    );
+    assert!(
+        payload_errors
+            .iter()
+            .any(|error| error.contains("`net_active` is serialized but unpublished")),
+        "{payload_errors:?}"
+    );
 }
 
 /// The retired Apply-limit token stays published, and stays a token.
@@ -1635,6 +2316,11 @@ fn state_response() -> StateResponse {
                 in_progress: 1,
                 pending: 0,
             },
+            run_clock: Some(RunClock {
+                started_at: Some("2026-08-04T00:00:00Z".to_string()),
+                ended_at: Some("2026-08-04T00:15:03Z".to_string()),
+                elapsed_ms: Some(903_000),
+            }),
         },
     }
 }
@@ -1726,6 +2412,12 @@ fn change_resource() -> ChangeResource {
                     ),
             },
         ),
+        archive_complete: Some(true),
+        net_active: Some(NetActiveTiming {
+            accumulated_ms: 125_000,
+            active_since: Some("2026-08-04T00:14:45.123Z".to_string()),
+            has_history: true,
+        }),
     }
 }
 
@@ -1781,6 +2473,7 @@ fn execution_status() -> ExecutionStatusResponse {
             has_active_work: true,
             active_activities: vec!["dependency_analysis".to_string()],
             latest_log: Some(latest_log()),
+            worktree_sessions_running: 1,
         },
         changes: vec![ChangeExecutionStatus {
             id: "a-change".to_string(),
@@ -1854,4 +2547,1138 @@ fn event_envelope() -> EventEnvelope {
 
 fn api_error() -> ApiError {
     ApiError::new(ErrorCode::StaleRevision, "revision moved", "corr-1").with_revision(9)
+}
+
+// ============================================================================
+// Bounded remote text edit
+// ============================================================================
+
+fn variant<'a>(doc: &'a Value, schema: &str, tag: &str, value: &str) -> Option<&'a Value> {
+    schemas(doc)[schema]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants
+                .iter()
+                .find(|variant| variant["properties"][tag]["enum"][0] == value)
+        })
+}
+
+fn property_names(schema: &Value) -> BTreeSet<&str> {
+    schema["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+fn required_names(schema: &Value) -> BTreeSet<&str> {
+    schema["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Every element of the text surface a generated client needs, by name.
+fn text_edit_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for route in [
+        "/api/v2/changes/{change_id}/text",
+        "/api/v2/worktrees/{worktree_id}/text",
+    ] {
+        let operation = &doc["paths"][route]["get"];
+        if operation.is_null() {
+            errors.push(format!("the text read route {route} is not published"));
+            continue;
+        }
+        let params: BTreeSet<&str> = operation["parameters"]
+            .as_array()
+            .map(|p| p.iter().filter_map(|p| p["name"].as_str()).collect())
+            .unwrap_or_default();
+        if !params.contains("path") {
+            errors.push(format!("{route} must publish its `path` query parameter"));
+        }
+        if !operation.to_string().contains("TextReadResponse") {
+            errors.push(format!("{route} must answer with TextReadResponse"));
+        }
+    }
+
+    for command in ["write_change_text", "write_worktree_text"] {
+        match variant(doc, "CommandSpec", "type", command) {
+            None => errors.push(format!("the {command} command is not published")),
+            Some(spec) => {
+                if property_names(spec) != BTreeSet::from(["type", "target", "params"]) {
+                    errors.push(format!("{command} must accept only target and params"));
+                }
+                if !spec["properties"]["params"]
+                    .to_string()
+                    .contains("TextWriteParams")
+                {
+                    errors.push(format!("{command} params must be TextWriteParams"));
+                }
+            }
+        }
+    }
+    let params = &schemas(doc)["TextWriteParams"];
+    if required_names(params) != BTreeSet::from(["path", "expected", "content"]) {
+        errors.push("TextWriteParams must require exactly path, expected, and content".into());
+    }
+    for kind in ["content", "absent"] {
+        if variant(doc, "TextExpectation", "kind", kind).is_none() {
+            errors.push(format!("the `{kind}` expectation is not published"));
+        }
+    }
+
+    let result_published = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .is_some_and(|variants| {
+            variants
+                .iter()
+                .any(|variant| variant.to_string().contains("\"text_write\""))
+        });
+    if !result_published {
+        errors.push("the text_write result kind is not published".into());
+    }
+    let result_required = required_names(&schemas(doc)["TextWriteResult"]);
+    for member in [
+        "scope",
+        "path",
+        "outcome",
+        "reason",
+        "detail",
+        "content_id_before",
+        "content_id_after",
+        "current_content_id",
+        "bytes_written",
+        "mode",
+        "effects",
+    ] {
+        if !result_required.contains(member) {
+            errors.push(format!("TextWriteResult must require `{member}`"));
+        }
+    }
+    let read_required = required_names(&schemas(doc)["TextReadResponse"]);
+    for member in [
+        "content",
+        "content_id",
+        "editable",
+        "edit_blocked_reason",
+        "edit_blocked_detail",
+        "limits",
+    ] {
+        if !read_required.contains(member) {
+            errors.push(format!("TextReadResponse must require `{member}`"));
+        }
+    }
+    let reasons = published_enum(doc, "TextEditBlockedReason");
+    if reasons
+        != BTreeSet::from(
+            [
+                "change_active",
+                "change_admitted",
+                "managed_process_live",
+                "root_busy",
+            ]
+            .map(String::from),
+        )
+    {
+        errors.push(format!("TextEditBlockedReason vocabulary: {reasons:?}"));
+    }
+
+    let codes = published_enum(doc, "ErrorCode");
+    for code in ["text_stale", "text_not_editable"] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    let capabilities = &schemas(doc)["CapabilitiesResponse"];
+    if capabilities["properties"]["text_edit"].is_null() {
+        errors.push("capabilities.text_edit is not published".into());
+    }
+    if required_names(capabilities).contains("text_edit") {
+        errors.push("text_edit must decode as absent from an older owner".into());
+    }
+    errors
+}
+
+#[test]
+fn remote_text_edit_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        TextEditBlockedReason, TextReadResponse, TextScope, TextWriteEffects, TextWriteOutcome,
+        TextWriteResult,
+    };
+
+    let doc = generated();
+    assert_eq!(text_edit_contract_errors(&doc), Vec::<String>::new());
+    for route in [
+        "/api/v2/changes/{change_id}/text",
+        "/api/v2/worktrees/{worktree_id}/text",
+    ] {
+        assert!(SUPPORTED_V2_PATHS.contains(&route), "{route}");
+    }
+    assert!(SUPPORTED_COMMANDS.contains(&"write_change_text"));
+    assert!(SUPPORTED_COMMANDS.contains(&"write_worktree_text"));
+
+    // What the server serializes is what the schemas describe, field by field.
+    let record = CommandRecord {
+        command_type: "write_worktree_text".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::TextStale),
+        result: Some(CommandResult::TextWrite(Box::new(TextWriteResult {
+            scope: TextScope::Worktree {
+                worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            path: "src/lib.rs".to_string(),
+            outcome: None,
+            reason: Some("stale".to_string()),
+            detail: None,
+            content_id_before: None,
+            content_id_after: None,
+            current_content_id: Some(format!("sha256:{}", "a".repeat(64))),
+            bytes_written: None,
+            mode: None,
+            effects: TextWriteEffects {
+                file_written: false,
+            },
+        }))),
+        ..command_record()
+    };
+    let written = CommandRecord {
+        command_type: "write_change_text".to_string(),
+        state: CommandState::Succeeded,
+        error_code: None,
+        result: Some(CommandResult::TextWrite(Box::new(TextWriteResult {
+            scope: TextScope::Change {
+                change_id: "alpha".to_string(),
+            },
+            path: "tasks.md".to_string(),
+            outcome: Some(TextWriteOutcome::Written),
+            reason: None,
+            detail: None,
+            content_id_before: Some(format!("sha256:{}", "a".repeat(64))),
+            content_id_after: Some(format!("sha256:{}", "b".repeat(64))),
+            current_content_id: Some(format!("sha256:{}", "b".repeat(64))),
+            bytes_written: Some(12),
+            mode: Some("0644".to_string()),
+            effects: TextWriteEffects { file_written: true },
+        }))),
+        ..command_record()
+    };
+    let read = TextReadResponse {
+        instance_id: "instance-1".to_string(),
+        state_revision: 41,
+        scope: TextScope::Worktree {
+            worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+        },
+        path: "src/lib.rs".to_string(),
+        exists: true,
+        content: Some("fn main() {}\n".to_string()),
+        content_id: Some(format!("sha256:{}", "c".repeat(64))),
+        size_bytes: Some(13),
+        mode: Some("0644".to_string()),
+        editable: false,
+        edit_blocked_reason: Some(TextEditBlockedReason::ManagedProcessLive),
+        edit_blocked_detail: Some("managed writer coverage is unknown".to_string()),
+        limits: conflux::web::remote_control_api::text_edit::limits(),
+    };
+    let capability = conflux::web::remote_control_api::text_edit::capability(true);
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("CommandRecord", to_value(&written)),
+        ("TextReadResponse", to_value(&read)),
+        ("TextEditCapability", to_value(&capability)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(to_value(&record)["result"]["kind"], "text_write");
+    assert_eq!(
+        to_value(&read)["edit_blocked_reason"],
+        "managed_process_live"
+    );
+
+    // The route surface and removed-path predicates still hold with the two
+    // new routes in place.
+    assert_eq!(route_surface_errors(&doc), Vec::<String>::new());
+    assert_eq!(removed_path_errors(&doc), Vec::<String>::new());
+}
+
+#[test]
+fn remote_text_edit_contract_omission_is_detected() {
+    let doc = generated();
+
+    let mut without_kind = doc.clone();
+    without_kind["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("\"text_write\""));
+    assert_ne!(without_kind, doc);
+    assert!(text_edit_contract_errors(&without_kind)
+        .iter()
+        .any(|error| error.contains("text_write result kind")));
+
+    let mut without_route = doc.clone();
+    without_route["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktrees/{worktree_id}/text");
+    assert_ne!(without_route, doc);
+    assert!(text_edit_contract_errors(&without_route)
+        .iter()
+        .any(|error| error.contains("/api/v2/worktrees/{worktree_id}/text")));
+    assert!(!route_surface_errors(&without_route).is_empty());
+
+    let mut without_command = doc.clone();
+    without_command["components"]["schemas"]["CommandSpec"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| variant["properties"]["type"]["enum"][0] != "write_change_text");
+    assert!(text_edit_contract_errors(&without_command)
+        .iter()
+        .any(|error| error.contains("write_change_text")));
+
+    let mut without_code = doc.clone();
+    without_code["components"]["schemas"]["ErrorCode"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|code| code != "text_stale");
+    assert!(text_edit_contract_errors(&without_code)
+        .iter()
+        .any(|error| error.contains("text_stale")));
+}
+
+// ============================================================================
+// Configured-command worktree sessions
+// ============================================================================
+
+/// The `kind` discriminants a `CommandResult` variant publishes, whether the
+/// variant is inline or an `allOf` over its own result schema.
+fn result_kinds(doc: &Value) -> BTreeSet<String> {
+    let mut kinds = BTreeSet::new();
+    for variant in schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let parts: Vec<Value> = match variant["allOf"].as_array() {
+            Some(parts) => parts.clone(),
+            None => vec![variant.clone()],
+        };
+        for part in parts {
+            for kind in part["properties"]["kind"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                if let Some(kind) = kind.as_str() {
+                    kinds.insert(kind.to_string());
+                }
+            }
+        }
+    }
+    kinds
+}
+
+fn command_variant<'a>(doc: &'a Value, name: &str) -> Option<&'a Value> {
+    schemas(doc)["CommandSpec"]["oneOf"]
+        .as_array()?
+        .iter()
+        .find(|variant| variant["properties"]["type"]["enum"][0] == name)
+}
+
+fn session_resource() -> conflux::web::remote_control_api::dto::WorktreeSessionResource {
+    use conflux::web::remote_control_api::dto::{
+        SessionCleanupFacts, SessionOutput, SessionOutputLine, SessionSetupFacts,
+        WorktreeSessionResource,
+    };
+    WorktreeSessionResource {
+        session_id: "a".repeat(32),
+        instance_id: "instance-1".to_string(),
+        kind: "session".to_string(),
+        worktree_id: Some("b".repeat(32)),
+        path: "../ws/proposal-1730000000000".to_string(),
+        branch: "ws-session-ab12cd34ef".to_string(),
+        state: "stopped".to_string(),
+        attempt: 1,
+        started_at: "2026-08-04T00:00:00Z".to_string(),
+        finished_at: Some("2026-08-04T00:00:05Z".to_string()),
+        exit_code: None,
+        signal: Some("SIGTERM".to_string()),
+        stop_requested: true,
+        setup: Some(SessionSetupFacts {
+            ran: true,
+            succeeded: true,
+        }),
+        cleanup: Some(SessionCleanupFacts {
+            outcome: "retained".to_string(),
+            removed: false,
+            reason: Some("device busy".to_string()),
+        }),
+        output: SessionOutput {
+            lines: vec![SessionOutputLine {
+                stream: "stdout".to_string(),
+                text: "hello".to_string(),
+            }],
+            retained_bytes: 5,
+            truncated_bytes: 0,
+        },
+        runner_notices: Some(Vec::new()),
+        runner_notices_dropped: Some(0),
+    }
+}
+
+/// Everything the session surface publishes, as one predicate so the same
+/// check can be run against a deliberately incomplete copy.
+fn session_contract_errors(doc: &Value) -> Vec<String> {
+    use conflux::web::remote_control_api::dto::{
+        SessionCleanupFacts, SessionSetupFacts, WorktreeSessionCapability,
+        WorktreeSessionEventType, WorktreeSessionResponse, WorktreeSessionResult,
+        WorktreeSessionsResponse,
+    };
+    let mut errors = Vec::new();
+
+    // Three commands, each closed over its own target.
+    for (name, target) in [
+        ("run_worktree_command", Some("WorktreeTarget")),
+        ("create_session_worktree", None),
+        ("stop_worktree_session", Some("SessionTarget")),
+    ] {
+        let Some(variant) = command_variant(doc, name) else {
+            errors.push(format!("the command `{name}` is not published"));
+            continue;
+        };
+        let reference = variant["properties"]["target"]["$ref"].as_str();
+        match target {
+            Some(schema) => {
+                if reference != Some(&format!("#/components/schemas/{schema}")) {
+                    errors.push(format!("`{name}` must target `{schema}`: {variant}"));
+                }
+            }
+            None => {
+                if variant["properties"].get("target").is_some() {
+                    errors.push(format!("`{name}` must take no target: {variant}"));
+                }
+            }
+        }
+        for smuggled in ["command", "argv", "env", "path", "branch", "change_id"] {
+            if variant["properties"].get(smuggled).is_some() {
+                errors.push(format!("`{name}` must not publish `{smuggled}`"));
+            }
+        }
+    }
+    if schemas(doc)["SessionTarget"]["properties"]
+        .as_object()
+        .map(|p| p.keys().cloned().collect::<Vec<_>>())
+        != Some(vec!["session_id".to_string()])
+    {
+        errors.push("SessionTarget must carry exactly `session_id`".into());
+    }
+
+    // Two read routes, both bearer-gated GETs.
+    for route in [
+        "/api/v2/worktree-sessions",
+        "/api/v2/worktree-sessions/{session_id}",
+    ] {
+        if doc["paths"][route]["get"].is_null() {
+            errors.push(format!("the route `{route}` is not published"));
+        }
+        if UNAUTHENTICATED_V2_PATHS.contains(&route) {
+            errors.push(format!("the route `{route}` must be authenticated"));
+        }
+    }
+
+    // Two result kinds and three error codes.
+    let kinds = result_kinds(doc);
+    for kind in ["worktree_session", "worktree_session_stop"] {
+        if !kinds.contains(kind) {
+            errors.push(format!("the result kind `{kind}` is not published"));
+        }
+    }
+    let codes = published_enum(doc, "ErrorCode");
+    for code in [
+        "worktree_session_unavailable",
+        "worktree_session_busy",
+        "worktree_session_setup_failed",
+    ] {
+        if !codes.contains(code) {
+            errors.push(format!("the error code `{code}` is not published"));
+        }
+    }
+
+    // The capability, the event vocabulary, and the execution-status counter.
+    if schemas(doc)["CapabilitiesResponse"]["properties"]["worktree_sessions"].is_null() {
+        errors.push("CapabilitiesResponse.worktree_sessions is not published".into());
+    }
+    let events = published_enum(doc, "WorktreeSessionEventType");
+    for event in ["worktree_session_started", "worktree_session_finished"] {
+        if !events.contains(event) {
+            errors.push(format!("the event type `{event}` is not published"));
+        }
+    }
+    if schemas(doc)["ProcessExecutionStatus"]["properties"]["worktree_sessions_running"].is_null() {
+        errors.push("ProcessExecutionStatus.worktree_sessions_running is not published".into());
+    }
+
+    // DTO values constructed field by field validate against what is published.
+    let launch = CommandRecord {
+        command_type: "create_session_worktree".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::WorktreeSessionSetupFailed),
+        result: Some(CommandResult::WorktreeSession(Box::new(
+            WorktreeSessionResult {
+                session_id: None,
+                session_kind: "session".to_string(),
+                worktree_id: None,
+                branch: "ws-session-ab12cd34ef".to_string(),
+                path: "../ws/proposal-1730000000000".to_string(),
+                setup: Some(SessionSetupFacts {
+                    ran: true,
+                    succeeded: false,
+                }),
+                cleanup: Some(SessionCleanupFacts {
+                    outcome: "removed".to_string(),
+                    removed: true,
+                    reason: None,
+                }),
+            },
+        ))),
+        ..command_record()
+    };
+    let stop = CommandRecord {
+        command_type: "stop_worktree_session".to_string(),
+        state: CommandState::Succeeded,
+        error_code: None,
+        result: Some(CommandResult::WorktreeSessionStop {
+            session_id: "a".repeat(32),
+            terminated: true,
+            state_after: "stopped".to_string(),
+        }),
+        ..command_record()
+    };
+    let capability = WorktreeSessionCapability {
+        available: true,
+        commands: vec![
+            "run_worktree_command".to_string(),
+            "create_session_worktree".to_string(),
+            "stop_worktree_session".to_string(),
+        ],
+        routes: vec![
+            "/api/v2/worktree-sessions".to_string(),
+            "/api/v2/worktree-sessions/{session_id}".to_string(),
+        ],
+        max_running: 4,
+        max_retained: 32,
+        max_output_bytes: 65_536,
+        max_runner_notices: Some(32),
+        stdin: "null".to_string(),
+        reasons: vec!["capacity".to_string()],
+        event_types: vec![
+            WorktreeSessionEventType::WorktreeSessionStarted,
+            WorktreeSessionEventType::WorktreeSessionFinished,
+        ],
+    };
+    let cases: Vec<(&str, Value)> = vec![
+        ("CommandRecord", to_value(&launch)),
+        ("CommandRecord", to_value(&stop)),
+        ("WorktreeSessionCapability", to_value(&capability)),
+        (
+            "WorktreeSessionResponse",
+            to_value(&WorktreeSessionResponse {
+                instance_id: "instance-1".to_string(),
+                state_revision: 3,
+                session: session_resource(),
+            }),
+        ),
+        (
+            "WorktreeSessionsResponse",
+            to_value(&WorktreeSessionsResponse {
+                instance_id: "instance-1".to_string(),
+                state_revision: 3,
+                sessions: vec![session_resource()],
+            }),
+        ),
+        ("ExecutionStatusResponse", to_value(&execution_status())),
+    ];
+    for (name, payload) in cases {
+        let schema = &schemas(doc)[name];
+        if schema.is_null() {
+            errors.push(format!("{name} is served but is not published"));
+            continue;
+        }
+        validate(&payload, schema, schemas(doc), name, &mut errors);
+    }
+    errors
+}
+
+#[test]
+fn remote_worktree_session_contract_is_published_end_to_end() {
+    let doc = generated();
+    let errors = session_contract_errors(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    // The worktree capability names the session operation.
+    assert!(conflux::web::remote_control_api::worktrees::WORKTREE_OPERATIONS.contains(&"session"));
+
+    // Negative control: a copy missing one route and one result kind must fail,
+    // and the failure must name exactly what is missing.
+    let mut incomplete = doc.clone();
+    incomplete["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/api/v2/worktree-sessions/{session_id}")
+        .expect("the route was published");
+    incomplete["components"]["schemas"]["CommandResult"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| !variant.to_string().contains("worktree_session_stop"));
+    let errors = session_contract_errors(&incomplete);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("/api/v2/worktree-sessions/{session_id}")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("worktree_session_stop")),
+        "{errors:#?}"
+    );
+}
+
+/// The exported document and the live one are the same bytes, and both carry
+/// the session surface.
+#[tokio::test]
+async fn remote_worktree_session_cli_export_equals_the_live_document() {
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    let response = protected_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v2/openapi.yaml")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let served = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let exported = std::process::Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .arg("openapi")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("the cflx binary under test is runnable");
+    assert!(exported.status.success());
+    let exported = String::from_utf8(exported.stdout).unwrap();
+    assert_eq!(exported, served);
+    for needle in [
+        "/api/v2/worktree-sessions/{session_id}",
+        "run_worktree_command",
+        "worktree_session_finished",
+    ] {
+        assert!(exported.contains(needle), "{needle}");
+    }
+}
+
+// ============================================================================
+// Public API contract gaps
+// ============================================================================
+
+/// Every member the six contract-gap fixes publish, as one predicate so the
+/// same check can be run against a deliberately incomplete copy.
+fn contract_gap_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let s = schemas(doc);
+    let names = |schema: &Value, key: &str| -> BTreeSet<String> {
+        schema[key]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .or_else(|| schema[key].as_object().map(|p| p.keys().cloned().collect()))
+            .unwrap_or_default()
+    };
+    let description = |value: &Value| {
+        value["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    if !published_enum(doc, "ErrorCode").contains("merge_hook_failed") {
+        errors.push("the error code `merge_hook_failed` is not published".into());
+    }
+    let outcomes = published_enum(doc, "MergeAbortOutcome");
+    for outcome in ["merged_hook_failed", "merge_failed"] {
+        if !outcomes.contains(outcome) {
+            errors.push(format!("MergeAbortOutcome lacks `{outcome}`"));
+        }
+    }
+    if published_enum(doc, "MergeLanded")
+        != BTreeSet::from(["confirmed", "not_landed", "unknown"].map(String::from))
+    {
+        errors.push("MergeLanded vocabulary is not confirmed/not_landed/unknown".into());
+    }
+    let landing = names(&s["MergeLandingEvidence"], "required");
+    for member in [
+        "landed",
+        "head_after",
+        "merge_head_present",
+        "clean_after",
+        "detail",
+    ] {
+        if !landing.contains(member) {
+            errors.push(format!("MergeLandingEvidence must require `{member}`"));
+        }
+    }
+    let hook = names(&s["MergeHookEvidence"], "required");
+    for member in ["ran", "exit_ok", "detail"] {
+        if !hook.contains(member) {
+            errors.push(format!("MergeHookEvidence must require `{member}`"));
+        }
+    }
+    let result_properties = names(&s["MergeAbortResult"], "properties");
+    let result_required = names(&s["MergeAbortResult"], "required");
+    for member in ["merge", "hook"] {
+        if !result_properties.contains(member) {
+            errors.push(format!("MergeAbortResult does not publish `{member}`"));
+        }
+        if result_required.contains(member) {
+            errors.push(format!(
+                "MergeAbortResult.{member} must decode as absent from an older owner"
+            ));
+        }
+    }
+
+    let session = &s["WorktreeSessionResource"];
+    let session_properties = names(session, "properties");
+    let session_required = names(session, "required");
+    for member in ["runner_notices", "runner_notices_dropped"] {
+        if !session_properties.contains(member) {
+            errors.push(format!(
+                "WorktreeSessionResource does not publish `{member}`"
+            ));
+        }
+        if session_required.contains(member) {
+            errors.push(format!(
+                "WorktreeSessionResource.{member} must decode as absent from an older owner"
+            ));
+        }
+    }
+    let notice = names(&s["SessionRunnerNotice"], "required");
+    for member in ["kind", "attempt", "detail"] {
+        if !notice.contains(member) {
+            errors.push(format!("SessionRunnerNotice must require `{member}`"));
+        }
+    }
+    if !description(&session["properties"]["signal"]).contains("terminated the leader as reaped") {
+        errors.push("WorktreeSessionResource.signal must describe the reaped signal".into());
+    }
+    if !description(&s["SessionOutputLine"]).contains("bytes the child wrote") {
+        errors.push("SessionOutputLine must describe child-only bytes".into());
+    }
+    if !names(&s["WorktreeSessionCapability"], "properties").contains("max_runner_notices") {
+        errors.push("WorktreeSessionCapability does not publish `max_runner_notices`".into());
+    }
+
+    if !published_enum(doc, "ConfirmedDeleteReason").contains("detached_head") {
+        errors.push("ConfirmedDeleteReason lacks `detached_head`".into());
+    }
+    if !description(&s["ConfirmedDeleteCapability"]).contains("max_listing_name_bytes") {
+        errors.push("the confirmed-delete budget does not name `max_listing_name_bytes`".into());
+    }
+    let preview_properties = names(&s["DeletePreviewResponse"], "properties");
+    let preview_required = names(&s["DeletePreviewResponse"], "required");
+    if !preview_properties.contains("is_detached") || preview_required.contains("is_detached") {
+        errors.push("DeletePreviewResponse must publish an optional `is_detached`".into());
+    }
+    errors
+}
+
+#[test]
+fn remote_contract_gap_contract_is_published_end_to_end() {
+    use conflux::web::remote_control_api::dto::{
+        MergeAbortOutcome, MergeAbortResult, MergeHookEvidence, MergeLanded, MergeLandingEvidence,
+        SessionRunnerNotice,
+    };
+
+    let doc = generated();
+    assert_eq!(contract_gap_errors(&doc), Vec::<String>::new());
+
+    // What the server serializes is what the schema describes.
+    let record = CommandRecord {
+        command_type: "merge_worktree_abort_on_conflict".to_string(),
+        state: CommandState::Failed,
+        error_code: Some(ErrorCode::MergeHookFailed),
+        result: Some(CommandResult::MergeAbort(Box::new(MergeAbortResult {
+            worktree_id: "0123456789abcdef0123456789abcdef".to_string(),
+            branch: "alpha".to_string(),
+            outcome: MergeAbortOutcome::MergedHookFailed,
+            premerge_head: Some("a".repeat(40)),
+            conflict_files: Vec::new(),
+            abort: None,
+            recovery: Some("local_or_tui_required".to_string()),
+            merge: Some(MergeLandingEvidence {
+                landed: MergeLanded::Confirmed,
+                head_after: Some("b".repeat(40)),
+                merge_head_present: Some(false),
+                clean_after: Some(true),
+                detail: None,
+            }),
+            hook: Some(MergeHookEvidence {
+                ran: true,
+                exit_ok: Some(false),
+                detail: Some("hook exited 1".to_string()),
+            }),
+        }))),
+        ..command_record()
+    };
+    let mut session = session_resource();
+    session.signal = Some("SIGKILL".to_string());
+    session.runner_notices = Some(vec![SessionRunnerNotice {
+        kind: "retry_scheduled".to_string(),
+        attempt: Some(2),
+        detail: Some("cause=crash, max_attempts=2, delay_ms=0".to_string()),
+    }]);
+    let mut errors = Vec::new();
+    for (name, payload) in [
+        ("CommandRecord", to_value(&record)),
+        ("WorktreeSessionResource", to_value(&session)),
+    ] {
+        validate(
+            &payload,
+            &schemas(&doc)[name],
+            schemas(&doc),
+            name,
+            &mut errors,
+        );
+    }
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(to_value(&record)["error_code"], "merge_hook_failed");
+    assert_eq!(to_value(&record)["result"]["merge"]["landed"], "confirmed");
+
+    // Negative controls: removing any one published member is noticed.
+    type Removal = Box<dyn Fn(&mut Value)>;
+    let removals: Vec<(&str, Removal)> = vec![
+        (
+            "merge_hook_failed",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["ErrorCode"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|c| c != "merge_hook_failed")
+            }),
+        ),
+        (
+            "merged_hook_failed",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["MergeAbortOutcome"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|c| c != "merged_hook_failed")
+            }),
+        ),
+        (
+            "merge_failed",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["MergeAbortOutcome"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|c| c != "merge_failed")
+            }),
+        ),
+        (
+            "MergeLandingEvidence",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("MergeLandingEvidence");
+            }),
+        ),
+        (
+            "MergeHookEvidence",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("MergeHookEvidence");
+            }),
+        ),
+        (
+            "runner_notices",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["WorktreeSessionResource"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("runner_notices");
+            }),
+        ),
+        (
+            "SessionRunnerNotice",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("SessionRunnerNotice");
+            }),
+        ),
+        (
+            "signal",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["WorktreeSessionResource"]["properties"]["signal"]
+                    ["description"] = json!("Terminating signal name.");
+            }),
+        ),
+        (
+            "SessionOutputLine",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["SessionOutputLine"]["description"] =
+                    json!("One output line.");
+            }),
+        ),
+        (
+            "detached_head",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["ConfirmedDeleteReason"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|c| c != "detached_head")
+            }),
+        ),
+        (
+            "max_listing_name_bytes",
+            Box::new(|d: &mut Value| {
+                d["components"]["schemas"]["ConfirmedDeleteCapability"]["description"] =
+                    json!("Confirmed delete.");
+            }),
+        ),
+    ];
+    for (what, remove) in removals {
+        let mut copy = doc.clone();
+        remove(&mut copy);
+        assert_ne!(copy, doc, "{what}: the removal changed nothing");
+        assert!(
+            !contract_gap_errors(&copy).is_empty(),
+            "removing {what} was not noticed"
+        );
+    }
+}
+
+/// Payloads in the shape an owner built at `10da8ac45` serializes: the same
+/// DTOs without any member this change adds. Each decodes with the new members
+/// absent.
+#[test]
+fn remote_contract_gap_contract_old_owner_payloads_decode() {
+    use conflux::web::remote_control_api::dto::{
+        MergeAbortOutcome, WorktreeSessionCapability, WorktreeSessionResource,
+    };
+    use conflux::web::remote_control_api::worktrees::{
+        ConfirmedDeleteCapability, DeletePreviewResponse,
+    };
+
+    let merge_abort: CommandResult = serde_json::from_value(json!({
+        "kind": "merge_abort",
+        "worktree_id": "0123456789abcdef0123456789abcdef",
+        "branch": "alpha",
+        "outcome": "abort_failed",
+        "premerge_head": "a".repeat(40),
+        "conflict_files": ["src/lib.rs"],
+        "abort": {
+            "exit_ok": false,
+            "head_after": "a".repeat(40),
+            "merge_head_present": true,
+            "clean_after": null,
+            "restored": "unknown",
+            "detail": "fatal: injected"
+        },
+        "recovery": "local_or_tui_required"
+    }))
+    .expect("an older merge_abort result decodes");
+    let CommandResult::MergeAbort(result) = merge_abort else {
+        panic!("decoded as another kind");
+    };
+    assert_eq!(result.outcome, MergeAbortOutcome::AbortFailed);
+    assert_eq!(result.merge, None);
+    assert_eq!(result.hook, None);
+
+    let session: WorktreeSessionResource = serde_json::from_value(json!({
+        "session_id": "a".repeat(32),
+        "instance_id": "instance-1",
+        "kind": "existing",
+        "worktree_id": "b".repeat(32),
+        "path": "../ws/alpha",
+        "branch": "alpha",
+        "state": "stopped",
+        "attempt": 1,
+        "started_at": "2026-08-04T00:00:00Z",
+        "finished_at": "2026-08-04T00:00:05Z",
+        "exit_code": null,
+        "signal": "SIGTERM",
+        "stop_requested": true,
+        "setup": null,
+        "cleanup": null,
+        "output": {"lines": [], "retained_bytes": 0, "truncated_bytes": 0}
+    }))
+    .expect("an older session resource decodes");
+    assert_eq!(session.runner_notices, None, "unpublished, not empty");
+    assert_eq!(session.runner_notices_dropped, None);
+
+    let capability: WorktreeSessionCapability = serde_json::from_value(json!({
+        "available": true,
+        "commands": ["run_worktree_command"],
+        "routes": ["/api/v2/worktree-sessions"],
+        "max_running": 4,
+        "max_retained": 32,
+        "max_output_bytes": 65536,
+        "stdin": "null",
+        "reasons": ["capacity"],
+        "event_types": ["worktree_session_started", "worktree_session_finished"]
+    }))
+    .expect("an older session capability decodes");
+    assert_eq!(capability.max_runner_notices, None);
+
+    let confirmed: ConfirmedDeleteCapability = serde_json::from_value(json!({
+        "available": true,
+        "command": "delete_worktree_confirmed",
+        "preview_route": "/api/v2/worktrees/{worktree_id}/delete-preview",
+        "permissions": ["skip_teardown", "discard_known_dirty", "discard_commits_ahead"],
+        "consent_fields": ["branch", "head", "dirty", "has_commits_ahead",
+                           "has_ignored_content", "merge_base",
+                           "discardable_content_id", "ignored_content_id"],
+        "content_id_algorithm": "sha256",
+        "binds_ignored_content": true,
+        "reasons": ["branch_changed", "teardown_failed"]
+    }))
+    .expect("an older confirmed-delete capability decodes");
+    assert!(!confirmed.reasons.iter().any(|r| r == "detached_head"));
+
+    let option = json!({"eligible": false, "blocked_reason": "ahead_unknown"});
+    let preview: DeletePreviewResponse = serde_json::from_value(json!({
+        "instance_id": "instance-1",
+        "state_revision": 3,
+        "worktree_id": "b".repeat(32),
+        "observed_at": "2026-08-04T00:00:00Z",
+        "branch": "",
+        "head": "a".repeat(40),
+        "is_main": false,
+        "dirty": false,
+        "has_commits_ahead": null,
+        "inspection": "not_inspected",
+        "content_observation": "observed",
+        "has_ignored_content": false,
+        "ignored_entries": 0,
+        "teardown_script_present": false,
+        "options": {
+            "ordinary": option,
+            "skip_teardown": option,
+            "discard_known_dirty": option,
+            "discard_commits_ahead": option
+        },
+        "consent": {
+            "branch": "",
+            "head": "a".repeat(40),
+            "dirty": false,
+            "has_commits_ahead": null,
+            "has_ignored_content": false,
+            "merge_base": null,
+            "discardable_content_id": null,
+            "ignored_content_id": null
+        }
+    }))
+    .expect("an older preview decodes");
+    assert!(!preview.is_detached, "absent decodes as attached");
+}
+
+// ============================================================================
+// Session stop during a retry delay: one more notice kind, nothing else
+// ============================================================================
+
+/// The generated notice description names the refusal kind and its detail.
+#[test]
+fn session_retry_stop_contract_documents_the_refusal_kind() {
+    let doc = generated();
+    let notice = &schemas(&doc)["SessionRunnerNotice"]["properties"];
+    let kind = notice["kind"]["description"].as_str().unwrap_or_default();
+    assert!(
+        kind.contains("stop_refused_attempt"),
+        "SessionRunnerNotice.kind must document stop_refused_attempt: {kind}"
+    );
+    for existing in ["retry_scheduled", "shutdown_refused"] {
+        assert!(
+            kind.contains(existing),
+            "{existing} is still documented: {kind}"
+        );
+    }
+    let detail = notice["detail"]["description"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("stage=retry"),
+        "SessionRunnerNotice.detail documents the refusal stage: {detail}"
+    );
+    assert_eq!(
+        notice["kind"]["type"], "string",
+        "kind stays a free string, not an enum"
+    );
+}
+
+/// A session resource in the shape an owner built at `f64f34d7b` serializes
+/// decodes unchanged and re-serializes to the same value: no member was added
+/// or moved, only a documented notice kind.
+#[test]
+fn session_retry_stop_contract_old_owner_session_decodes() {
+    use conflux::web::remote_control_api::dto::WorktreeSessionResource;
+
+    let published = json!({
+        "session_id": "a".repeat(32),
+        "instance_id": "instance-1",
+        "kind": "existing",
+        "worktree_id": "b".repeat(32),
+        "path": "../ws/alpha",
+        "branch": "alpha",
+        "state": "stopped",
+        "attempt": 2,
+        "started_at": "2026-11-05T00:00:00Z",
+        "finished_at": "2026-11-05T00:00:05Z",
+        "exit_code": null,
+        "signal": "SIGTERM",
+        "stop_requested": true,
+        "setup": null,
+        "cleanup": null,
+        "output": {
+            "lines": [{"stream": "stdout", "text": "first"}],
+            "retained_bytes": 5,
+            "truncated_bytes": 0
+        },
+        "runner_notices": [{
+            "kind": "retry_scheduled",
+            "attempt": 2,
+            "detail": "cause=crash, max_attempts=3, delay_ms=60000"
+        }],
+        "runner_notices_dropped": 0
+    });
+    let session: WorktreeSessionResource =
+        serde_json::from_value(published.clone()).expect("an f64f34d7b session decodes");
+    assert_eq!(session.attempt, 2);
+    assert_eq!(
+        serde_json::to_value(&session).unwrap(),
+        published,
+        "nothing else moved"
+    );
 }

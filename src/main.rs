@@ -1041,6 +1041,17 @@ async fn main() -> Result<()> {
                         orchestration::execution_facts::ExecutionFactsStore::new(),
                     ))
                     .await;
+                // Writer coverage for the remote text editor. The ledger is
+                // installed before orchestration so every run scope and unscoped
+                // spawn this process creates reports into it; the port owns no
+                // live run scope, so force-stop eligibility is unchanged.
+                let writer_ledger = ai_command_runner::ManagedWriterLedger::for_owner_process();
+                web_state
+                    .set_managed_termination(std::sync::Arc::new(
+                        orchestration::operator_command::LiveRunManagedProcesses::new(|| None)
+                            .with_writer_ledger(writer_ledger),
+                    ))
+                    .await;
                 // A run binds no command executor, so a client can only observe
                 // it — but observing truthfully still needs to know which
                 // repository evidence would prove a change finished.

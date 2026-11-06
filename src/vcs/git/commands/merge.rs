@@ -4,11 +4,14 @@
 //! and managing merge-related operations.
 
 use super::basic::{get_conflict_files, is_working_directory_clean, run_git};
-use super::status_policy::{read_only_status_argv, PORCELAIN_UNTRACKED_STATUS_ARGS};
+use super::status_policy::{
+    read_only_status_argv, PORCELAIN_STATUS_ARGS, PORCELAIN_UNTRACKED_STATUS_ARGS,
+};
 use crate::vcs::commands::run_vcs_command_captured;
 use crate::vcs::{VcsError, VcsResult};
+use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -346,49 +349,464 @@ fn parse_conflict_files_from_stderr(stderr: &str) -> Vec<String> {
     files
 }
 
-/// Merge a branch into the current branch.
+/// Merge a branch into the current branch, aborting on conflict.
 ///
-/// Performs `git merge --no-ff --no-edit <branch>` to merge the specified branch.
-/// Checks for a clean working directory first. If merge conflicts occur, aborts the merge.
-/// Returns Ok(()) on successful merge, Err() on conflict or other errors.
+/// A thin wrapper over [`merge_branch_aborting_on_conflict`] for callers that
+/// only want pass/fail. The error text names the *verified* abort outcome: the
+/// words `Merge aborted` appear only when restoration was confirmed from the
+/// repository, never from the abort attempt alone.
+// The binary crate recompiles this tree and sees no caller.
+#[allow(dead_code)]
 pub async fn merge_branch<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<()> {
-    let cwd = cwd.as_ref();
+    match merge_branch_aborting_on_conflict(cwd, branch_name).await? {
+        AbortingMergeOutcome::Merged => Ok(()),
+        AbortingMergeOutcome::Conflict { files, abort } => {
+            Err(VcsError::git_command(abort_message(&files, &abort)))
+        }
+    }
+}
 
-    // Check working directory is clean
-    if !is_working_directory_clean(cwd).await? {
+/// How far the repository was proven restored after `git merge --abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restoration {
+    /// The abort exited zero, `HEAD` is the pre-merge commit, no `MERGE_HEAD`
+    /// exists, and the working directory is clean.
+    Confirmed,
+    /// Every verification was read and at least one of them failed.
+    Failed,
+    /// At least one verification could not be read.
+    Unknown,
+}
+
+/// What `git merge --abort` did, re-read from the repository afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortReport {
+    /// `HEAD` before `git merge` ran.
+    pub premerge_head: String,
+    /// Exit status of `git merge --abort`.
+    pub exit_ok: bool,
+    /// `HEAD` after the abort; `None` when it could not be read.
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists after the abort; `None` when unreadable.
+    pub merge_head_present: Option<bool>,
+    /// Whether the working directory is clean after the abort; `None` on error.
+    pub clean_after: Option<bool>,
+    /// The verdict derived from the four facts above, never from the attempt.
+    pub restored: Restoration,
+    /// Bounded, sanitized tail of the abort's own output.
+    pub detail: String,
+}
+
+impl AbortReport {
+    /// One-line rendering of the observed facts.
+    pub fn facts(&self) -> String {
+        fn show<T: std::fmt::Display>(value: &Option<T>) -> String {
+            value
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unreadable".to_string())
+        }
+        format!(
+            "abort exit_ok={}, head_after={}, merge_head_present={}, clean_after={}",
+            self.exit_ok,
+            show(&self.head_after),
+            show(&self.merge_head_present),
+            show(&self.clean_after),
+        )
+    }
+}
+
+/// What an aborting base merge did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortingMergeOutcome {
+    /// The merge completed and produced a merge commit.
+    Merged,
+    /// The merge conflicted and an abort was attempted; `abort` says how it went.
+    Conflict {
+        /// Repository-relative paths of the unmerged entries.
+        files: Vec<String>,
+        /// The verified abort report.
+        abort: AbortReport,
+    },
+}
+
+/// Derive the restoration verdict from what was observed after the abort.
+///
+/// `Unknown` wins over `Failed`: a fact that could not be read is not evidence
+/// that restoration failed, and it is certainly not evidence that it succeeded.
+pub fn classify_restoration(
+    premerge_head: &str,
+    exit_ok: bool,
+    head_after: Option<&str>,
+    merge_head_present: Option<bool>,
+    clean_after: Option<bool>,
+) -> Restoration {
+    let (Some(head_after), Some(merge_head_present), Some(clean_after)) =
+        (head_after, merge_head_present, clean_after)
+    else {
+        return Restoration::Unknown;
+    };
+    if exit_ok && head_after == premerge_head && !merge_head_present && clean_after {
+        Restoration::Confirmed
+    } else {
+        Restoration::Failed
+    }
+}
+
+/// Whether a base merge commit landed, re-read from the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// `HEAD` moved off the pre-merge commit, descends from it, and no
+    /// `MERGE_HEAD` exists.
+    Confirmed,
+    /// `HEAD` is still the pre-merge commit and no `MERGE_HEAD` exists.
+    NotLanded,
+    /// A fact could not be read, or the facts read support neither verdict.
+    Unknown,
+}
+
+/// What the repository looks like after a merge operation stopped, re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandingReport {
+    /// The verdict derived from the facts below, never from the attempt.
+    pub landed: Landing,
+    /// `HEAD` as re-read; `None` when it could not be read.
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists; `None` when unreadable.
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean; informational, never changes `landed`.
+    pub clean_after: Option<bool>,
+    /// Which verification failed or contradicted, when `landed` is not decided.
+    pub detail: Option<String>,
+}
+
+impl LandingReport {
+    /// A report that reads nothing: every fact unknown, with the reason.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            landed: Landing::Unknown,
+            head_after: None,
+            merge_head_present: None,
+            clean_after: None,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Derive the landing verdict from re-read facts.
+///
+/// `confirmed` needs `HEAD != premerge_head`, `premerge_head` an ancestor of
+/// `HEAD`, and no `MERGE_HEAD`; `not_landed` needs `HEAD == premerge_head` and
+/// no `MERGE_HEAD`. Anything unreadable or contrary is `unknown`, with the
+/// verification that decided it named.
+pub fn classify_landing(
+    premerge_head: Option<&str>,
+    head_after: Option<&str>,
+    merge_head_present: Option<bool>,
+    premerge_is_ancestor: Option<bool>,
+) -> (Landing, Option<String>) {
+    let Some(premerge_head) = premerge_head else {
+        return (
+            Landing::Unknown,
+            Some("the pre-merge HEAD was not read".to_string()),
+        );
+    };
+    let Some(head_after) = head_after else {
+        return (
+            Landing::Unknown,
+            Some("HEAD could not be re-read".to_string()),
+        );
+    };
+    match merge_head_present {
+        None => {
+            return (
+                Landing::Unknown,
+                Some("MERGE_HEAD presence could not be re-read".to_string()),
+            )
+        }
+        Some(true) => {
+            return (
+                Landing::Unknown,
+                Some("MERGE_HEAD is present: a merge is still in progress".to_string()),
+            )
+        }
+        Some(false) => {}
+    }
+    if head_after == premerge_head {
+        return (Landing::NotLanded, None);
+    }
+    match premerge_is_ancestor {
+        Some(true) => (Landing::Confirmed, None),
+        Some(false) => (
+            Landing::Unknown,
+            Some("HEAD moved but does not descend from the pre-merge HEAD".to_string()),
+        ),
+        None => (
+            Landing::Unknown,
+            Some("merge-base --is-ancestor could not be read".to_string()),
+        ),
+    }
+}
+
+/// Re-read whether a base merge landed at `cwd`. Reads only; never mutates.
+pub async fn read_merge_landing<P: AsRef<Path>>(
+    cwd: P,
+    premerge_head: Option<&str>,
+) -> LandingReport {
+    read_merge_landing_with(OsStr::new("git"), cwd.as_ref(), premerge_head).await
+}
+
+/// [`read_merge_landing`] with an explicit Git program, so tests can inject an
+/// unreadable re-read.
+pub(crate) async fn read_merge_landing_with(
+    git: &OsStr,
+    cwd: &Path,
+    premerge_head: Option<&str>,
+) -> LandingReport {
+    let head_after = read_head(git, cwd).await;
+    let merge_head_present = read_merge_head_present(git, cwd).await;
+    let clean_after = read_clean(git, cwd).await.ok();
+    let premerge_is_ancestor = match (premerge_head, head_after.as_deref()) {
+        (Some(premerge), Some(head)) if premerge != head => {
+            match git_output(git, &["merge-base", "--is-ancestor", premerge, head], cwd).await {
+                Ok(out) => match out.status.code() {
+                    Some(0) => Some(true),
+                    Some(1) => Some(false),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let (landed, detail) = classify_landing(
+        premerge_head,
+        head_after.as_deref(),
+        merge_head_present,
+        premerge_is_ancestor,
+    );
+    LandingReport {
+        landed,
+        head_after,
+        merge_head_present,
+        clean_after,
+        detail,
+    }
+}
+
+/// Operator-facing text for an aborted conflicting merge.
+///
+/// Only [`Restoration::Confirmed`] says the merge was aborted and the base
+/// restored; the other two name what was observed and that local recovery is
+/// required.
+pub fn abort_message(files: &[String], abort: &AbortReport) -> String {
+    let files = files.join(", ");
+    match abort.restored {
+        Restoration::Confirmed => format!(
+            "Merge conflict detected. Merge aborted; base restored to {}. Files: {}",
+            abort.premerge_head, files
+        ),
+        Restoration::Failed => format!(
+            "Merge conflict detected. Merge abort FAILED ({}); base may still hold merge state, manual recovery required. Files: {}",
+            abort.facts(),
+            files
+        ),
+        Restoration::Unknown => format!(
+            "Merge conflict detected. Merge abort attempted; restoration UNCONFIRMED ({}); manual recovery required. Files: {}",
+            abort.facts(),
+            files
+        ),
+    }
+}
+
+/// How many bytes of the abort's own output a report may quote.
+const MAX_ABORT_DETAIL_BYTES: usize = 1024;
+
+/// Last `limit` bytes of `text` with control characters replaced, never
+/// splitting a character.
+fn sanitized_tail(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    let mut start = trimmed.len().saturating_sub(limit);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    let sanitized: String = trimmed[start..]
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    sanitized.trim().to_string()
+}
+
+/// Run one Git command with `program` and capture it without interpreting the exit status.
+async fn git_output(program: &OsStr, args: &[&str], cwd: &Path) -> std::io::Result<Output> {
+    Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await
+}
+
+/// Read `HEAD`; `None` when it cannot be read.
+async fn read_head(program: &OsStr, cwd: &Path) -> Option<String> {
+    let output = git_output(program, &["rev-parse", "--verify", "HEAD"], cwd)
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// Whether `MERGE_HEAD` exists; `None` when the answer could not be read.
+///
+/// With `-q`, `rev-parse --verify` exits 1 for a missing ref — the same answer
+/// [`is_merge_in_progress`] relies on — regardless of incidental stderr such as
+/// `GIT_TRACE` output. Any other failure (not a repository, a signal) is not an
+/// answer.
+async fn read_merge_head_present(program: &OsStr, cwd: &Path) -> Option<bool> {
+    let output = git_output(program, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd)
+        .await
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the working directory is clean under the read-only status policy.
+async fn read_clean(program: &OsStr, cwd: &Path) -> VcsResult<bool> {
+    let output = git_output(program, &read_only_status_argv(PORCELAIN_STATUS_ARGS), cwd)
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to execute git status: {e}")))?;
+    if !output.status.success() {
+        return Err(VcsError::git_command(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+/// Merge a branch into the current branch; on conflict, abort and verify.
+///
+/// Same `git merge --no-ff --no-edit <branch>` and clean-working-directory
+/// precondition as [`merge_branch_preserving_conflict`]. On conflict it runs
+/// `git merge --abort` exactly once, records its exit status, and then reads
+/// the repository back — `HEAD`, `MERGE_HEAD`, and the read-only clean check —
+/// to decide whether restoration actually happened. It never retries the abort
+/// and never runs any further compensation: a repository in an unknown state is
+/// handed back to the operator as typed evidence.
+pub async fn merge_branch_aborting_on_conflict<P: AsRef<Path>>(
+    cwd: P,
+    branch_name: &str,
+) -> VcsResult<AbortingMergeOutcome> {
+    aborting_merge_with(OsStr::new("git"), cwd.as_ref(), branch_name).await
+}
+
+/// [`merge_branch_aborting_on_conflict`] with an explicit Git program.
+///
+/// The program is a parameter so tests can inject a failing `git merge --abort`
+/// or an unreadable verification without mutating the process-wide `PATH`.
+pub(crate) async fn aborting_merge_with(
+    git: &OsStr,
+    cwd: &Path,
+    branch_name: &str,
+) -> VcsResult<AbortingMergeOutcome> {
+    if !read_clean(git, cwd).await? {
         return Err(VcsError::git_command(
             "Working directory is not clean. Commit or stash changes before merging.".to_string(),
         ));
     }
 
-    // Perform the merge
-    let output = Command::new("git")
-        .args(["merge", "--no-ff", "--no-edit", branch_name])
-        .current_dir(cwd)
-        .output()
+    let premerge_head = read_head(git, cwd)
+        .await
+        .ok_or_else(|| VcsError::git_command("failed to read HEAD before merging".to_string()))?;
+
+    let output = git_output(git, &["merge", "--no-ff", "--no-edit", branch_name], cwd)
         .await
         .map_err(|e| VcsError::git_command(e.to_string()))?;
 
     if output.status.success() {
         debug!("Merged branch {} successfully", branch_name);
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Check if it's a conflict
-        if stderr.contains("CONFLICT") {
-            // Abort the merge
-            let _ = run_git(&["merge", "--abort"], cwd).await;
-
-            Err(VcsError::git_command(format!(
-                "Merge conflict detected. Merge aborted. Files: {}",
-                parse_conflict_files_from_stderr(&stderr).join(", ")
-            )))
-        } else {
-            // Other error
-            Err(VcsError::git_command(format!("Merge failed: {}", stderr)))
-        }
+        return Ok(AbortingMergeOutcome::Merged);
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    if !(combined.contains("CONFLICT") || combined.contains("Automatic merge failed")) {
+        return Err(VcsError::git_command(format!(
+            "git merge {} failed: {}",
+            branch_name, combined
+        )));
+    }
+
+    // Read the conflict before the abort erases it from the index.
+    let files = match git_output(git, &["diff", "--name-only", "--diff-filter=U"], cwd).await {
+        Ok(out) if out.status.success() => {
+            let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            if listed.is_empty() {
+                parse_conflict_files_from_stderr(&combined)
+            } else {
+                listed
+            }
+        }
+        _ => parse_conflict_files_from_stderr(&combined),
+    };
+
+    let (exit_ok, detail) = match git_output(git, &["merge", "--abort"], cwd).await {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let text = if stderr.trim().is_empty() {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            } else {
+                stderr.to_string()
+            };
+            (
+                out.status.success(),
+                sanitized_tail(&text, MAX_ABORT_DETAIL_BYTES),
+            )
+        }
+        Err(error) => (
+            false,
+            sanitized_tail(
+                &format!("failed to execute git merge --abort: {error}"),
+                MAX_ABORT_DETAIL_BYTES,
+            ),
+        ),
+    };
+
+    let head_after = read_head(git, cwd).await;
+    let merge_head_present = read_merge_head_present(git, cwd).await;
+    let clean_after = read_clean(git, cwd).await.ok();
+    let restored = classify_restoration(
+        &premerge_head,
+        exit_ok,
+        head_after.as_deref(),
+        merge_head_present,
+        clean_after,
+    );
+
+    Ok(AbortingMergeOutcome::Conflict {
+        files,
+        abort: AbortReport {
+            premerge_head,
+            exit_ok,
+            head_after,
+            merge_head_present,
+            clean_after,
+            restored,
+            detail,
+        },
+    })
 }
 
 /// What a conflict-preserving base merge did.
@@ -1194,3 +1612,9 @@ mod tests {
         assert_eq!(merge_head(dir).await.unwrap(), None);
     }
 }
+
+/// `remote_merge_abort` regressions: the pure restoration verdict (unit) and
+/// the aborting merge against disposable repositories (integration, real `git`).
+#[cfg(test)]
+#[path = "merge_abort_tests.rs"]
+mod remote_merge_abort_tests;

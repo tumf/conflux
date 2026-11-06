@@ -24,7 +24,9 @@ use super::dto::{
     ALL_PARALLEL_BLOCKED_REASONS, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
     MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
 };
-use super::worktrees::{WorktreeCapabilities, WorktreeResponse, WorktreesResponse};
+use super::worktrees::{
+    DeletePreviewResponse, WorktreeCapabilities, WorktreeResponse, WorktreesResponse,
+};
 use super::RemoteControlState;
 
 /// Responses describe a live process, so nothing may be cached anywhere.
@@ -121,6 +123,13 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             },
         },
         worktrees: WorktreeCapabilities::default(),
+        // Available only when the configured command could actually launch: a
+        // template, a Git repository, a bound session runtime, and a command
+        // executor. An older owner omits the block, which decodes the same way.
+        worktree_sessions: super::worktree_sessions::capability(
+            &state.worktree_sessions,
+            state.executor.is_command_capable().await,
+        ),
         proposal_refresh: dto::ProposalRefreshCapability {
             // A read over the projection and the repository, so it is served
             // whether or not a command executor is bound.
@@ -133,6 +142,9 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
                 .map(|reason| reason.as_str().to_string())
                 .collect(),
         },
+        // A read surface plus two fenced commands, served once the owner-side
+        // facts it resolves against are attached.
+        text_edit: super::text_edit::capability(state.text_edit.is_some()),
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,
             vcs_backend: parallel.vcs_backend,
@@ -377,6 +389,7 @@ pub async fn execution_status(State(state): State<RemoteControlState>) -> Respon
                 .process_log
                 .as_ref()
                 .map(LatestLogProjection::from_entry),
+            worktree_sessions_running: state.worktree_sessions.running() as u32,
         },
         changes,
     })
@@ -438,4 +451,41 @@ pub async fn logs(State(state): State<RemoteControlState>) -> Response {
         event_sequence,
         logs,
     })
+}
+
+/// What a consent-bound delete of one worktree would act on.
+///
+/// A read: no command record, no revision change, and nothing in the worktree
+/// is written. It runs a fresh targeted observation and the same bounded
+/// content oracle `delete_worktree_confirmed` runs, so the per-option answers
+/// agree with what the command would decide right now. Echo `consent`
+/// unmodified as the command's `params.consent`; `observed_at` is not part of
+/// it. Cancelling is submitting nothing.
+#[utoipa::path(
+    get,
+    path = "/api/v2/worktrees/{worktree_id}/delete-preview",
+    tag = "remote-control",
+    params(("worktree_id" = String, Path, description = "Opaque process-local worktree ID")),
+    responses(
+        (status = 200, description = "Facts, per-option eligibility, and the consent to echo", body = DeletePreviewResponse),
+        (status = 404, description = "Unknown or retired worktree ID", body = ApiError),
+        (status = 409, description = "No worktree runtime is bound yet", body = ApiError)
+    )
+)]
+pub async fn get_worktree_delete_preview(
+    State(state): State<RemoteControlState>,
+    Extension(correlation): Extension<CorrelationId>,
+    Path(worktree_id): Path<String>,
+) -> Response {
+    let state_revision = state.projection.revision();
+    match state.worktrees.delete_preview(&worktree_id).await {
+        Ok(mut preview) => {
+            preview.instance_id = state.projection.instance_id().to_string();
+            preview.state_revision = state_revision;
+            no_store(preview)
+        }
+        Err(failure) => ApiError::new(failure.error_code, failure.message, &correlation.0)
+            .with_revision(state_revision)
+            .into_response(),
+    }
 }

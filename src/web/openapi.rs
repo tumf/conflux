@@ -38,9 +38,14 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/proposals/{change_id}/refresh-preview",
     "/api/v2/changes",
     "/api/v2/changes/{change_id}",
+    "/api/v2/changes/{change_id}/text",
     "/api/v2/logs",
     "/api/v2/worktrees",
     "/api/v2/worktrees/{worktree_id}",
+    "/api/v2/worktrees/{worktree_id}/delete-preview",
+    "/api/v2/worktrees/{worktree_id}/text",
+    "/api/v2/worktree-sessions",
+    "/api/v2/worktree-sessions/{session_id}",
     "/api/v2/commands",
     "/api/v2/commands/{command_id}",
     "/api/v2/events",
@@ -139,10 +144,78 @@ extended — and reads a versioned JSON file holding `schema_version`,
 bounded `evidence` string. It never carries prompts, terminal contents,
 environment dumps, credentials, or unrestricted error bodies.
 
+**Bounded text edit.** `GET /api/v2/changes/{change_id}/text?path=` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=` read one regular UTF-8 file of
+at most 1 MiB under a server-derived root, with a `sha256:` `content_id`. The
+`write_change_text` and `write_worktree_text` commands replace or create one
+only while `expected` still holds (`content` identity or `absent`), through a
+same-directory temporary file and rename that keeps the permission bits; a
+stale expectation is `text_stale` with the current identity on the record.
+`.git`, top-level `.wt/` and `.conflux-inflight`, nested repositories,
+symlinks, and executable files are `text_not_editable`. Writer exclusion
+(`change_active`, `change_admitted`, `managed_process_live`, `root_busy`) is
+published on every read as `editable` and enforced as `target_ineligible`.
+External editors are not excluded, and a save never commits, stages, or pushes.
+
+**Abort-on-conflict merge.** `merge_worktree_abort_on_conflict` settles with a
+typed `merge_abort` result on success and on every refusal after eligibility.
+`merge` says whether the merge commit landed on base (`confirmed`,
+`not_landed`, or `unknown`), re-read from Git after the command stopped, and
+`hook` what `on_merged` did. A hook failure after a landed merge is
+`merge_hook_failed` with `outcome: merged_hook_failed` and
+`recovery: local_or_tui_required`; a Git failure before any merge commit stays
+`internal_error` with `outcome: merge_failed`. Nothing re-merges, aborts,
+resets, or re-runs the hook. `merge_worktree` is unchanged: the same failures
+are `internal_error` with no result.
+
 **Worktree safety.** Worktrees are addressed only by the opaque process-local
 `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
 server-derived and are rejected as mutation input, so no client can steer where a
-worktree lands or what it is cut from.";
+worktree lands or what it is cut from.
+
+**Confirmed deletion.** `delete_worktree` is fail-closed and never changes:
+teardown always runs, and dirty, ahead, or unknown worktrees refuse. The three
+TUI escalations — skip teardown, discard known uncommitted (and ignored)
+content, discard commits ahead including the branch — are reachable only
+through `delete_worktree_confirmed`, each as its own boolean. Read
+`GET /api/v2/worktrees/{worktree_id}/delete-preview` first and echo its
+`consent` object verbatim. Consent binds branch, HEAD, Git identity, the dirty,
+ahead, and ignored-content facts, the merge base, and two `sha256:` content
+identities over the bytes `git worktree remove --force` would delete beyond
+`HEAD`, ignored content included. Under the root guard, before teardown and
+again before removal, every fact is re-derived; any difference is
+`delete_consent_stale` with nothing removed. An unobservable or over-budget
+content observation is `worktree_dirty_unknown`, and a nested repository is
+`target_ineligible`, whatever permissions were given. The observation budget is
+500,000 records, 256 MiB of hashed bytes, and 64 MiB of directory-entry names
+per listing (`max_listing_name_bytes`); every directory entry is charged as it
+is read, so no listing is materialized past it. A detached worktree reports
+every option ineligible with `detached_head`, and its empty `consent.branch`
+cannot be echoed: there is no remote detached destructive delete.
+
+**Worktree sessions.** `run_worktree_command` (an existing worktree by opaque
+`worktree_id`) and `create_session_worktree` (a fresh `ws-session-*` worktree
+from base `HEAD`, set up and cleaned up exactly as the TUI `+` key does) launch
+the owner's *configured* `worktree_command`. No request carries a command, argv,
+environment, path, or branch; the template's `{workspace_dir}` and `{repo_root}`
+are expanded server-side. stdin is `/dev/null`, the configured retry policy
+retries inside one session (`attempt`, counted from the runner's typed
+report of each successful spawn), an exact idempotent replay launches
+nothing, and a second request for a running worktree or a fifth concurrent
+session is `worktree_session_busy`. `stop_worktree_session` cancels through the
+runner's own path and settles after the reap; a stop that arrives while no
+attempt runs — during a retry delay, the stagger wait, or at spawn admission —
+spawns nothing further and is recorded as the `stop_refused_attempt` notice,
+leaving `attempt` at the last one started. `GET /api/v2/worktree-sessions`
+publishes each session with a bounded output tail: that tail is only the
+command's own stdout/stderr with control sequences stripped, **not redacted**,
+readable by every authenticated client. The runner's own retry, launch-failure,
+shutdown, limit, and cleanup facts are `runner_notices`, from a typed channel no
+child output can forge, and `signal` is the signal that terminated the leader as
+reaped — `SIGKILL` after escalation — or `null` when unknown. Owner-generated members never carry the template, the
+expanded command, environment values, or absolute paths. Session state events
+(`worktree_session_started`, `worktree_session_finished`) never advance
+`state_revision`; output is never an event or a log entry.";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -169,9 +242,14 @@ worktree lands or what it is cut from.";
         crate::web::remote_control_api::proposal_refresh::preview,
         crate::web::remote_control_api::reads::list_changes,
         crate::web::remote_control_api::reads::get_change,
+        crate::web::remote_control_api::text_edit::read_change_text,
         crate::web::remote_control_api::reads::logs,
         crate::web::remote_control_api::reads::list_worktrees,
         crate::web::remote_control_api::reads::get_worktree,
+        crate::web::remote_control_api::reads::get_worktree_delete_preview,
+        crate::web::remote_control_api::text_edit::read_worktree_text,
+        crate::web::remote_control_api::worktree_sessions::list_sessions,
+        crate::web::remote_control_api::worktree_sessions::get_session,
         crate::web::remote_control_api::commands::submit_command,
         crate::web::remote_control_api::commands::get_command,
         crate::web::remote_control_api::stream::events,
@@ -189,6 +267,8 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::ChangeActivity,
             crate::web::remote_control_api::dto::ChangeBlocker,
             crate::web::remote_control_api::dto::ChangeTiming,
+            crate::web::remote_control_api::dto::NetActiveTiming,
+            crate::web::remote_control_api::dto::RunClock,
             crate::web::remote_control_api::dto::ChangeWorktree,
             crate::web::remote_control_api::dto::ErrorCode,
             // Execution observability: the closed vocabularies and the resource
@@ -219,6 +299,18 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::RefreshEffects,
             crate::web::remote_control_api::dto::RefreshPreviewResponse,
             crate::web::remote_control_api::dto::RefreshProposalResult,
+            // Bounded remote text edit: two reads, two fenced commands, and a
+            // result that says what the filesystem actually holds.
+            crate::web::remote_control_api::dto::TextEditBlockedReason,
+            crate::web::remote_control_api::dto::TextEditCapability,
+            crate::web::remote_control_api::dto::TextEditLimits,
+            crate::web::remote_control_api::dto::TextExpectation,
+            crate::web::remote_control_api::dto::TextReadResponse,
+            crate::web::remote_control_api::dto::TextScope,
+            crate::web::remote_control_api::dto::TextWriteEffects,
+            crate::web::remote_control_api::dto::TextWriteOutcome,
+            crate::web::remote_control_api::dto::TextWriteParams,
+            crate::web::remote_control_api::dto::TextWriteResult,
             crate::web::remote_control_api::dto::ProposalSubscriptionRequest,
             crate::web::remote_control_api::dto::ProposalSubscriptionResponse,
             crate::web::remote_control_api::dto::OwnerExecutionContract,
@@ -242,6 +334,19 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::CommandState,
             crate::web::remote_control_api::dto::ChangeTarget,
             crate::web::remote_control_api::dto::WorktreeTarget,
+            // Configured-command worktree sessions.
+            crate::web::remote_control_api::dto::SessionTarget,
+            crate::web::remote_control_api::dto::SessionCleanupFacts,
+            crate::web::remote_control_api::dto::SessionOutput,
+            crate::web::remote_control_api::dto::SessionOutputLine,
+            crate::web::remote_control_api::dto::SessionRunnerNotice,
+            crate::web::remote_control_api::dto::SessionSetupFacts,
+            crate::web::remote_control_api::dto::WorktreeSessionCapability,
+            crate::web::remote_control_api::dto::WorktreeSessionEventType,
+            crate::web::remote_control_api::dto::WorktreeSessionResource,
+            crate::web::remote_control_api::dto::WorktreeSessionResponse,
+            crate::web::remote_control_api::dto::WorktreeSessionResult,
+            crate::web::remote_control_api::dto::WorktreeSessionsResponse,
             crate::web::remote_control_api::dto::EmptyParams,
             crate::events::LogLevel,
             crate::web::remote_control_api::dto::EventCategory,
@@ -253,6 +358,30 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::SnapshotTotals,
             crate::web::remote_control_api::dto::StateResponse,
             crate::web::remote_control_api::dto::TransportDescriptor,
+            // Abort-on-conflict merge: a separate command whose result reports
+            // restoration verified from the repository, never assumed.
+            crate::web::remote_control_api::dto::MergeAbortEvidence,
+            crate::web::remote_control_api::dto::MergeAbortOutcome,
+            crate::web::remote_control_api::dto::MergeAbortRestoration,
+            crate::web::remote_control_api::dto::MergeAbortResult,
+            crate::web::remote_control_api::dto::MergeHookEvidence,
+            crate::web::remote_control_api::dto::MergeLanded,
+            crate::web::remote_control_api::dto::MergeLandingEvidence,
+            crate::web::remote_control_api::worktrees::MergeAbortCapability,
+            // Consent-bound destructive deletion: a read-only preview whose
+            // `consent` is echoed to one separate, re-verified command.
+            crate::web::remote_control_api::dto::ConfirmedDeleteParams,
+            crate::web::remote_control_api::dto::ConfirmedDeleteRefusalResult,
+            crate::web::remote_control_api::dto::ConfirmedDeleteResult,
+            crate::web::remote_control_api::worktrees::ConfirmedDeleteCapability,
+            crate::web::remote_control_api::worktrees::DeleteOptionEligibility,
+            crate::web::remote_control_api::worktrees::DeletePreviewOptions,
+            crate::web::remote_control_api::worktrees::DeletePreviewResponse,
+            crate::worktree_ops::consent::ConfirmedDeleteReason,
+            crate::worktree_ops::consent::ConsentObservation,
+            crate::worktree_ops::consent::ContentObservationKind,
+            crate::worktree_ops::consent::DeleteConsent,
+            crate::worktree_ops::consent::TeardownDisposition,
             crate::web::remote_control_api::worktrees::WorktreeCapabilities,
             crate::web::remote_control_api::worktrees::WorktreeConflict,
             crate::web::remote_control_api::worktrees::WorktreeEligibility,

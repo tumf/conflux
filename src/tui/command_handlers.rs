@@ -162,6 +162,14 @@ use crate::worktree_ops::service::{
     WorktreeOpError, WorktreeOperationEvent, WorktreeService,
 };
 
+/// Log line for a merge the shared service refused or failed.
+///
+/// The error's own text carries the verified abort outcome, so this never
+/// claims a restoration the service did not confirm.
+fn merge_failure_log(branch_name: &str, error: &WorktreeOpError) -> LogEntry {
+    LogEntry::error(format!("Merge failed for '{}': {}", branch_name, error))
+}
+
 /// Publish shared worktree operation events onto the TUI's orchestrator channel.
 ///
 /// This is the whole reason the TUI and `/api/v2` cannot drift on merge
@@ -245,23 +253,45 @@ fn build_worktree_backend(
 /// the repository mutation guard, so a second instance would be a second guard
 /// and two overlapping mutations could each believe they held it. The TUI and
 /// `/api/v2` are handed the same `Arc`.
+// Production wires the session-aware variant; tests build this one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_worktree_service(
     repo_root: &Path,
     config: &OrchestratorConfig,
     tx: &mpsc::Sender<OrchestratorEvent>,
 ) -> Arc<WorktreeService> {
+    Arc::new(build_worktree_service_value(repo_root, config, tx))
+}
+
+/// Build the shared worktree service with a session probe, so deleting a
+/// worktree a configured-command session runs in is refused for the TUI and
+/// `/api/v2` alike.
+pub(crate) fn build_worktree_service_with_sessions(
+    repo_root: &Path,
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    sessions: Arc<dyn crate::worktree_ops::service::SessionProbe>,
+) -> Arc<WorktreeService> {
+    Arc::new(build_worktree_service_value(repo_root, config, tx).with_session_probe(sessions))
+}
+
+fn build_worktree_service_value(
+    repo_root: &Path,
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+) -> WorktreeService {
     let workspace_base_dir = config
         .get_workspace_base_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(repo_root)));
-    Arc::new(WorktreeService::new(
+    WorktreeService::new(
         build_worktree_backend(repo_root, config, tx),
         Arc::new(TuiWorktreeEvents {
             tx: tx.clone(),
             repo_root: repo_root.to_path_buf(),
         }),
         workspace_base_dir,
-    ))
+    )
 }
 
 /// Operator-facing feedback from a command that settled off the event loop.
@@ -761,8 +791,9 @@ pub async fn handle_tui_command(
             // Adapter only: the shared service owns the merge guards, the base
             // merge itself, `on_merged` cardinality, and the merge event
             // sequence. The TUI's policy difference is one value — a conflicting
-            // merge is aborted here, and preserved for `/api/v2` clients that
-            // have no way to resolve it remotely.
+            // merge is aborted here, and preserved for `/api/v2` `merge_worktree`
+            // clients that have no way to resolve it remotely. The abort's
+            // restoration is verified, and the error text says which way it went.
             let service = ctx.worktree_service.clone();
             let merge_tx = ctx.tx.clone();
 
@@ -776,10 +807,10 @@ pub async fn handle_tui_command(
                     // that did not (a busy root, an unobservable worktree).
                     debug!("Merge refused for branch {}: {}", branch_name, error);
                     let _ = merge_tx
-                        .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                            "Merge failed for '{}': {}",
-                            branch_name, error
-                        ))))
+                        .send(OrchestratorEvent::Log(merge_failure_log(
+                            &branch_name,
+                            &error,
+                        )))
                         .await;
                 }
             });
@@ -3008,6 +3039,134 @@ mod tests {
             harness.scheduler.calls().is_empty(),
             "a refused force stop must not cancel the run"
         );
+    }
+
+    /// Fails every merge with one scripted aborted conflict.
+    struct AbortingBackend(crate::vcs::git::commands::Restoration);
+
+    #[async_trait::async_trait]
+    impl WorktreeBackend for AbortingBackend {
+        async fn observe(
+            &self,
+            _request: crate::worktree_ops::ObservationRequest,
+        ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+            let mut facts = WorktreeFacts::new(PathBuf::from("/w/feature-a"), "feature-a");
+            facts.identity = "gitdir: /w/feature-a/.git".to_string();
+            facts.head = STUB_HEAD.to_string();
+            facts.has_commits_ahead = crate::worktree_ops::service::SafetyFact::Yes;
+            Ok(vec![facts])
+        }
+        async fn base_head(&self) -> WorktreeOpResult<String> {
+            Ok(STUB_HEAD.to_string())
+        }
+        async fn create(&self, _: &Path, _: &str, _: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn teardown(&self, _: &Path) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn remove_worktree(&self, _: &Path) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn branch_ref(&self, _: &str) -> WorktreeOpResult<Option<String>> {
+            Ok(Some(STUB_HEAD.to_string()))
+        }
+        async fn delete_branch_if_merged(&self, _: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn delete_branch_at(&self, _: &str, _: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn merge_into_base(
+            &self,
+            _branch: &str,
+            policy: ConflictPolicy,
+        ) -> WorktreeOpResult<MergeAttempt> {
+            use crate::vcs::git::commands::{AbortReport, Restoration};
+            assert_eq!(policy, ConflictPolicy::AbortOnConflict);
+            let confirmed = self.0 == Restoration::Confirmed;
+            Ok(MergeAttempt::ConflictAborted {
+                files: vec!["src/lib.rs".to_string()],
+                abort: AbortReport {
+                    premerge_head: "b".repeat(40),
+                    exit_ok: confirmed,
+                    head_after: Some("b".repeat(40)),
+                    merge_head_present: (self.0 != Restoration::Unknown).then_some(!confirmed),
+                    clean_after: Some(confirmed),
+                    restored: self.0,
+                    detail: String::new(),
+                },
+            })
+        }
+        async fn run_on_merged(&self, _: &str, _: &Path) -> WorktreeOpResult<()> {
+            panic!("on_merged must not run for an aborted merge");
+        }
+        async fn change_is_eligible(&self, _: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_merge_abort_tui_message_names_verified_outcome() {
+        use crate::vcs::git::commands::Restoration;
+        for restored in [
+            Restoration::Confirmed,
+            Restoration::Failed,
+            Restoration::Unknown,
+        ] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let service = WorktreeService::new(
+                Arc::new(AbortingBackend(restored)),
+                Arc::new(TuiWorktreeEvents {
+                    tx,
+                    repo_root: PathBuf::from("/w/repo"),
+                }),
+                PathBuf::from("/w"),
+            );
+
+            // The same call the `M` handler makes.
+            let error = service
+                .merge_worktree(Path::new("/w/feature-a"), ConflictPolicy::AbortOnConflict)
+                .await
+                .expect_err("an aborted conflict fails the merge");
+            let log = merge_failure_log("feature-a", &error).message;
+
+            let mut failed = None;
+            while let Ok(event) = rx.try_recv() {
+                if let OrchestratorEvent::BranchMergeFailed { branch_name, error } = event {
+                    failed = Some((branch_name, error));
+                }
+            }
+            let (branch_name, event_error) = failed.expect("BranchMergeFailed is published");
+            let mut app = crate::tui::state::AppState::new(Vec::new());
+            app.handle_branch_merge_failed(branch_name, event_error);
+            let popup = app
+                .warning_popup
+                .as_ref()
+                .expect("the failure opens a popup")
+                .message
+                .clone();
+
+            for text in [&log, &popup] {
+                assert!(text.contains("src/lib.rs"), "{restored:?}: {text}");
+                if restored == Restoration::Confirmed {
+                    assert!(
+                        text.contains("Merge aborted; base restored to"),
+                        "{restored:?}: {text}"
+                    );
+                } else {
+                    assert!(!text.contains("Merge aborted"), "{restored:?}: {text}");
+                    assert!(
+                        text.contains("abort FAILED") || text.contains("UNCONFIRMED"),
+                        "{restored:?}: {text}"
+                    );
+                    assert!(
+                        text.contains("manual recovery required"),
+                        "{restored:?}: {text}"
+                    );
+                }
+            }
+        }
     }
 }
 

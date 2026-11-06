@@ -497,6 +497,196 @@ a cancellation is still in flight. Read the settled command record's typed
 which is always `false`. Creating a manual commit, archive, or merge on that
 guess is exactly the failure this contract exists to prevent.
 
+### Editing a text file over `/api/v2`
+
+`GET /api/v2/changes/{change_id}/text?path=` and
+`GET /api/v2/worktrees/{worktree_id}/text?path=` read one regular UTF-8 file
+(at most 1 MiB, path at most 1024 bytes) under a server-derived root and return
+its `sha256:` `content_id`; `write_change_text` and `write_worktree_text` save
+it only while `params.expected` still holds (`content` identity, or `absent` to
+create). A mismatch is `text_stale` with `result.current_content_id`. `.git`,
+top-level `.wt/` and `.conflux-inflight`, nested repositories, symlinks,
+executable, oversized, and non-text files are `text_not_editable` with a stable
+`reason`. Every read publishes `editable` and `edit_blocked_reason`
+(`change_active`, `change_admitted`, `managed_process_live`, `root_busy`) from
+the same classifier a write is refused by (`target_ineligible`);
+`managed_process_live` means a managed writer is bound to the root *or* the
+owner cannot prove none is, and `edit_blocked_detail` says which. An unscoped
+writer's lease is released only on positive knowledge of its spawn — never
+attempted, a spawn that returned an error, or a bound process group observed
+empty; an attempted spawn whose outcome was never reported, or one without a
+process-group identity, stays unknown with that typed detail. Retained
+unproven processes from an earlier run keep their root blocked; restarting the
+owner is not quiescence evidence, and the editor kills nothing. External
+editors are not excluded: the compare and the rename are not atomic against
+them. A save never commits, stages, or pushes, but it can advance the state
+revision through the ordinary observation refresh — re-read `state_revision`
+afterwards. A crash mid-write can leave `.<leaf>.cflx-tmp-<hex>`, which shows
+up as ordinary untracked dirt. Read `capabilities.text_edit`; an older owner
+omits it (decoded as unavailable). Full detail: `docs/guides/USAGE.md`.
+### Configured-command worktree sessions
+
+`run_worktree_command` (existing worktree by opaque `worktree_id`) and
+`create_session_worktree` (a fresh `ws-session-*` worktree provisioned exactly as
+the TUI `+` key does) launch the owner's **configured** `worktree_command`; no
+request carries a command, argv, environment, path, or branch. Sessions are read
+from `GET /api/v2/worktree-sessions[/{session_id}]` and stopped with
+`stop_worktree_session`. `cflx client` and `cflx client mcp` have no verb for
+any of it.
+
+- Same runner path as the TUI: `sh -c`, stdin `/dev/null`, own process group,
+  stagger, and the configured retry policy *inside* one session (`attempt`,
+  moved only by the runner's typed report of a later successful spawn; a retry
+  merely scheduled does not count).
+  An exact idempotent replay launches nothing; a running worktree is
+  `worktree_session_busy` (`reason=worktree_busy`); a fifth concurrent session is
+  `worktree_session_busy` (`reason=capacity`) before any Git effect.
+- Setup failure removes the worktree (forced, no teardown), **keeps** the
+  `ws-session-*` branch, launches nothing, and fails
+  `worktree_session_setup_failed` with `result.cleanup` `removed` or `retained`.
+  An invalid cwd is `target_ineligible` with `reason=cwd_invalid`. With no
+  template, outside Git, or during owner shutdown, launches are
+  `worktree_session_unavailable`.
+- Stop goes through `StreamingChildHandle::terminate` (SIGTERM, SIGKILL after
+  5 s, verified cleanup, no further attempt) and settles after the reap. A stop
+  received while no attempt runs — a retry delay, the stagger wait, or spawn
+  admission — spawns nothing further and records `stop_refused_attempt`
+  (`stage=retry|stagger|spawn`); `attempt` stays at the last one started and
+  `terminated` reflects that attempt's group cleanup. Only a stop landing after
+  admission let an attempt spawn terminates that attempt instead. Never
+  `killpg` a session yourself: the retry policy reads that as a crash and
+  relaunches. Descendants that left the process group (`setsid`, daemonization)
+  are outside the guarantee. Owner shutdown closes the registry's own
+  `RunCommandScope` with a 10 s deadline; scheduler `stop`, `stop_and_dequeue`,
+  and `force_stop` do not touch sessions.
+- Deleting a worktree with a running session is refused for the TUI and the API
+  alike (`target_ineligible`, "a worktree session is running").
+- In memory only: running sessions are never evicted, at most 32 finished are
+  kept, nothing is written to disk or survives restart, and no scheduling,
+  resume, acceptance, or archive decision reads them.
+- `output.lines` is the command's **own** stdout/stderr — the newest 64 KiB,
+  ANSI/control-stripped, 8 KiB per line, **not redacted** — and is visible to
+  every bearer-authenticated reader. A command that prints its arguments,
+  environment, or cwd discloses them; that is the operator's choice when
+  configuring `worktree_command`. The tail is never an event, log entry, or
+  snapshot field, and owner-generated members never carry the template, the
+  expanded command, environment values, or absolute paths. The tail is
+  child-only: the runner's own retry, launch-failure, shutdown, limit, and
+  cleanup facts arrive on a typed channel as `runner_notices` (`kind`,
+  `attempt`, `detail`; at most 32, overflow in `runner_notices_dropped`), so a
+  child printing `[Retry N/M]` or a fake `pgid=` line changes no typed member.
+  Kinds: `retry_scheduled`, `inactivity_terminated`, `runtime_limit_reached`,
+  `launch_failed`, `shutdown_refused`, `process_group_cleanup_unconfirmed`,
+  and `stop_refused_attempt`. The TUI terminal and every other text consumer
+  still print `[Retry N/M]` and keep their existing stop timing (a stop during
+  a retry delay cancels the next attempt after it spawns).
+- `signal`/`exit_code` of a stopped or runtime-limited session are the leader's
+  as reaped — `SIGTERM`, or `SIGKILL` after the 5 s escalation — and both are
+  `null` when the leader was not reaped. An older owner omits `runner_notices`
+  and `max_runner_notices` (decode as unpublished).
+- The launch result names the session kind as `result.session_kind`, not
+  `kind`: `kind` is the `CommandResult` discriminant. The session resource
+  itself uses `kind`.
+- An older owner omits `capabilities.worktree_sessions` (decode as unavailable)
+  and refuses the three commands as `validation_failed` before any effect.
+
+### Progress and timing facts
+
+`/api/v2/state` publishes three presentation-only facts, all process-local:
+nothing persists them, a restarted owner reports `false`/zero/empty, and no
+scheduling, resume, acceptance, or archive decision reads them.
+
+- `changes[].archive_complete` — the reducer's archive record, read in the same
+  hold as `display_status` and distinct from it. A post-archive row truthfully
+  shows `resolving`, `resolve pending`, `merge wait`, `merged`, or `pushed`; a
+  fresh-process resolve retry is `resolving` with `archive_complete: false`.
+  Never infer archive completion from the status, and never read it as merge or
+  push success.
+- `changes[].timing` stays *per run* (`elapsed_ms` is one finished run).
+  `changes[].net_active` is *cumulative*: `accumulated_ms` of closed active
+  intervals plus the open one from `active_since`, through the same shared
+  clock as the TUI row. It opens on a transition into an active status, closes
+  on any other status or on process `Stopped`, and never resets while the owner
+  runs.
+- `run_clock` (`started_at`, `ended_at`, `elapsed_ms`) is the TUI `Elapsed`
+  line, unchanged: opened by an accepted Start while the owner is not running;
+  left open by a persistent-idle park, persistent-idle re-admission,
+  `ResolveReserved`, and a fatal process error; frozen by every `Stopped`, every
+  `AllCompleted`, and a resolve settlement that leaves nothing processing; and
+  re-frozen at the later instant by a repeated terminal event.
+
+None of them is a live counter, so time passing never advances
+`state_revision`: compute "running for" as `accumulated_ms + (now -
+active_since)` and "run elapsed" as `now - started_at` while `ended_at` is
+`null`. An older owner omits all three; that decodes as `None` — "unpublished" —
+never as `false` or zero, and every `cflx client` verb keeps working against it.
+
+### Merging a worktree over `/api/v2`
+
+`merge_worktree` and `merge_worktree_abort_on_conflict` are separate commands
+on purpose. `merge_worktree` preserves a conflict (`merge_conflict`,
+`local_or_tui_required`, `MERGE_HEAD` retained, later mutations `root_busy`),
+and `merge_conflict_preserves_state: true` describes it alone. The abort
+variant refuses a predicted conflict as `merge_conflict_predicted` before any
+Git mutation, and aborts a real one once, then verifies restoration from the
+repository: `HEAD` equals `premerge_head`, no `MERGE_HEAD`, and a clean root.
+Only all three passing is `merge_conflict_aborted` (`restored: confirmed`); a
+failed or unreadable check is `merge_abort_failed` (`restored: failed` or
+`unknown`, `recovery: local_or_tui_required`), and the root stays `root_busy`
+while `MERGE_HEAD` remains. The result also carries `merge` (`landed`:
+`confirmed`, `not_landed`, or `unknown`, re-read from Git after the command
+stopped) and `hook` (`ran`, `exit_ok`, `detail`). A landed merge whose
+`on_merged` hook then failed is `merge_hook_failed` (409,
+`outcome: merged_hook_failed`, `recovery: local_or_tui_required`) — the base
+moved; a Git failure after eligibility and before any merge commit stays
+`internal_error` with `outcome: merge_failed`. `merge_worktree` keeps
+`internal_error` with no result for both. Read the typed `merge_abort` result,
+never the prose, and never treat an abort attempt as a restoration. Nothing retries the
+abort or compensates — not the owner and not a relaying server. An older
+owner omits `capabilities.worktrees.merge_abort` (decoded as unavailable) and
+refuses the command with `validation_failed`; one built before the landing and
+hook evidence omits `merge` and `hook` (decoded as `null`).
+
+### Deleting a worktree over `/api/v2`
+
+`delete_worktree` is fail-closed and unchanged: teardown always runs; dirty,
+ahead, main, and unknown refuse; any extra param is `validation_failed`; and
+`delete_requires_teardown: true` describes exactly it. Skip-teardown,
+known-dirty discard, and ahead discard (branch included) are reachable remotely
+only through `delete_worktree_confirmed`, three independent booleans plus the
+`consent` object of `GET /api/v2/worktrees/{worktree_id}/delete-preview`, echoed
+verbatim. The preview is a read; not submitting is cancelling.
+
+Consent binds branch, HEAD, Git identity, `dirty`, `has_commits_ahead`,
+`has_ignored_content`, `merge_base`, and two `sha256:` content identities over
+the bytes forced removal would delete beyond `HEAD` — tracked, untracked, *and
+ignored*, walked through collapsed directories, metadata bound in addition to
+bytes, never instead. Ignored content needs `discard_known_dirty` even when Git
+calls the worktree clean. Every fact is re-derived under the root guard before
+teardown and again before removal; any difference is `delete_consent_stale`
+with nothing removed, and `refusal.observed` carries the fresh facts. Unknown
+dirty/content and a content observation past the combined budget (500,000
+records, 256 MiB, or 64 MiB of directory-entry names in one listing — each entry
+charged as it is read) are `worktree_dirty_unknown`; a nested repository is
+`target_ineligible`; neither yields to any permission, and no weaker identity is
+ever substituted. A detached worktree previews `is_detached: true` with every
+option `detached_head`, its blank `consent.branch` is `validation_failed`, and
+one detached after an attached preview is refused `target_ineligible`
+(`refusal.reason: detached_head`) — there is no remote detached destructive
+delete. A worktree too large to bind — usually build output — is
+reduced locally or deleted through the TUI, never remotely. After teardown the
+ignored identity may be the consented one or empty and nothing else; a refusal
+after teardown says `teardown_ran: true`, and teardown is never reversed. A
+failing teardown is recovered with fresh consent and `skip_teardown: true`.
+
+Read the typed `result` (`kind: delete_worktree_confirmed`): `teardown`,
+`dirty_discarded`, `commits_discarded`, `branch_deleted`,
+`branch_retained_reason`, and on refusal `refusal.reason`. An older owner omits
+`capabilities.worktrees.confirmed_delete` (decoded as unavailable) and refuses
+the command with `validation_failed`. Nothing is locked between preview and
+command: an external write after the final comparison is not detected, the same
+window the TUI has. `cflx client` and `cflx client mcp` gain no verb for this.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on

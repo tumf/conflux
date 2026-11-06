@@ -31,20 +31,23 @@ pub use commit::{
 // where this crate's own binary target has no use for every item.
 #[allow(unused_imports)]
 pub use merge::{
-    bounded_prefix, check_merge_conflicts, commit_diff_entries, commits_with_exact_subject,
-    committed_file_text, committed_tree_paths, diff_paths_between, first_parent_lineage,
-    index_conflict_entries, index_stage0_paths, is_ancestor, is_clean_including_untracked,
-    is_merge_in_progress, merge, merge_base, merge_branch, merge_branch_preserving_conflict,
-    merge_head, parents_of, rev_parse_commit, summarize_merge_tree, CommitDiffEntry,
-    MergeSimulation, PreservedMergeOutcome, MAX_CONFLICT_SAMPLE, MAX_OUTPUT_PREFIX_BYTES,
+    abort_message, bounded_prefix, check_merge_conflicts, classify_landing, classify_restoration,
+    commit_diff_entries, commits_with_exact_subject, committed_file_text, committed_tree_paths,
+    diff_paths_between, first_parent_lineage, index_conflict_entries, index_stage0_paths,
+    is_ancestor, is_clean_including_untracked, is_merge_in_progress, merge, merge_base,
+    merge_branch, merge_branch_aborting_on_conflict, merge_branch_preserving_conflict, merge_head,
+    parents_of, read_merge_landing, rev_parse_commit, summarize_merge_tree, AbortReport,
+    AbortingMergeOutcome, CommitDiffEntry, Landing, LandingReport, MergeSimulation,
+    PreservedMergeOutcome, Restoration, MAX_CONFLICT_SAMPLE, MAX_OUTPUT_PREFIX_BYTES,
 };
 #[allow(unused_imports)]
 pub use worktree::{
     classify_worktree_identity, count_commits_ahead, is_worktree, list_worktrees,
-    run_worktree_setup, run_worktree_teardown, validate_worktree_command_cwd,
-    validate_worktree_command_cwd_facts, validate_worktree_identity, worktree_add,
-    worktree_records, worktree_remove, worktree_remove_forced, worktree_remove_with_options,
-    worktree_setup_completed_diagnostic, worktree_setup_start_diagnostic, RegisteredWorktreePath,
-    WorktreeCommandCwdFacts, WorktreeCommandCwdValidationError, WorktreeIdentity, WorktreeRecord,
-    WorktreeRemoveOptions, WorktreeSetupReport,
+    run_worktree_setup, run_worktree_teardown, teardown_script_would_run,
+    validate_worktree_command_cwd, validate_worktree_command_cwd_facts, validate_worktree_identity,
+    worktree_add, worktree_records, worktree_remove, worktree_remove_forced,
+    worktree_remove_with_options, worktree_setup_completed_diagnostic,
+    worktree_setup_start_diagnostic, RegisteredWorktreePath, WorktreeCommandCwdFacts,
+    WorktreeCommandCwdValidationError, WorktreeIdentity, WorktreeRecord, WorktreeRemoveOptions,
+    WorktreeSetupReport,
 };

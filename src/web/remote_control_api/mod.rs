@@ -30,6 +30,8 @@ pub mod reads;
 pub mod registry;
 pub mod sinks;
 pub mod stream;
+pub mod text_edit;
+pub mod worktree_sessions;
 pub mod worktrees;
 
 use std::sync::Arc;
@@ -115,6 +117,8 @@ pub struct RemoteControlRuntime {
     /// Execution-scoped completion sinks, bound with the orchestration runtime
     /// whose typed transitions they observe.
     completion_sinks: Arc<CompletionSinkHandle>,
+    /// Configured-command worktree sessions, bound with the worktree runtime.
+    worktree_sessions: Arc<worktree_sessions::WorktreeSessionHandle>,
 }
 
 /// Late-bound holder of this incarnation's completion-sink registry.
@@ -315,7 +319,21 @@ impl RemoteControlRuntime {
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
             execution_contract: Arc::new(ExecutionContractHandle::default()),
             completion_sinks: Arc::new(CompletionSinkHandle::default()),
+            worktree_sessions: Arc::new(worktree_sessions::WorktreeSessionHandle::default()),
         }
+    }
+
+    /// The late-bound worktree-session handle the router reads.
+    pub fn worktree_sessions(&self) -> Arc<worktree_sessions::WorktreeSessionHandle> {
+        self.worktree_sessions.clone()
+    }
+
+    /// Bind the worktree-session port this incarnation serves.
+    pub fn bind_worktree_sessions(
+        &self,
+        port: Arc<dyn worktree_sessions::WorktreeSessionOperations>,
+    ) {
+        self.worktree_sessions.bind(port);
     }
 
     /// The projection owner for this incarnation.
@@ -478,6 +496,65 @@ impl WorktreeOperations for RemoteControlRuntime {
             None => UnboundWorktreeOperations.merge(worktree_id).await,
         }
     }
+
+    async fn merge_abort_on_conflict(
+        &self,
+        worktree_id: &str,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.merge_abort_on_conflict(worktree_id).await,
+            None => {
+                UnboundWorktreeOperations
+                    .merge_abort_on_conflict(worktree_id)
+                    .await
+            }
+        }
+    }
+
+    async fn delete_preview(
+        &self,
+        worktree_id: &str,
+    ) -> Result<worktrees::DeletePreviewResponse, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_preview(worktree_id).await,
+            None => UnboundWorktreeOperations.delete_preview(worktree_id).await,
+        }
+    }
+
+    async fn delete_confirmed(
+        &self,
+        worktree_id: &str,
+        params: &dto::ConfirmedDeleteParams,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete_confirmed(worktree_id, params).await,
+            None => {
+                UnboundWorktreeOperations
+                    .delete_confirmed(worktree_id, params)
+                    .await
+            }
+        }
+    }
+
+    async fn text_root(&self, worktree_id: &str) -> Result<std::path::PathBuf, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.text_root(worktree_id).await,
+            None => UnboundWorktreeOperations.text_root(worktree_id).await,
+        }
+    }
+
+    async fn root_guard_is_held(&self) -> bool {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.root_guard_is_held().await,
+            None => false,
+        }
+    }
+
+    async fn refresh_after_text_write(&self) {
+        if let Some(port) = self.worktrees.read().await.clone() {
+            port.refresh_after_text_write().await;
+        }
+    }
 }
 
 /// Shared state for the v2 router.
@@ -514,6 +591,17 @@ pub struct RemoteControlState {
     /// `None` is a process that knows no candidate worktree, which previews
     /// every eligible row as `no_candidate_worktree`.
     pub refresh_paths: Option<Arc<dyn proposal_refresh::RefreshPathSource>>,
+    /// The owner-side facts the bounded text surface resolves against.
+    ///
+    /// `None` is a process that serves no text edit, which capabilities report
+    /// as unavailable.
+    pub text_edit: Option<Arc<dyn text_edit::TextEditSource>>,
+    /// Configured-command worktree sessions.
+    ///
+    /// Unbound is a process that holds no session and can launch none; the
+    /// read routes answer an empty list and the capability reports
+    /// `available: false`.
+    pub worktree_sessions: Arc<worktree_sessions::WorktreeSessionHandle>,
 }
 
 impl RemoteControlState {
@@ -540,7 +628,24 @@ impl RemoteControlState {
             execution_contract: Arc::new(ExecutionContractHandle::default()),
             completion_sinks: Arc::new(CompletionSinkHandle::default()),
             refresh_paths: None,
+            text_edit: None,
+            worktree_sessions: Arc::new(worktree_sessions::WorktreeSessionHandle::default()),
         }
+    }
+
+    /// Attach the owner-side facts the text surface reads.
+    pub fn with_text_edit(mut self, source: Arc<dyn text_edit::TextEditSource>) -> Self {
+        self.text_edit = Some(source);
+        self
+    }
+
+    /// Attach the worktree-session handle this router serves.
+    pub fn with_worktree_sessions(
+        mut self,
+        handle: Arc<worktree_sessions::WorktreeSessionHandle>,
+    ) -> Self {
+        self.worktree_sessions = handle;
+        self
     }
 
     /// Attach the candidate-worktree locator the refresh preview reads.
@@ -620,9 +725,29 @@ pub fn router(state: RemoteControlState) -> Router {
         )
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
+        .route(
+            text_edit::CHANGE_TEXT_ROUTE,
+            get(text_edit::read_change_text),
+        )
         .route("/api/v2/logs", get(reads::logs))
         .route("/api/v2/worktrees", get(reads::list_worktrees))
         .route("/api/v2/worktrees/{worktree_id}", get(reads::get_worktree))
+        .route(
+            worktrees::DELETE_PREVIEW_ROUTE,
+            get(reads::get_worktree_delete_preview),
+        )
+        .route(
+            text_edit::WORKTREE_TEXT_ROUTE,
+            get(text_edit::read_worktree_text),
+        )
+        .route(
+            "/api/v2/worktree-sessions",
+            get(worktree_sessions::list_sessions),
+        )
+        .route(
+            "/api/v2/worktree-sessions/{session_id}",
+            get(worktree_sessions::get_session),
+        )
         .route("/api/v2/commands", post(commands::submit_command))
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))

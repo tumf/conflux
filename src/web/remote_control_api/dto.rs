@@ -81,6 +81,23 @@ pub enum ErrorCode {
     WorktreeDirtyUnknown,
     /// The base merge conflicted and its intermediate state was preserved.
     MergeConflict,
+    /// `merge_worktree_abort_on_conflict` refused a conflict the fresh
+    /// targeted inspection predicted, before any Git mutation.
+    MergeConflictPredicted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict, ran
+    /// `git merge --abort`, and proved the root restored: `HEAD` is the
+    /// pre-merge commit, no `MERGE_HEAD` exists, and the root is clean.
+    MergeConflictAborted,
+    /// `merge_worktree_abort_on_conflict` hit a real conflict and restoration
+    /// was not proven: the abort failed or a verification could not be read.
+    /// Recovery is local or TUI; nothing claims state was preserved on purpose.
+    MergeAbortFailed,
+    /// `merge_worktree_abort_on_conflict` merged into base and the `on_merged`
+    /// hook then failed. The base moved; the record's `result.merge` says
+    /// whether the merge commit is confirmed on base, re-read from Git, and
+    /// `result.hook` what the hook did. Nothing re-merged, aborted, reset, or
+    /// re-ran the hook; recovery is local or TUI.
+    MergeHookFailed,
     /// The addressed execution exists, but the presented instance/change
     /// binding is not the one it belongs to.
     ///
@@ -101,6 +118,36 @@ pub enum ErrorCode {
     /// itself refused — a moved ref, a dirty candidate, a hook. The record's
     /// `result` carries the stable reason and the effects re-read from Git.
     RefreshRefused,
+    /// `delete_worktree_confirmed` found that the echoed consent no longer
+    /// describes the worktree: a consented fact or a recomputed content
+    /// identity differs. Nothing was removed; the record's `result.refusal`
+    /// carries the stable reason and the freshly observed facts.
+    DeleteConsentStale,
+    /// A text write named content the file no longer holds.
+    ///
+    /// Nothing was written. The record's `result.current_content_id` carries the
+    /// identity the file holds now (`null` when it is absent), so a client keeps
+    /// its buffer and re-reads instead of being told to discard anything.
+    TextStale,
+    /// The addressed path is outside the bounded editable scope.
+    ///
+    /// The `reason` (on a read refusal's message, on a command's `result`) is
+    /// one stable token — `git_metadata`, `conflux_owned_path`, `unsafe_path`,
+    /// `nested_repository`, `not_regular_file`, `executable`, `too_large`,
+    /// `not_text`, or `root_missing`.
+    TextNotEditable,
+    /// The configured-command session surface cannot launch here: no
+    /// `worktree_command` is configured, the project is not a Git repository,
+    /// or the owner is shutting down. Refused before any Git or process effect.
+    WorktreeSessionUnavailable,
+    /// A session is already running for that worktree (`reason=worktree_busy`)
+    /// or the running-session limit is reached (`reason=capacity`). Refused
+    /// before any Git or process effect.
+    WorktreeSessionBusy,
+    /// `.wt/setup` failed for a provisioned session worktree; the worktree was
+    /// cleaned up and nothing was launched. The record's result carries the
+    /// typed cleanup outcome.
+    WorktreeSessionSetupFailed,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -122,8 +169,18 @@ impl ErrorCode {
             | Self::WorktreeDirty
             | Self::WorktreeDirtyUnknown
             | Self::MergeConflict
+            | Self::MergeConflictPredicted
+            | Self::MergeConflictAborted
+            | Self::MergeAbortFailed
+            | Self::MergeHookFailed
             | Self::ExecutionBindingMismatch
-            | Self::RefreshRefused => StatusCode::CONFLICT,
+            | Self::RefreshRefused
+            | Self::DeleteConsentStale
+            | Self::TextStale
+            | Self::TextNotEditable
+            | Self::WorktreeSessionUnavailable
+            | Self::WorktreeSessionBusy
+            | Self::WorktreeSessionSetupFailed => StatusCode::CONFLICT,
             Self::TransportNotPermitted => StatusCode::FORBIDDEN,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
@@ -150,16 +207,26 @@ impl ErrorCode {
             Self::WorktreeDirty => "worktree_dirty",
             Self::WorktreeDirtyUnknown => "worktree_dirty_unknown",
             Self::MergeConflict => "merge_conflict",
+            Self::MergeConflictPredicted => "merge_conflict_predicted",
+            Self::MergeConflictAborted => "merge_conflict_aborted",
+            Self::MergeAbortFailed => "merge_abort_failed",
+            Self::MergeHookFailed => "merge_hook_failed",
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::RefreshRefused => "refresh_refused",
+            Self::DeleteConsentStale => "delete_consent_stale",
+            Self::TextStale => "text_stale",
+            Self::TextNotEditable => "text_not_editable",
+            Self::WorktreeSessionUnavailable => "worktree_session_unavailable",
+            Self::WorktreeSessionBusy => "worktree_session_busy",
+            Self::WorktreeSessionSetupFailed => "worktree_session_setup_failed",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 20] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 30] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -176,10 +243,20 @@ pub const ALL_ERROR_CODES: [ErrorCode; 20] = [
     ErrorCode::WorktreeDirty,
     ErrorCode::WorktreeDirtyUnknown,
     ErrorCode::MergeConflict,
+    ErrorCode::MergeConflictPredicted,
+    ErrorCode::MergeConflictAborted,
+    ErrorCode::MergeAbortFailed,
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
     ErrorCode::RefreshRefused,
+    ErrorCode::DeleteConsentStale,
+    ErrorCode::TextStale,
+    ErrorCode::TextNotEditable,
+    ErrorCode::WorktreeSessionUnavailable,
+    ErrorCode::WorktreeSessionBusy,
+    ErrorCode::WorktreeSessionSetupFailed,
     ErrorCode::InternalError,
+    ErrorCode::MergeHookFailed,
 ];
 
 /// Structured error body returned by every non-success v2 response.
@@ -342,6 +419,33 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Merge a worktree's branch into base, aborting on conflict.
+    ///
+    /// A separate command rather than a parameter on `merge_worktree`, so that
+    /// command's conflict-preserving contract holds for every call of it. A
+    /// predicted conflict is refused before any Git mutation; a real one is
+    /// aborted and the restoration is verified from the repository.
+    MergeWorktreeAbortOnConflict {
+        /// The worktree to merge.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Delete a worktree on explicit, re-verified consent.
+    ///
+    /// A separate command rather than parameters on `delete_worktree`, so
+    /// that command's fail-closed contract — and the published
+    /// `delete_requires_teardown: true` — hold for every call of it. The three
+    /// destructive permissions are independent choices, and each is honored
+    /// only while every consented fact and both content identities still
+    /// match a fresh observation under the repository root guard.
+    DeleteWorktreeConfirmed {
+        /// The worktree to delete.
+        target: WorktreeTarget,
+        /// The explicit permissions and the echoed consent.
+        params: ConfirmedDeleteParams,
+    },
     /// Refresh one candidate's `proposal.md` from an explicit source commit.
     ///
     /// Takes the two full commit IDs a `refresh-preview` read returned. Exactly
@@ -356,6 +460,87 @@ pub enum CommandSpec {
         /// Full commit ID the candidate `HEAD` must still be at.
         expected_head: String,
     },
+    /// Launch the configured `worktree_command` in an existing worktree.
+    ///
+    /// The command text is always the owner's configured template with
+    /// `{workspace_dir}` and `{repo_root}` expanded server-side. No request field
+    /// carries a command, argv, environment, path, or branch.
+    RunWorktreeCommand {
+        /// The worktree to run in.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Create a `ws-session-*` worktree from base `HEAD` exactly as the TUI `+`
+    /// key does — setup, cleanup on setup failure, revalidation — and launch
+    /// the configured `worktree_command` there.
+    CreateSessionWorktree {
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Stop one session through the runner's own cancellation path and settle
+    /// after the leader is reaped and the cleanup report is read.
+    StopWorktreeSession {
+        /// The session to stop.
+        target: SessionTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Replace or create one text file inside a change's own directory.
+    ///
+    /// The root is server-derived — `openspec/changes/<change_id>` of the
+    /// project — and `params.expected` must name what the caller read: there is
+    /// no unconditional write. Saving never commits, stages, or pushes.
+    WriteChangeText {
+        /// The change whose directory is the root.
+        target: ChangeTarget,
+        /// The relative path, the expected identity, and the new content.
+        params: TextWriteParams,
+    },
+    /// Replace or create one text file inside a worktree addressed by opaque ID.
+    ///
+    /// The root is the directory the ID is bound to, and nothing else: no path,
+    /// branch, or ref is accepted as identity.
+    WriteWorktreeText {
+        /// The worktree whose directory is the root.
+        target: WorktreeTarget,
+        /// The relative path, the expected identity, and the new content.
+        params: TextWriteParams,
+    },
+}
+
+/// Parameters of a bounded text write.
+///
+/// `deny_unknown_fields`, so a smuggled root, mode, or force flag is a schema
+/// error instead of a silently ignored member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextWriteParams {
+    /// Root-relative UTF-8 path, `/`-separated, at most 1024 bytes.
+    pub path: String,
+    /// What the caller read. A write proceeds only while it still holds.
+    pub expected: TextExpectation,
+    /// The complete new file content, at most 1 MiB of UTF-8 without NUL.
+    pub content: String,
+}
+
+/// The content a write expects the file to hold right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TextExpectation {
+    /// The file holds exactly these bytes, by `sha256:` identity from a read.
+    Content {
+        /// `sha256:` followed by 64 lowercase hexadecimal digits.
+        content_id: String,
+    },
+    /// The file does not exist yet; this write creates it.
+    ///
+    /// An empty struct variant rather than a unit one, so `deny_unknown_fields`
+    /// refuses a `content_id` smuggled next to `kind: absent`.
+    Absent {},
 }
 
 /// Change-addressed command target.
@@ -381,6 +566,22 @@ pub struct WorktreeTarget {
     pub worktree_id: String,
 }
 
+/// Session-addressed command target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTarget {
+    /// Opaque 128-bit hexadecimal session ID from a v2 read or launch result.
+    pub session_id: String,
+}
+
+/// True for a 32-character lowercase hexadecimal opaque ID.
+pub fn is_opaque_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// A parameter object that accepts nothing.
 ///
 /// Present so the wire shape is stable if a parameter is ever added, and so that
@@ -388,6 +589,85 @@ pub struct WorktreeTarget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
+
+/// Typed parameters of `delete_worktree_confirmed`.
+///
+/// Three independent booleans — none implies another — plus the `consent`
+/// object a `delete-preview` read returned, echoed verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedDeleteParams {
+    /// Skip `.wt/teardown`. The recovery path for a failing teardown script.
+    pub skip_teardown: bool,
+    /// Discard known uncommitted changes and known ignored content.
+    pub discard_known_dirty: bool,
+    /// Discard commits ahead of base and force-delete the branch at the
+    /// consented HEAD.
+    pub discard_commits_ahead: bool,
+    /// The preview's `consent` object, unmodified.
+    pub consent: crate::worktree_ops::consent::DeleteConsent,
+}
+
+impl ConfirmedDeleteParams {
+    /// Field-level validation serde cannot express.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::orchestration::proposal_refresh::is_full_oid;
+        use crate::worktree_ops::consent::is_content_id;
+
+        let consent = &self.consent;
+        if consent.branch.trim().is_empty() {
+            return Err(
+                "delete_worktree_confirmed requires a non-empty consent.branch".to_string(),
+            );
+        }
+        if consent.head.len() != 40 || !is_full_oid(&consent.head) {
+            return Err(
+                "consent.head must be a 40-character lowercase hexadecimal commit ID".to_string(),
+            );
+        }
+        if let Some(base) = consent.merge_base.as_deref() {
+            if base.len() != 40 || !is_full_oid(base) {
+                return Err(
+                    "consent.merge_base must be a 40-character lowercase hexadecimal commit ID"
+                        .to_string(),
+                );
+            }
+        }
+        for (name, value) in [
+            ("discardable_content_id", &consent.discardable_content_id),
+            ("ignored_content_id", &consent.ignored_content_id),
+        ] {
+            if value.as_deref().is_some_and(|id| !is_content_id(id)) {
+                return Err(format!(
+                    "consent.{name} must be sha256: followed by 64 lowercase hexadecimal digits"
+                ));
+            }
+        }
+        // Independent of `consent.dirty`: a discard permission is only ever
+        // bound to named content, never to an undefined comparison.
+        if (self.discard_known_dirty || self.discard_commits_ahead)
+            && (consent.discardable_content_id.is_none() || consent.ignored_content_id.is_none())
+        {
+            return Err(
+                "a discard permission requires both consent.discardable_content_id and consent.ignored_content_id"
+                    .to_string(),
+            );
+        }
+        if self.discard_commits_ahead && consent.merge_base.is_none() {
+            return Err("discard_commits_ahead requires consent.merge_base".to_string());
+        }
+        Ok(())
+    }
+
+    /// The shared delete policy these permissions map onto, one-to-one.
+    pub fn options(&self) -> crate::worktree_ops::service::DeleteOptions {
+        crate::worktree_ops::service::DeleteOptions {
+            skip_teardown: self.skip_teardown,
+            allow_known_dirty: self.discard_known_dirty,
+            allow_commits_ahead: self.discard_commits_ahead,
+        }
+    }
+}
 
 impl CommandSpec {
     /// Wire discriminant of this command.
@@ -408,7 +688,14 @@ impl CommandSpec {
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
+            Self::MergeWorktreeAbortOnConflict { .. } => "merge_worktree_abort_on_conflict",
+            Self::DeleteWorktreeConfirmed { .. } => "delete_worktree_confirmed",
             Self::RefreshProposal { .. } => "refresh_proposal",
+            Self::WriteChangeText { .. } => "write_change_text",
+            Self::WriteWorktreeText { .. } => "write_worktree_text",
+            Self::RunWorktreeCommand { .. } => "run_worktree_command",
+            Self::CreateSessionWorktree { .. } => "create_session_worktree",
+            Self::StopWorktreeSession { .. } => "stop_worktree_session",
         }
     }
 
@@ -442,6 +729,41 @@ impl CommandSpec {
                 }
                 Ok(())
             }
+            Self::DeleteWorktreeConfirmed { params, .. } => params.validate(),
+            Self::WriteChangeText { target, params } => {
+                if target.change_id.trim().is_empty() {
+                    return Err("write_change_text requires a non-empty change_id".to_string());
+                }
+                params.validate()
+            }
+            Self::WriteWorktreeText { target, params } => {
+                if target.worktree_id.trim().is_empty() {
+                    return Err("write_worktree_text requires a non-empty worktree_id".to_string());
+                }
+                params.validate()
+            }
+            Self::RunWorktreeCommand { target, .. } => {
+                if is_opaque_id(&target.worktree_id) {
+                    Ok(())
+                } else {
+                    Err(
+                        "run_worktree_command requires a 32-character lowercase hexadecimal \
+                         target.worktree_id"
+                            .to_string(),
+                    )
+                }
+            }
+            Self::StopWorktreeSession { target, .. } => {
+                if is_opaque_id(&target.session_id) {
+                    Ok(())
+                } else {
+                    Err(
+                        "stop_worktree_session requires a 32-character lowercase hexadecimal \
+                         target.session_id"
+                            .to_string(),
+                    )
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -457,20 +779,58 @@ impl CommandSpec {
             | Self::ForceStopChange { change_id }
             | Self::ResolveMerge { change_id }
             | Self::RefreshProposal { change_id, .. } => Some(change_id),
-            Self::CreateWorktree { target, .. } => Some(&target.change_id),
+            Self::CreateWorktree { target, .. } | Self::WriteChangeText { target, .. } => {
+                Some(&target.change_id)
+            }
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
             // A process-wide mutation: it addresses the whole target set, never
             // one change.
             Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
-            Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
+            Self::DeleteWorktree { .. }
+            | Self::DeleteWorktreeConfirmed { .. }
+            | Self::MergeWorktree { .. }
+            | Self::MergeWorktreeAbortOnConflict { .. }
+            | Self::WriteWorktreeText { .. } => None,
+            // Sessions are addressed by opaque worktree or session ID, never by change.
+            Self::RunWorktreeCommand { .. }
+            | Self::CreateSessionWorktree { .. }
+            | Self::StopWorktreeSession { .. } => None,
         }
     }
 }
 
+impl TextWriteParams {
+    /// Lexical path rules, the size ceiling, NUL, and identity shape.
+    ///
+    /// Everything here is decided without touching the filesystem, so a
+    /// violation is a `validation_failed` envelope with no record.
+    pub fn validate(&self) -> Result<(), String> {
+        super::text_edit::validate_path(&self.path)?;
+        if self.content.len() as u64 > super::text_edit::MAX_TEXT_BYTES {
+            return Err(format!(
+                "content exceeds the {} byte text ceiling",
+                super::text_edit::MAX_TEXT_BYTES
+            ));
+        }
+        if self.content.contains('\0') {
+            return Err("content must not contain NUL".to_string());
+        }
+        if let TextExpectation::Content { content_id } = &self.expected {
+            if !super::text_edit::is_content_id(content_id) {
+                return Err(
+                    "expected.content_id must be `sha256:` followed by 64 lowercase hex digits"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 16] = [
+pub const SUPPORTED_COMMANDS: [&str; 23] = [
     "start",
     "stop",
     "cancel_stop",
@@ -487,6 +847,13 @@ pub const SUPPORTED_COMMANDS: [&str; 16] = [
     "delete_worktree",
     "merge_worktree",
     "refresh_proposal",
+    "merge_worktree_abort_on_conflict",
+    "delete_worktree_confirmed",
+    "write_change_text",
+    "write_worktree_text",
+    "run_worktree_command",
+    "create_session_worktree",
+    "stop_worktree_session",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -687,6 +1054,61 @@ pub struct CapabilitiesResponse {
     /// absent field means "not served".
     #[serde(default)]
     pub proposal_refresh: ProposalRefreshCapability,
+    /// The bounded remote text edit surface.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field decodes as unavailable — never as available.
+    #[serde(default)]
+    pub text_edit: TextEditCapability,
+    /// The configured-command worktree session surface.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field decodes as `available: false` — exactly what such an owner is.
+    #[serde(default)]
+    pub worktree_sessions: WorktreeSessionCapability,
+}
+
+/// Whether configured-command worktree sessions can be launched here, and the
+/// limits that bound them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionCapability {
+    /// True only when `worktree_command` is configured, the project is a Git
+    /// repository, and a command executor is bound.
+    pub available: bool,
+    /// The three session command types.
+    pub commands: Vec<String>,
+    /// The two session read routes.
+    pub routes: Vec<String>,
+    /// Sessions that may run at once.
+    pub max_running: usize,
+    /// Finished sessions retained, oldest evicted first.
+    pub max_retained: usize,
+    /// Retained output tail per session, in bytes.
+    pub max_output_bytes: usize,
+    /// Retained runner notices per session, oldest dropped first. `null` from
+    /// an older owner, which publishes no notices.
+    #[serde(default)]
+    pub max_runner_notices: Option<usize>,
+    /// What the command's stdin is. Always `null`: there is no stdin relay.
+    pub stdin: String,
+    /// Every stable refusal reason.
+    pub reasons: Vec<String>,
+    /// The state events a session publishes. Output is never an event.
+    #[serde(default)]
+    pub event_types: Vec<WorktreeSessionEventType>,
+}
+
+/// State events a configured-command worktree session publishes.
+///
+/// Payload `{session_id, worktree_id, state, exit_code}`, `change_id: null`. They
+/// take an event sequence but never advance `state_revision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSessionEventType {
+    /// A session was launched.
+    WorktreeSessionStarted,
+    /// A session settled.
+    WorktreeSessionFinished,
 }
 
 /// Whether a mutation can be executed by this process at all.
@@ -1122,6 +1544,9 @@ impl Default for ParallelEligibility {
 /// Only boundary instants are published. A live elapsed counter in the snapshot
 /// would make every projection look changed and advance the revision forever, so
 /// a client derives "running for" from `started_at` itself.
+///
+/// Per-run boundaries of the current or most recent run; `elapsed_ms` is that
+/// run's duration and is not cumulative — see `net_active`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeTiming {
     /// When the current or most recent run started (RFC 3339).
@@ -1129,6 +1554,56 @@ pub struct ChangeTiming {
     /// When it finished (RFC 3339); `null` while it is still running.
     pub completed_at: Option<String>,
     /// Duration of the finished run in milliseconds.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Cumulative net-active execution time of one change in this owner process.
+///
+/// Driven by the same shared clock the TUI row's net execution time uses: an
+/// interval opens on a transition into an active display status (`preparing`,
+/// `applying`, `accepting`, `rejecting`, `archiving`, `resolving`), stays open
+/// across repeated or successive active statuses, and closes exactly once on a
+/// transition to any other status or on process `Stopped`. Closed intervals
+/// accumulate and are never reset while the owner runs; a restarted owner
+/// starts from zero. Unlike `timing`, which is per run, this is cumulative.
+///
+/// No live counter is published: a client derives the current total as
+/// `accumulated_ms + (now - active_since)` while `active_since` is set, so the
+/// snapshot never changes merely because time passed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NetActiveTiming {
+    /// Sum of closed active intervals, in milliseconds.
+    pub accumulated_ms: u64,
+    /// When the open active interval started (RFC 3339); `null` while closed.
+    #[schema(required)]
+    pub active_since: Option<String>,
+    /// Whether this change was ever active in this owner process.
+    pub has_history: bool,
+}
+
+/// Run-level elapsed clock, the projection of the TUI `Elapsed` line.
+///
+/// Opened by an accepted Start while the owner is not running; left open by a
+/// persistent-idle park, persistent-idle re-admission, `ResolveReserved`, and a
+/// fatal process error; frozen by every `Stopped` and every `AllCompleted`
+/// delivery and by a resolve-side settlement that leaves nothing processing; a
+/// repeated terminal delivery re-freezes at the later instant. The value is
+/// retained until the next opening Start. All three members are `null` before
+/// the first Start in this process. Process-local presentation only.
+///
+/// While `ended_at` is `null` a client derives the live value as
+/// `now - started_at`; no server-side counter is ever published.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunClock {
+    /// When the current or most recent run was opened (RFC 3339).
+    #[schema(required)]
+    pub started_at: Option<String>,
+    /// When the run clock was last frozen (RFC 3339); `null` while open.
+    #[schema(required)]
+    pub ended_at: Option<String>,
+    /// Monotonic duration from the open to the latest freeze, in whole
+    /// milliseconds; `null` while open.
+    #[schema(required)]
     pub elapsed_ms: Option<u64>,
 }
 
@@ -1225,6 +1700,29 @@ pub struct ChangeResource {
     #[serde(default)]
     pub acceptance_provenance:
         Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
+    /// Whether the reducer recorded archive completion for this change in this
+    /// owner process.
+    ///
+    /// Read in the same reducer hold as `display_status` and distinct from it:
+    /// stays `true` while the row advances to `resolving`, `resolve pending`,
+    /// `merge wait`, `merged`, or `pushed`, and is `false` for a fresh-process
+    /// resolve retry with no archive on record. Not merge or push success.
+    /// Process-local; never a workflow input.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as `false`. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub archive_complete: Option<bool>,
+    /// Cumulative net-active execution time; see `NetActiveTiming`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"), never as zero. This server
+    /// always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub net_active: Option<NetActiveTiming>,
 }
 
 /// Aggregate counts over the projected changes.
@@ -1276,6 +1774,13 @@ pub struct InstanceSnapshot {
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
     pub totals: SnapshotTotals,
+    /// Run-level elapsed clock; see `RunClock`.
+    ///
+    /// `Option` with `#[serde(default)]` only so an owner built before this
+    /// member decodes as `None` ("unpublished"). This server always writes it.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub run_clock: Option<RunClock>,
 }
 
 impl InstanceSnapshot {
@@ -1294,6 +1799,7 @@ impl InstanceSnapshot {
                 in_progress: 0,
                 pending: 0,
             },
+            run_clock: Some(RunClock::default()),
         }
     }
 }
@@ -1530,6 +2036,12 @@ pub struct ProcessExecutionStatus {
     /// Latest retained structured log line, regardless of change; `null` when
     /// the ring is empty.
     pub latest_log: Option<LatestLogProjection>,
+    /// Configured-command worktree sessions currently running.
+    ///
+    /// Computed on read. Independent of `has_active_work` and
+    /// `scheduler_running`: a session is not lifecycle work.
+    #[serde(default)]
+    pub worktree_sessions_running: u32,
 }
 
 /// One change's execution facts.
@@ -2055,6 +2567,460 @@ pub enum CommandResult {
     /// write (a hook rejection, an unexpected tree) left real Git state behind,
     /// and the effects object is the only truthful account of it.
     RefreshProposal(Box<RefreshProposalResult>),
+    /// Launch evidence for `run_worktree_command` and `create_session_worktree`.
+    ///
+    /// A failed `create_session_worktree` that already created a worktree also
+    /// carries it, with `session_id: null`, so the setup and cleanup facts are
+    /// not lost.
+    WorktreeSession(Box<WorktreeSessionResult>),
+    /// Settlement evidence for `stop_worktree_session`.
+    WorktreeSessionStop {
+        /// The session the command addressed.
+        session_id: String,
+        /// True when the runner cancelled it and proved the process group
+        /// quiescent. `false` for a session that had already finished.
+        terminated: bool,
+        /// Session state after settlement.
+        state_after: String,
+    },
+    /// Settlement evidence for `merge_worktree_abort_on_conflict`.
+    ///
+    /// Present on success and on every refusal after eligibility
+    /// (`merge_conflict_predicted`, `merge_conflict_aborted`,
+    /// `merge_abort_failed`), because a client must be able to tell a proven
+    /// restoration from an unproven one without parsing prose.
+    MergeAbort(Box<MergeAbortResult>),
+    /// Settlement evidence for `delete_worktree_confirmed`, success or refusal.
+    ///
+    /// A refused record carries the same kind, with `refusal` holding the
+    /// stable reason and the freshly observed facts, so a client can re-render
+    /// its confirmation without a second preview.
+    DeleteWorktreeConfirmed(Box<ConfirmedDeleteResult>),
+    /// Settlement evidence for `write_change_text` / `write_worktree_text`.
+    ///
+    /// Carried by refusals too (`text_stale`, `text_not_editable`,
+    /// `target_ineligible`), so a client reads `current_content_id` from the
+    /// record rather than re-observing the file.
+    TextWrite(Box<TextWriteResult>),
+}
+
+/// What a session launch (or a refused provisioning) produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResult {
+    /// The launched session; `null` when nothing was launched.
+    pub session_id: Option<String>,
+    /// `existing` or `session`.
+    ///
+    /// Not named `kind`: that member is the `CommandResult` discriminant, and a
+    /// second `kind` would overwrite it on the wire.
+    pub session_kind: String,
+    /// Opaque worktree ID; `null` when no live worktree could be identified.
+    pub worktree_id: Option<String>,
+    /// Checked-out branch.
+    pub branch: String,
+    /// Repository-relative display path.
+    pub path: String,
+    /// Setup facts of a provisioned worktree; `null` for `existing`.
+    pub setup: Option<SessionSetupFacts>,
+    /// Setup-failure cleanup facts; `null` when no cleanup ran.
+    pub cleanup: Option<SessionCleanupFacts>,
+}
+
+/// What `.wt/setup` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSetupFacts {
+    /// A `.wt/setup` script existed and ran.
+    pub ran: bool,
+    /// Setup did not fail.
+    pub succeeded: bool,
+}
+
+/// What the setup-failure cleanup did.
+///
+/// `removed: true` means the worktree directory and registration are gone; the
+/// `ws-session-*` branch is retained exactly as after a TUI `+` setup failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionCleanupFacts {
+    /// `removed` or `retained`.
+    pub outcome: String,
+    /// True when the worktree is gone.
+    pub removed: bool,
+    /// Why removal failed, when it did.
+    pub reason: Option<String>,
+}
+
+/// One retained output line of a session: bytes the child wrote.
+///
+/// Never a runner diagnostic: retry, launch-failure, shutdown, limit, and
+/// cleanup facts are `runner_notices`, so a line here cannot change any
+/// owner-generated member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionOutputLine {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    /// The command's own text after control-sequence stripping and the 8 KiB
+    /// line bound. Not redacted.
+    pub text: String,
+}
+
+/// One runner-generated fact about a session, from a typed runner channel.
+///
+/// Never derived from child output. `detail` carries numbers and fixed tokens
+/// only — never the template, the expanded command, environment values, or a
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionRunnerNotice {
+    /// `retry_scheduled`, `inactivity_terminated`, `runtime_limit_reached`,
+    /// `launch_failed`, `shutdown_refused`,
+    /// `process_group_cleanup_unconfirmed`, or `stop_refused_attempt` (a stop
+    /// arrived before the next attempt was spawned, so it never was).
+    pub kind: String,
+    /// The attempt the notice concerns (for `retry_scheduled`, the attempt
+    /// scheduled next; for `stop_refused_attempt`, the attempt refused);
+    /// `null` when it concerns none.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub attempt: Option<u32>,
+    /// Sanitized facts, for example `cause=crash, max_attempts=1, delay_ms=0`
+    /// `pgid=4242, force_killed=true`, or `stage=retry` (`retry`, `stagger`,
+    /// or `spawn` for `stop_refused_attempt`); `null` when the kind has none.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
+}
+
+/// Bounded, sanitized output tail of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionOutput {
+    /// Retained lines, oldest first.
+    pub lines: Vec<SessionOutputLine>,
+    /// Bytes of line text retained (at most 65,536).
+    pub retained_bytes: usize,
+    /// Bytes of line text dropped to stay within the bound.
+    pub truncated_bytes: u64,
+}
+
+/// One configured-command worktree session.
+///
+/// Owner-generated members never carry the configured template, the expanded
+/// command, environment values, absolute paths, or a process-group ID.
+/// `output.lines` is different in kind: it is the command's own stdout/stderr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResource {
+    /// Random 128-bit process-local hexadecimal session ID.
+    pub session_id: String,
+    /// Process incarnation that owns the session.
+    pub instance_id: String,
+    /// `existing` or `session`.
+    pub kind: String,
+    /// Opaque worktree ID.
+    pub worktree_id: Option<String>,
+    /// Repository-relative display path.
+    pub path: String,
+    /// Checked-out branch.
+    pub branch: String,
+    /// `running`, `succeeded`, `failed`, or `stopped`.
+    pub state: String,
+    /// Runner attempts started inside this one session (configured retries):
+    /// `1` at launch, then the attempt of each later successful spawn the
+    /// runner reported on its typed channel. A retry merely scheduled does not
+    /// count, and no output line can change it.
+    pub attempt: u32,
+    /// Launch instant (RFC 3339).
+    pub started_at: String,
+    /// Settlement instant (RFC 3339), once settled.
+    pub finished_at: Option<String>,
+    /// Exit code of the final attempt as reaped; `null` when a signal ended
+    /// it or the leader was not reaped.
+    pub exit_code: Option<i32>,
+    /// The signal that terminated the leader as reaped (`SIGTERM`, or
+    /// `SIGKILL` after escalation); `null` when unknown or when it exited on
+    /// its own.
+    pub signal: Option<String>,
+    /// A stop or owner shutdown was requested.
+    pub stop_requested: bool,
+    /// Setup facts of a provisioned session.
+    pub setup: Option<SessionSetupFacts>,
+    /// Setup-failure cleanup facts; always `null` for a launched session.
+    pub cleanup: Option<SessionCleanupFacts>,
+    /// Bounded sanitized output tail: only bytes the child wrote.
+    pub output: SessionOutput,
+    /// Bounded runner-generated notices, oldest first. `null` from an older
+    /// owner, which publishes none ("unpublished", not "empty").
+    #[serde(default)]
+    pub runner_notices: Option<Vec<SessionRunnerNotice>>,
+    /// Runner notices dropped to stay within `max_runner_notices`; `null`
+    /// from an older owner.
+    #[serde(default)]
+    pub runner_notices_dropped: Option<u64>,
+}
+
+/// `GET /api/v2/worktree-sessions` body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionsResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the list was read at. Sessions never advance it.
+    pub state_revision: u64,
+    /// Retained sessions, newest first.
+    pub sessions: Vec<WorktreeSessionResource>,
+}
+
+/// `GET /api/v2/worktree-sessions/{session_id}` body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorktreeSessionResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the session was read at.
+    pub state_revision: u64,
+    /// The requested session.
+    pub session: WorktreeSessionResource,
+}
+
+/// Why a confirmed delete was refused, with what the service just observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteRefusalResult {
+    /// The stable reason; `null` for a refusal outside the consent vocabulary.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub reason: Option<crate::worktree_ops::consent::ConfirmedDeleteReason>,
+    /// True when `.wt/teardown` ran before the refusal. Its effects are not
+    /// reversed; the worktree was retained.
+    pub teardown_ran: bool,
+    /// The freshest observation; `null` when the worktree was not observable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub observed: Option<crate::worktree_ops::consent::ConsentObservation>,
+}
+
+/// The settled body of a `delete_worktree_confirmed` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedDeleteResult {
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// Branch of the worktree; the consented one when nothing was observed.
+    pub branch: String,
+    /// HEAD of the worktree; the consented one when nothing was observed.
+    pub head: String,
+    /// `deleted` on success; `null` when refused.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub outcome: Option<String>,
+    /// What happened to `.wt/teardown`.
+    pub teardown: crate::worktree_ops::consent::TeardownDisposition,
+    /// True when known uncommitted or ignored content was discarded.
+    pub dirty_discarded: bool,
+    /// True when commits ahead of base were discarded with their branch.
+    pub commits_discarded: bool,
+    /// True when the worktree's branch was deleted.
+    pub branch_deleted: bool,
+    /// Why the branch was kept, when the worktree was removed but it was not.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub branch_retained_reason: Option<String>,
+    /// The refusal; `null` on success.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub refusal: Option<ConfirmedDeleteRefusalResult>,
+}
+
+/// How an abort-on-conflict merge settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortOutcome {
+    /// The merge completed.
+    Merged,
+    /// Refused before any Git mutation.
+    PredictedConflict,
+    /// Conflicted, aborted, and restoration was confirmed.
+    ConflictAborted,
+    /// Conflicted, and restoration was not confirmed.
+    AbortFailed,
+    /// Merged into base, then the `on_merged` hook failed. Decided by the
+    /// operation stage; `merge.landed` is re-read separately.
+    MergedHookFailed,
+    /// A Git failure after eligibility and before any merge commit (a dirty
+    /// base, an unmergeable ref). `merge.landed` is re-read separately.
+    MergeFailed,
+}
+
+/// Whether a base merge commit landed, re-read from the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeLanded {
+    /// `HEAD` moved off `premerge_head`, descends from it, and no `MERGE_HEAD` exists.
+    Confirmed,
+    /// `HEAD` is still `premerge_head` and no `MERGE_HEAD` exists.
+    NotLanded,
+    /// A fact could not be read, or the facts support neither verdict; `detail` names which.
+    Unknown,
+}
+
+impl From<crate::vcs::git::commands::Landing> for MergeLanded {
+    fn from(value: crate::vcs::git::commands::Landing) -> Self {
+        use crate::vcs::git::commands::Landing;
+        match value {
+            Landing::Confirmed => Self::Confirmed,
+            Landing::NotLanded => Self::NotLanded,
+            Landing::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Whether the merge commit landed on base, re-read from Git after the command stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeLandingEvidence {
+    /// The verdict derived from the facts below, never from the attempt.
+    pub landed: MergeLanded,
+    /// Base `HEAD` as re-read; `null` when it could not be read.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean; informational, never changes `landed`. `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub clean_after: Option<bool>,
+    /// Which verification failed or contradicted when `landed` is `unknown`; else `null`.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
+}
+
+impl MergeLandingEvidence {
+    /// Project the VCS landing report onto the wire.
+    pub fn from_report(report: &crate::vcs::git::commands::LandingReport) -> Self {
+        Self {
+            landed: report.landed.into(),
+            head_after: report.head_after.clone(),
+            merge_head_present: report.merge_head_present,
+            clean_after: report.clean_after,
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// What the `on_merged` hook did during an abort-on-conflict merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeHookEvidence {
+    /// True when the hook was invoked (exactly once).
+    pub ran: bool,
+    /// Whether the hook succeeded; `null` when it did not run.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub exit_ok: Option<bool>,
+    /// Bounded, sanitized hook failure text; `null` unless the hook failed.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub detail: Option<String>,
+}
+
+impl MergeHookEvidence {
+    /// The hook was not invoked.
+    pub fn not_run() -> Self {
+        Self {
+            ran: false,
+            exit_ok: None,
+            detail: None,
+        }
+    }
+}
+
+/// How far the root was proven restored after `git merge --abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAbortRestoration {
+    /// `HEAD` is the pre-merge commit, no `MERGE_HEAD`, and the root is clean.
+    Confirmed,
+    /// Every verification was read and at least one failed.
+    Failed,
+    /// At least one verification could not be read.
+    Unknown,
+}
+
+impl From<crate::vcs::git::commands::Restoration> for MergeAbortRestoration {
+    fn from(value: crate::vcs::git::commands::Restoration) -> Self {
+        use crate::vcs::git::commands::Restoration;
+        match value {
+            Restoration::Confirmed => Self::Confirmed,
+            Restoration::Failed => Self::Failed,
+            Restoration::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// What `git merge --abort` did, re-read from the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortEvidence {
+    /// Exit status of `git merge --abort`.
+    pub exit_ok: bool,
+    /// `HEAD` after the abort; `null` when it could not be read.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub head_after: Option<String>,
+    /// Whether `MERGE_HEAD` exists after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub merge_head_present: Option<bool>,
+    /// Whether the root is clean after the abort; `null` when unreadable.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub clean_after: Option<bool>,
+    /// The verdict derived from the facts above, never from the attempt alone.
+    pub restored: MergeAbortRestoration,
+    /// Bounded, sanitized tail of the abort's own output.
+    pub detail: String,
+}
+
+impl MergeAbortEvidence {
+    /// Project the VCS report onto the wire.
+    pub fn from_report(report: &crate::vcs::git::commands::AbortReport) -> Self {
+        Self {
+            exit_ok: report.exit_ok,
+            head_after: report.head_after.clone(),
+            merge_head_present: report.merge_head_present,
+            clean_after: report.clean_after,
+            restored: report.restored.into(),
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// The settled body of a `merge_worktree_abort_on_conflict` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MergeAbortResult {
+    /// The addressed opaque worktree ID.
+    pub worktree_id: String,
+    /// The merged branch; empty when it could not be observed.
+    pub branch: String,
+    /// How the command settled.
+    pub outcome: MergeAbortOutcome,
+    /// `HEAD` before `git merge` ran; `null` when no merge ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub premerge_head: Option<String>,
+    /// Repository-relative conflicting paths; empty after a clean merge.
+    pub conflict_files: Vec<String>,
+    /// The verified abort report; `null` when no abort ran.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub abort: Option<MergeAbortEvidence>,
+    /// `local_or_tui_required` when restoration was not confirmed or a hook
+    /// failed after a landed merge; else `null`.
+    // Published as required: always written, `null` when it does not apply.
+    #[schema(required)]
+    pub recovery: Option<String>,
+    /// Whether the merge commit landed on base, re-read from Git; `null` when
+    /// not reported. Omitted by older owners, which decodes as `null`.
+    #[serde(default)]
+    pub merge: Option<MergeLandingEvidence>,
+    /// What the `on_merged` hook did; `null` when not reported. Omitted by
+    /// older owners, which decodes as `null`.
+    #[serde(default)]
+    pub hook: Option<MergeHookEvidence>,
 }
 
 /// What a candidate proposal refresh actually did, re-read from Git.
@@ -2204,6 +3170,184 @@ pub struct ProposalRefreshCapability {
     /// Command type an apply is submitted as.
     pub command: String,
     /// Every stable refusal reason, lifecycle and command time.
+    pub reasons: Vec<String>,
+}
+
+// ============================================================================
+// Bounded text edit
+// ============================================================================
+
+/// Which root a text read or write addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextScope {
+    /// `openspec/changes/<change_id>` of the project.
+    Change {
+        /// Tracked, non-archived change.
+        change_id: String,
+    },
+    /// The directory a live opaque worktree ID is bound to.
+    Worktree {
+        /// Opaque process-local worktree ID.
+        worktree_id: String,
+    },
+}
+
+/// Why a target that holds editable text cannot be written right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextEditBlockedReason {
+    /// The change (for a worktree, its owning change) is in an active status.
+    ChangeActive,
+    /// The change is admitted: queue intent queued, or status `queued`/`blocked`.
+    ChangeAdmitted,
+    /// Managed writer coverage for the root is not `Clear`: a managed writer is
+    /// bound here, or the owner cannot prove that none is. `edit_blocked_detail`
+    /// tells the two apart.
+    ManagedProcessLive,
+    /// The repository root guard is held, a base merge is in progress, or a
+    /// resolve is running.
+    RootBusy,
+}
+
+impl TextEditBlockedReason {
+    /// Wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeActive => "change_active",
+            Self::ChangeAdmitted => "change_admitted",
+            Self::ManagedProcessLive => "managed_process_live",
+            Self::RootBusy => "root_busy",
+        }
+    }
+}
+
+/// The surface's fixed bounds, repeated on every read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextEditLimits {
+    /// Largest editable file, in bytes.
+    pub max_bytes: u64,
+    /// Longest accepted relative path, in bytes.
+    pub max_path_bytes: usize,
+    /// Algorithm of `content_id`; always `sha256`.
+    pub content_id_algorithm: String,
+}
+
+/// `GET /api/v2/changes/{change_id}/text` and
+/// `GET /api/v2/worktrees/{worktree_id}/text` body.
+///
+/// A read: no command record, no revision change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextReadResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision the eligibility was read at.
+    pub state_revision: u64,
+    /// The addressed root.
+    pub scope: TextScope,
+    /// The root-relative path, as requested.
+    pub path: String,
+    /// False when the file does not exist; a write may then create it with
+    /// `expected.kind = absent`.
+    pub exists: bool,
+    /// The file's bytes as UTF-8; `null` when absent.
+    #[schema(required)]
+    pub content: Option<String>,
+    /// `sha256:<hex>` of the bytes; `null` when absent.
+    #[schema(required)]
+    pub content_id: Option<String>,
+    /// Byte length; `null` when absent.
+    #[schema(required)]
+    pub size_bytes: Option<u64>,
+    /// Octal permission bits, for example `0644`; `null` when absent.
+    #[schema(required)]
+    pub mode: Option<String>,
+    /// True when a write would pass writer exclusion right now.
+    pub editable: bool,
+    /// Why not, when `editable` is false.
+    #[schema(required)]
+    pub edit_blocked_reason: Option<TextEditBlockedReason>,
+    /// Bounded diagnostic for the refusal; never parsed by clients.
+    #[schema(required)]
+    pub edit_blocked_detail: Option<String>,
+    /// The surface's fixed bounds.
+    pub limits: TextEditLimits,
+}
+
+/// How a text write settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextWriteOutcome {
+    /// The bytes were replaced (or the file created).
+    Written,
+    /// The new content equals the file; nothing was opened for writing.
+    Unchanged,
+}
+
+/// What a text write actually did to the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextWriteEffects {
+    /// True only when the target file now holds the new bytes.
+    pub file_written: bool,
+}
+
+/// The settled body of a text write, successful or refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextWriteResult {
+    /// The addressed root.
+    pub scope: TextScope,
+    /// The root-relative path.
+    pub path: String,
+    /// `written` or `unchanged`; `null` when refused.
+    #[schema(required)]
+    pub outcome: Option<TextWriteOutcome>,
+    /// Stable refusal reason (a `text_not_editable` or `target_ineligible`
+    /// token, or `stale`); `null` on success.
+    #[schema(required)]
+    pub reason: Option<String>,
+    /// Bounded diagnostic; for `managed_process_live`, the coverage detail.
+    #[schema(required)]
+    pub detail: Option<String>,
+    /// Identity the file held before the write; `null` when it was absent.
+    #[schema(required)]
+    pub content_id_before: Option<String>,
+    /// Identity re-read after the write; `null` when nothing was written.
+    #[schema(required)]
+    pub content_id_after: Option<String>,
+    /// For `text_stale`: what the file holds now; `null` when it is absent.
+    #[schema(required)]
+    pub current_content_id: Option<String>,
+    /// Bytes written; `null` when nothing was written.
+    #[schema(required)]
+    pub bytes_written: Option<u64>,
+    /// Octal permission bits after the write; `null` when nothing was written.
+    #[schema(required)]
+    pub mode: Option<String>,
+    /// What the filesystem holds as a result.
+    pub effects: TextWriteEffects,
+}
+
+/// Whether the bounded text edit surface is served, and its bounds.
+///
+/// `Default` is the *unavailable* answer, which is what an older owner's
+/// omission decodes as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct TextEditCapability {
+    /// True when this build serves the text routes and commands.
+    pub available: bool,
+    /// Route templates of the two reads.
+    pub read_routes: Vec<String>,
+    /// Command types a write is submitted as.
+    pub commands: Vec<String>,
+    /// Largest editable file, in bytes.
+    pub max_bytes: u64,
+    /// Longest accepted relative path, in bytes.
+    pub max_path_bytes: usize,
+    /// Algorithm of `content_id`.
+    pub content_id_algorithm: String,
+    /// Paths and kinds that are never editable.
+    pub excluded: Vec<String>,
+    /// Every stable refusal reason, containment and writer exclusion.
     pub reasons: Vec<String>,
 }
 

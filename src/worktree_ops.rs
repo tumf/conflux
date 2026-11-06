@@ -14,9 +14,11 @@
 //! frontend observes through [`observe_worktrees`], so the eligibility policy
 //! and the revision-keyed observation cache are the same ones for all of them.
 
+pub mod consent;
 pub mod git_backend;
 pub mod inspection;
 pub mod service;
+pub mod session;
 
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};

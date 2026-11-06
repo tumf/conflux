@@ -207,6 +207,12 @@ pub struct TuiRunSupervisor {
     launch: LaunchContext,
     slots: Arc<RunSlots>,
     graceful_stop: Arc<AtomicBool>,
+    /// The owner's account of every writer it can launch.
+    ///
+    /// Every scope this supervisor installs is registered here, and stays
+    /// registered after the next launch replaces it or shutdown takes it: only
+    /// confirmed quiescence resolves a scope, never forgetting it.
+    writer_ledger: Option<crate::ai_command_runner::ManagedWriterLedger>,
 }
 
 impl TuiRunSupervisor {
@@ -236,7 +242,17 @@ impl TuiRunSupervisor {
             },
             slots: Arc::new(RunSlots::default()),
             graceful_stop,
+            writer_ledger: None,
         }
+    }
+
+    /// Register every scope this supervisor installs with `ledger`.
+    pub fn with_writer_ledger(
+        mut self,
+        ledger: crate::ai_command_runner::ManagedWriterLedger,
+    ) -> Self {
+        self.writer_ledger = Some(ledger);
+        self
     }
 
     /// Take the current run task, cancellation token, and command scope for shutdown.
@@ -275,9 +291,32 @@ impl TuiRunSupervisor {
         cancel: Option<CancellationToken>,
         scope: Option<RunCommandScope>,
     ) {
+        if let (Some(ledger), Some(scope)) = (&self.writer_ledger, &scope) {
+            ledger.register_scope(scope);
+        }
         *lock(&self.slots.handle) = handle;
         *lock(&self.slots.cancel) = cancel;
         *lock(&self.slots.scope) = scope;
+    }
+
+    /// A supervisor that never launches a run, for coverage tests that only
+    /// install scopes through [`Self::install_run_for_test`].
+    #[cfg(test)]
+    pub(crate) fn idle_for_test(
+        repo_root: PathBuf,
+        state: Arc<tokio::sync::RwLock<OrchestratorState>>,
+    ) -> Self {
+        Self::new(
+            repo_root,
+            OrchestratorConfig::default(),
+            Arc::new(EventDispatcher::new(state.clone(), Vec::new())),
+            DynamicQueue::new(),
+            state,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            PostArchiveAction::MergeToBase,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// The cancellation token of the live run, if any.
@@ -363,6 +402,7 @@ impl TuiRunSupervisor {
         let launch = self.launch.clone();
         let slots = self.slots.clone();
         let graceful_stop = self.graceful_stop.clone();
+        let writer_ledger = self.writer_ledger.clone();
 
         move || {
             let cancel = CancellationToken::new();
@@ -370,6 +410,11 @@ impl TuiRunSupervisor {
             // a restarted run always begins with open admission.
             let scope = RunCommandScope::new();
             scope.link_cancellation(cancel.clone());
+            // Registered before the slot replaces the previous run's scope, so
+            // there is no instant at which either one is unaccounted for.
+            if let Some(ledger) = &writer_ledger {
+                ledger.register_scope(&scope);
+            }
 
             // Every launch — selected targets and scheduler-owned resolve alike
             // — dispatches the cumulative worktree scheduler, so an opted-in
