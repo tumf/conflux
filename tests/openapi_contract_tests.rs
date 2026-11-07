@@ -3682,3 +3682,159 @@ fn session_retry_stop_contract_old_owner_session_decodes() {
         "nothing else moved"
     );
 }
+
+// ============================================================================
+// Completed-change retention
+// ============================================================================
+
+/// Everything the completed-change retention guarantee publishes, as one
+/// predicate so the same check can be run against deliberately broken copies.
+fn retention_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let capability = &schemas(doc)["CompletedChangeRetentionCapability"];
+    if capability.is_null() {
+        errors.push("CompletedChangeRetentionCapability is not published".into());
+    } else {
+        let expected: [(&str, &str); 4] = [
+            ("available", "boolean"),
+            ("retained_statuses", "array"),
+            ("settling_statuses", "array"),
+            ("scope", "string"),
+        ];
+        let properties: BTreeSet<String> = capability["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default();
+        let names: BTreeSet<String> = expected.iter().map(|(name, _)| name.to_string()).collect();
+        if properties != names {
+            errors.push(format!(
+                "CompletedChangeRetentionCapability must publish exactly {names:?}: {properties:?}"
+            ));
+        }
+        let required: BTreeSet<String> = capability["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if required != names {
+            errors.push(format!(
+                "CompletedChangeRetentionCapability must require exactly {names:?}: {required:?}"
+            ));
+        }
+        for (name, kind) in expected {
+            let property = &capability["properties"][name];
+            if property["type"] != kind {
+                errors.push(format!(
+                    "CompletedChangeRetentionCapability.{name} must be a {kind}: {property}"
+                ));
+            }
+            if kind == "array" && property["items"]["type"] != "string" {
+                errors.push(format!(
+                    "CompletedChangeRetentionCapability.{name} must list strings: {property}"
+                ));
+            }
+        }
+    }
+
+    let capabilities = &schemas(doc)["CapabilitiesResponse"];
+    let member = &capabilities["properties"]["completed_change_retention"];
+    if member.is_null() {
+        errors.push("CapabilitiesResponse.completed_change_retention is not published".into());
+    } else {
+        let mut refs = BTreeSet::new();
+        collect_refs(member, &mut refs);
+        if !refs.contains("CompletedChangeRetentionCapability") {
+            errors.push(format!(
+                "CapabilitiesResponse.completed_change_retention must reference \
+                 CompletedChangeRetentionCapability: {member}"
+            ));
+        }
+    }
+    let required_members = capabilities["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if required_members.contains(&json!("completed_change_retention")) {
+        errors.push(
+            "CapabilitiesResponse.completed_change_retention must be optional so an older \
+             owner's omission decodes"
+                .into(),
+        );
+    }
+
+    for schema in ["InstanceSnapshot", "ChangesResponse"] {
+        let description = schemas(doc)[schema]["properties"]["changes"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        if !description.contains("completed_change_retention") {
+            errors.push(format!(
+                "{schema}.changes must describe completed_change_retention: {description:?}"
+            ));
+        }
+    }
+    errors
+}
+
+#[test]
+fn retain_api_completed_capability_is_published_and_optional() {
+    use conflux::web::state::completed_change_retention_capability;
+
+    let doc = generated();
+    let errors = retention_contract_errors(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let published = serde_json::to_value(completed_change_retention_capability()).unwrap();
+    assert_eq!(
+        published,
+        json!({
+            "available": true,
+            "retained_statuses": ["merged", "pushed"],
+            "settling_statuses": ["resolving"],
+            "scope": "instance",
+        })
+    );
+    let mut payload_errors = Vec::new();
+    validate(
+        &published,
+        &schemas(&doc)["CompletedChangeRetentionCapability"],
+        schemas(&doc),
+        "CompletedChangeRetentionCapability",
+        &mut payload_errors,
+    );
+    assert!(payload_errors.is_empty(), "{payload_errors:#?}");
+}
+
+#[test]
+fn retain_api_completed_omitting_the_capability_fails_the_contract() {
+    let mut removed = generated();
+    removed["components"]["schemas"]["CapabilitiesResponse"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("completed_change_retention")
+        .expect("the member is published");
+    let errors = retention_contract_errors(&removed);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("completed_change_retention")),
+        "a document without the member must fail: {errors:#?}"
+    );
+
+    let mut required = generated();
+    required["components"]["schemas"]["CapabilitiesResponse"]["required"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("completed_change_retention"));
+    let errors = retention_contract_errors(&required);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("completed_change_retention")),
+        "a document requiring the member must fail: {errors:#?}"
+    );
+}

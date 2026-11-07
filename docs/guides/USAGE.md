@@ -265,6 +265,51 @@ Notes for client authors:
   `active_since` is set, and `now - started_at` while `ended_at` is `null`. An
   owner built before these members omits them; decode the absence as
   "unpublished", never as `false` or zero.
+- Completed changes stay listed. A change this owner already published stays
+  in `changes` after its proposal leaves `openspec/changes/` while the reducer
+  reports it `merged` or `pushed` (for the rest of the incarnation) or
+  `resolving` (while that lasts); a settled `resolving` row stays, with its
+  current reducer status, until an observation that reads the reducer releases
+  it. The status is always reducer-authored, never inferred from absence, task
+  counts, the archive, or `archive_complete`; absent rows that wait or fail
+  (`merge wait`, `resolve pending`, `error`, `rejected`, `stopped`, `not queued`)
+  are not published. A released row goes into a private, process-local memory —
+  at most one row per change ID this incarnation published, never projected,
+  persisted, or read by admission — and is published again as soon as the
+  reducer authors `resolving`, `merged`, or `pushed` for it (an explicit
+  resolve after an `on_merged` failure returns it as `resolving` at
+  `ResolveStarted`; resumed publication after a push failure returns it as
+  `pushed`), with the facts this owner kept for it.
+  While released it is answered exactly as an ID this owner never observed.
+  - A released ID listed again is a new arrival with fresh facts. A published
+    row listed again keeps its facts and may show, for example, `merged` 1/3.
+  - The guarantee is instance-scoped: nothing is persisted or rehydrated, and a
+    new `instance_id` starts with no retained rows and no memory.
+  - `GET /capabilities` publishes `completed_change_retention` `{available:
+    true, retained_statuses: [merged, pushed], settling_statuses: [resolving],
+    scope: instance}`; an older owner omits it, which decodes as `available:
+    false`.
+  - Hiding or restoring rows is client-local and needs no command. Key it by
+    `instance_id`, and clear or rekey it when `instance_id` changes. TUI
+    dismissal never removes an API row.
+  - Owner-side effects for a kept `merged`/`pushed` row: `GET /changes/{id}`
+    answers 200, `GET /execution-status` lists it, the refresh preview answers
+    200 `eligible: false` / `refusal: terminal_target`, the change text route
+    still answers 404 `not_found`, every action is blocked, and totals count it
+    as `completed`. Its `worktree` is `null` when the latest observation reports
+    no worktree path for it, and `parallel.blocked_reason` is `not_committed`
+    when the latest event observation's committed set lacks it.
+  - Derived, not validated client behavior: `cflx client mark`/`unmark` settle
+    `unchanged` instead of `change_not_found`; `force-stop-change` and
+    `refresh-proposal` return `target_ineligible`; `wait` on a kept row whose
+    certification fails returns `change_requires_action`; and a `wait` that sees
+    a settled row still published as `merge wait` or `error` returns
+    `change_requires_action` (exit 27) instead of continuing to observe.
+  - For an explicit resolve started while the resolve lane is free, `run_clock`
+    matches the TUI during an absent `resolving` refresh, at settlement, and
+    afterwards. A private `resolve pending` row waiting behind a busy lane can
+    make the API clock freeze earlier than the TUI's, as before.
+  - `changes_refreshed` payloads count the observation, not the published rows.
 - Log content is available through `GET /logs`, `/events`, and `/ws` only. No
   response, schema, event, or command result discloses a log file path, a
   repository root, a workspace path used as a log locator, or a `file://` URL,

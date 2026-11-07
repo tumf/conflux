@@ -2144,3 +2144,579 @@ async fn rerun_leading_env_error_detail_projection_carries_no_binding_value() {
     let serialized = serde_json::to_string(&snapshot).unwrap();
     assert!(!serialized.contains(SENTINEL), "{serialized}");
 }
+
+// ============================================================================
+// Completed-change retention through the production pipeline
+// ============================================================================
+
+mod retain_api_completed {
+    //! `EventDispatcher` → `WebEventSink` → `WebState` → projection →
+    //! `crate::web::remote_control_router`, with a real reducer.
+
+    use super::*;
+    use crate::events::{EventDispatcher, OperatorCommandEffect};
+    use crate::orchestration::state::ReducerCommand;
+    use crate::web::state::{completed_change_retention_capability, WebEventSink};
+    use crate::web::WebConfig;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    pub(super) struct Owner {
+        pub web: Arc<WebState>,
+        pub reducer: Arc<tokio::sync::RwLock<OrchestratorState>>,
+        pub marks: Arc<ExecutionMarkStore>,
+        pub dispatcher: EventDispatcher,
+        pub router: axum::Router,
+    }
+
+    pub(super) fn listing(ids: &[&str]) -> Vec<Change> {
+        ids.iter().map(|id| change(id)).collect()
+    }
+
+    pub(super) fn refresh_event(ids: &[&str]) -> ExecutionEvent {
+        changes_refreshed(listing(ids), ids, &[], HashMap::new())
+    }
+
+    pub(super) async fn retention_owner(ids: &[&str]) -> Owner {
+        let (web, reducer, marks) = wired_web_state(ids).await;
+        let web = Arc::new(web);
+        let dispatcher = EventDispatcher::new(
+            reducer.clone(),
+            vec![Arc::new(WebEventSink::new(web.clone()))],
+        );
+        let router = crate::web::remote_control_router(
+            &WebConfig::enabled(0, "127.0.0.1".into()),
+            web.clone(),
+        )
+        .expect("the production router builds");
+        let owner = Owner {
+            web,
+            reducer,
+            marks,
+            dispatcher,
+            router,
+        };
+        owner.refresh(ids).await;
+        owner
+    }
+
+    impl Owner {
+        pub async fn dispatch(&self, event: ExecutionEvent) {
+            self.dispatcher.dispatch(event).await;
+        }
+
+        pub async fn refresh(&self, ids: &[&str]) {
+            self.dispatch(refresh_event(ids)).await;
+        }
+
+        pub async fn update(&self, ids: &[&str]) {
+            self.web.update(&listing(ids)).await;
+        }
+
+        pub async fn archive(&self, id: &str) {
+            let id = id.to_string();
+            for event in [
+                ExecutionEvent::ApplyStarted {
+                    change_id: id.clone(),
+                    command: "apply".into(),
+                },
+                ExecutionEvent::ApplyCompleted {
+                    change_id: id.clone(),
+                    revision: "r".into(),
+                },
+                ExecutionEvent::ArchiveStarted {
+                    change_id: id.clone(),
+                    command: "archive".into(),
+                },
+                ExecutionEvent::ChangeArchived(id.clone()),
+            ] {
+                self.dispatch(event).await;
+            }
+        }
+
+        pub async fn merge(&self, id: &str) {
+            self.archive(id).await;
+            self.resolve_events(id).await;
+        }
+
+        pub async fn resolve_events(&self, id: &str) {
+            self.dispatch(ExecutionEvent::ResolveStarted {
+                change_id: id.into(),
+                command: "merge".into(),
+            })
+            .await;
+            self.dispatch(ExecutionEvent::MergeCompleted {
+                change_id: id.into(),
+                revision: "r".into(),
+            })
+            .await;
+        }
+
+        pub async fn hookfail(&self, id: &str) {
+            self.archive(id).await;
+            self.dispatch(ExecutionEvent::ResolveStarted {
+                change_id: id.into(),
+                command: "merge".into(),
+            })
+            .await;
+            self.dispatch(ExecutionEvent::HookFailed {
+                change_id: id.into(),
+                hook_type: "on_merged".into(),
+                error: "hook exited 1".into(),
+            })
+            .await;
+        }
+
+        pub async fn resolve(&self, id: &str) {
+            self.reducer
+                .write()
+                .await
+                .apply_command(ReducerCommand::ResolveMerge(id.to_string()));
+            self.resolve_events(id).await;
+        }
+
+        pub async fn push_event(&self, id: &str, stage: &str) {
+            let (change_id, remote, branch) = (id.to_string(), "origin".into(), "main".into());
+            let event = match stage {
+                "started" => ExecutionEvent::PushStarted {
+                    change_id,
+                    remote,
+                    branch,
+                },
+                "completed" => ExecutionEvent::PushCompleted {
+                    change_id,
+                    remote,
+                    branch,
+                },
+                _ => ExecutionEvent::PushFailed {
+                    change_id,
+                    remote,
+                    branch,
+                    error: "rejected".into(),
+                },
+            };
+            self.dispatch(event).await;
+        }
+
+        pub async fn json(&self, uri: &str) -> (StatusCode, Value) {
+            status_and_json(send(&self.router, get(uri, None)).await).await
+        }
+
+        pub async fn published(&self) -> Vec<String> {
+            let stored: Vec<String> = self
+                .web
+                .get_state()
+                .await
+                .changes
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            let (snapshot, _, _) = self.web.remote_control().projection().snapshot();
+            let projected: Vec<String> = snapshot.changes.into_iter().map(|row| row.id).collect();
+            assert_eq!(stored, projected, "stored and projected rows diverge");
+            projected
+        }
+
+        pub fn revision(&self) -> u64 {
+            self.web.remote_control().projection().revision()
+        }
+
+        pub fn sequence(&self) -> u64 {
+            self.web.remote_control().projection().snapshot().2
+        }
+
+        pub fn events_after(
+            &self,
+            after: u64,
+        ) -> Vec<crate::web::remote_control_api::dto::EventEnvelope> {
+            match self.web.remote_control().projection().events_after(after) {
+                EventsSince::Replay(events) => events,
+                EventsSince::Gap => panic!("cursor {after} must still be retained"),
+            }
+        }
+
+        /// The SSE replay from `after`, read frame by frame up to the number of
+        /// events the ring holds after it.
+        pub async fn sse_after(
+            &self,
+            after: u64,
+        ) -> Vec<crate::web::remote_control_api::dto::EventEnvelope> {
+            let expected = self.events_after(after).len();
+            let response = send(
+                &self.router,
+                get(&format!("/api/v2/events?after_sequence={after}"), None),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let mut text = String::new();
+            while text.matches("data: ").count() < expected {
+                match tokio::time::timeout(Duration::from_secs(5), body.next()).await {
+                    Ok(Some(Ok(chunk))) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                    _ => break,
+                }
+            }
+            text.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|json| serde_json::from_str(json).expect("an SSE frame is an envelope"))
+                .collect()
+        }
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn sequences(events: &[crate::web::remote_control_api::dto::EventEnvelope]) -> Vec<u64> {
+        events.iter().map(|event| event.event_sequence).collect()
+    }
+
+    #[tokio::test]
+    async fn retain_api_completed_list_get_state_and_stream_agree_across_refreshes() {
+        let owner = retention_owner(&["alpha", "beta", "gamma"]).await;
+        owner.merge("alpha").await;
+        let c0 = owner.sequence();
+        owner.refresh(&["beta", "gamma"]).await;
+        let (_, state) = owner.json("/api/v2/state").await;
+        let r = state["state_revision"].as_u64().unwrap();
+        let s = state["event_sequence"].as_u64().unwrap();
+        let instance = state["instance_id"].clone();
+        let alpha = projected_change(&state["snapshot"], "alpha");
+        assert_eq!(alpha["display_status"], "merged");
+
+        for _ in 0..3 {
+            owner.refresh(&["beta", "gamma"]).await;
+            owner.update(&["beta", "gamma"]).await;
+            let (_, list) = owner.json("/api/v2/changes").await;
+            let (status, get_alpha) = owner.json("/api/v2/changes/alpha").await;
+            let (_, state) = owner.json("/api/v2/state").await;
+            assert_eq!(status, StatusCode::OK);
+            for body in [&list, &get_alpha, &state] {
+                assert_eq!(body["instance_id"], instance);
+                assert_eq!(body["state_revision"].as_u64(), Some(r));
+            }
+            let listed = list["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "alpha")
+                .cloned()
+                .expect("alpha is listed");
+            assert_eq!(listed, alpha);
+            assert_eq!(get_alpha["change"], alpha);
+            assert_eq!(projected_change(&state["snapshot"], "alpha"), alpha);
+        }
+
+        let replay = owner.events_after(s);
+        assert!(!replay.is_empty());
+        for event in &replay {
+            assert_eq!(event.state_revision, r, "{event:?}");
+            if event.event_type == "changes_refreshed" {
+                assert_eq!(event.payload["changes"], 2);
+            }
+        }
+        let from_c0 = owner.events_after(c0);
+        let sse = owner.sse_after(c0).await;
+        assert_eq!(sequences(&sse), sequences(&from_c0));
+        assert_eq!(sse.last().unwrap().state_revision, r);
+
+        // Reconnect: state, then its cursor.
+        let (_, state) = owner.json("/api/v2/state").await;
+        let s2 = state["event_sequence"].as_u64().unwrap();
+        assert!(owner.events_after(s2).is_empty());
+        owner.refresh(&["beta", "gamma"]).await;
+        let after = owner.events_after(s2);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].event_type, "changes_refreshed");
+        assert_eq!(after[0].state_revision, r);
+        assert!(owner.published().await.contains(&"alpha".to_string()));
+
+        // Republication after a publication failure.
+        owner.archive("beta").await;
+        owner.push_event("beta", "started").await;
+        owner.push_event("beta", "failed").await;
+        owner.refresh(&["gamma"]).await;
+        let (status, _) = owner.json("/api/v2/changes/beta").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let c1 = owner.sequence();
+        let mut produced = Vec::new();
+        for stage in ["started", "completed"] {
+            owner.push_event("beta", stage).await;
+            let reducer_keeps = matches!(
+                owner.reducer.read().await.display_status("beta"),
+                "resolving" | "pushed"
+            );
+            let published = owner.published().await.contains(&"beta".to_string());
+            assert_eq!(published, reducer_keeps, "after push {stage}");
+            produced.push((owner.revision(), published));
+            if published {
+                let (_, state) = owner.json("/api/v2/state").await;
+                let (_, list) = owner.json("/api/v2/changes").await;
+                let (status, get_beta) = owner.json("/api/v2/changes/beta").await;
+                assert_eq!(status, StatusCode::OK);
+                let row = projected_change(&state["snapshot"], "beta");
+                assert_eq!(get_beta["change"], row);
+                assert!(list["changes"].as_array().unwrap().contains(&row));
+                for body in [&state, &list, &get_beta] {
+                    assert_eq!(body["state_revision"].as_u64(), Some(owner.revision()));
+                }
+            }
+        }
+        assert_eq!(
+            produced.iter().filter(|(_, published)| *published).count(),
+            1
+        );
+        let (_, get_beta) = owner.json("/api/v2/changes/beta").await;
+        assert_eq!(get_beta["change"]["display_status"], "pushed");
+
+        let replay = owner.events_after(c1);
+        let sse = owner.sse_after(c1).await;
+        assert_eq!(sequences(&sse), sequences(&replay));
+        let push_events: Vec<_> = replay
+            .iter()
+            .filter(|event| event.event_type.starts_with("push_"))
+            .collect();
+        assert_eq!(
+            push_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["push_started", "push_completed"]
+        );
+        for (event, (revision, _)) in push_events.iter().zip(&produced) {
+            assert_eq!(event.state_revision, *revision, "{event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retain_api_completed_reads_and_private_memory_have_no_side_effects() {
+        let owner = retention_owner(&["alpha", "delta", "gamma"]).await;
+        owner.merge("alpha").await;
+        owner.hookfail("delta").await;
+        owner.refresh(&["gamma"]).await;
+        assert_eq!(owner.published().await, ids(&["gamma", "alpha"]));
+
+        let projection = owner.web.remote_control().projection();
+        let revision = owner.revision();
+        let sequence = owner.sequence();
+        let registry = projection.registry_sizes();
+        let statuses = owner.reducer.read().await.all_display_statuses();
+        let marks = owner.marks.marked_ids();
+        let uris = [
+            "/api/v2/state",
+            "/api/v2/changes",
+            "/api/v2/changes/alpha",
+            "/api/v2/changes/delta",
+            "/api/v2/capabilities",
+            "/api/v2/execution-status",
+            "/api/v2/proposals/alpha/refresh-preview?source_ref=main",
+            "/api/v2/proposals/delta/refresh-preview?source_ref=main",
+            "/api/v2/changes/alpha/text?path=proposal.md",
+            "/api/v2/changes/delta/text?path=proposal.md",
+        ];
+        let mut first = Vec::new();
+        for round in 0..2 {
+            for uri in uris {
+                let response = owner.json(uri).await;
+                if round == 0 {
+                    first.push(response);
+                }
+            }
+            let _ = owner.sse_after(0).await;
+        }
+        assert_eq!(owner.revision(), revision);
+        assert_eq!(owner.sequence(), sequence);
+        assert_eq!(projection.registry_sizes(), registry);
+        assert_eq!(owner.reducer.read().await.all_display_statuses(), statuses);
+        assert_eq!(owner.marks.marked_ids(), marks);
+
+        let read =
+            |uri: &str| first[uris.iter().position(|candidate| *candidate == uri).unwrap()].clone();
+        let (status, preview) = read("/api/v2/proposals/alpha/refresh-preview?source_ref=main");
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["eligible"], false);
+        assert_eq!(preview["refusal"], "terminal_target");
+        let (status, text) = read("/api/v2/changes/alpha/text?path=proposal.md");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+        assert_eq!(text["error_code"], "not_found");
+
+        // A remembered change answers exactly as one this owner never observed.
+        for (private, never) in [
+            ("/api/v2/changes/delta", "/api/v2/changes/zeta"),
+            (
+                "/api/v2/proposals/delta/refresh-preview?source_ref=main",
+                "/api/v2/proposals/zeta/refresh-preview?source_ref=main",
+            ),
+            (
+                "/api/v2/changes/delta/text?path=proposal.md",
+                "/api/v2/changes/zeta/text?path=proposal.md",
+            ),
+        ] {
+            let (private_status, private_body) = read(private);
+            let (never_status, never_body) = owner.json(never).await;
+            assert_eq!(private_status, never_status, "{private}");
+            assert_eq!(
+                private_body["error_code"], never_body["error_code"],
+                "{private}"
+            );
+        }
+        let (_, list) = read("/api/v2/changes");
+        assert!(!list["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "delta"));
+        let (_, state) = read("/api/v2/state");
+        assert_eq!(state["snapshot"]["totals"]["total"], 2);
+        let (_, execution) = read("/api/v2/execution-status");
+        assert!(
+            !execution.to_string().contains("\"delta\""),
+            "execution status names no private change: {execution}"
+        );
+        assert!(
+            execution.to_string().contains("\"alpha\""),
+            "execution status lists the kept change: {execution}"
+        );
+        let (_, capabilities) = read("/api/v2/capabilities");
+        assert_eq!(
+            capabilities["completed_change_retention"],
+            serde_json::to_value(completed_change_retention_capability()).unwrap()
+        );
+
+        // An observation reporting a worktree for the private change publishes
+        // nothing for it and relates no published row to that worktree.
+        let paths = HashMap::from([("delta".to_string(), PathBuf::from("/repo/.wt/delta"))]);
+        owner
+            .dispatch(changes_refreshed(
+                listing(&["gamma"]),
+                &["gamma"],
+                &[],
+                paths,
+            ))
+            .await;
+        let (snapshot, _, _) = projection.snapshot();
+        assert_eq!(owner.published().await, ids(&["gamma", "alpha"]));
+        for row in &snapshot.changes {
+            assert_eq!(row.worktree, None, "{}", row.id);
+        }
+
+        owner.resolve("delta").await;
+        assert_eq!(owner.published().await, ids(&["gamma", "alpha", "delta"]));
+        let (_, delta) = owner.json("/api/v2/changes/delta").await;
+        assert_eq!(delta["change"]["display_status"], "merged");
+    }
+
+    #[tokio::test]
+    async fn retain_api_completed_totals_actions_and_clocks_stay_truthful() {
+        let owner = retention_owner(&["alpha", "beta", "gamma"]).await;
+        let base = std::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let pin = |second: u64| {
+            owner.web.pin_observation_clock_for_tests(
+                base + Duration::from_secs(second),
+                wall + chrono::Duration::seconds(second as i64),
+            )
+        };
+        pin(1);
+        owner
+            .dispatch(ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::RunDispatched {
+                    change_ids: vec!["alpha".to_string()],
+                    explicit_retry: false,
+                    scheduler_started: true,
+                },
+            })
+            .await;
+        pin(2);
+        owner.archive("alpha").await;
+        pin(3);
+        owner.resolve_events("alpha").await;
+        pin(4);
+        owner.dispatch(ExecutionEvent::AllCompleted).await;
+
+        let (snapshot, _, _) = owner.web.remote_control().projection().snapshot();
+        let run_clock = snapshot.run_clock.clone();
+        assert!(run_clock.as_ref().unwrap().started_at.is_some());
+        assert!(run_clock.as_ref().unwrap().ended_at.is_some());
+        let alpha = |snapshot: &crate::web::remote_control_api::dto::InstanceSnapshot| {
+            snapshot
+                .changes
+                .iter()
+                .find(|row| row.id == "alpha")
+                .cloned()
+                .expect("alpha is published")
+        };
+        let net_active = alpha(&snapshot).net_active;
+        assert!(net_active.as_ref().unwrap().accumulated_ms > 0);
+
+        pin(5);
+        owner.refresh(&["beta", "gamma"]).await;
+        let revision = owner.revision();
+        for _ in 0..2 {
+            owner.refresh(&["beta", "gamma"]).await;
+            owner.update(&["beta", "gamma"]).await;
+        }
+        let (snapshot, _, _) = owner.web.remote_control().projection().snapshot();
+        assert_eq!(owner.revision(), revision);
+        assert_eq!(
+            (
+                snapshot.totals.total,
+                snapshot.totals.completed,
+                snapshot.totals.in_progress,
+                snapshot.totals.pending
+            ),
+            (3, 1, 0, 0)
+        );
+        let row = alpha(&snapshot);
+        assert_eq!(
+            row.actions,
+            change_actions_for_test(&snapshot.app_mode, "merged", None)
+        );
+        let actions = serde_json::to_value(row.actions).unwrap();
+        for (name, action) in actions.as_object().unwrap() {
+            assert_eq!(action["allowed"], false, "{name} must be blocked");
+        }
+        assert_eq!(snapshot.run_clock, run_clock);
+        assert_eq!(row.net_active, net_active);
+
+        owner
+            .reducer
+            .write()
+            .await
+            .apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+        owner.refresh(&["beta", "gamma"]).await;
+        let (snapshot, _, _) = owner.web.remote_control().projection().snapshot();
+        assert_eq!(snapshot.totals.pending, 1);
+        assert_eq!(snapshot.totals.completed, 1);
+        assert_eq!(snapshot.totals.total, 3);
+        assert_eq!(alpha(&snapshot).display_status, "merged");
+    }
+
+    #[tokio::test]
+    async fn retain_api_completed_new_owner_starts_without_previous_rows() {
+        let a = retention_owner(&["alpha", "beta"]).await;
+        a.merge("alpha").await;
+        a.refresh(&["beta"]).await;
+        assert_eq!(a.published().await, ids(&["beta", "alpha"]));
+
+        let b = retention_owner(&["beta"]).await;
+        assert_eq!(b.published().await, ids(&["beta"]));
+        let (_, state_a) = a.json("/api/v2/state").await;
+        let (_, state_b) = b.json("/api/v2/state").await;
+        assert_ne!(state_a["instance_id"], state_b["instance_id"]);
+        let (_, capabilities) = b.json("/api/v2/capabilities").await;
+        assert_eq!(
+            capabilities["completed_change_retention"]["scope"],
+            "instance"
+        );
+
+        // A completion for a change B never published publishes nothing in B.
+        b.merge("alpha").await;
+        assert_eq!(b.reducer.read().await.display_status("alpha"), "merged");
+        b.refresh(&["beta"]).await;
+        assert_eq!(b.published().await, ids(&["beta"]));
+        let (status, _) = b.json("/api/v2/changes/alpha").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(a.published().await, ids(&["beta", "alpha"]));
+    }
+}
