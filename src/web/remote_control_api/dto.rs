@@ -1066,6 +1066,39 @@ pub struct CapabilitiesResponse {
     /// absent field decodes as `available: false` — exactly what such an owner is.
     #[serde(default)]
     pub worktree_sessions: WorktreeSessionCapability,
+    /// Completed-change retention guarantee of this owner.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field decodes as `available: false` — never as available.
+    #[serde(default)]
+    pub completed_change_retention: CompletedChangeRetentionCapability,
+}
+
+/// Whether changes this owner published stay in `changes` once the reducer
+/// reports them complete, even after the workspace stops listing them, and for
+/// how long.
+///
+/// `Default` is the *unavailable* answer, which is what an older owner's
+/// omission decodes as: such an owner may drop a merged row as soon as its
+/// proposal leaves `openspec/changes/`. Hiding or restoring rows is client-local
+/// and needs no command; key that state by `instance_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct CompletedChangeRetentionCapability {
+    /// True when this owner publishes, for the rest of its incarnation, every
+    /// change it already published while the reducer reports it `merged` or
+    /// `pushed` — including one it stopped publishing while it waited or failed.
+    pub available: bool,
+    /// Reducer-authored statuses that keep such a change published for the rest
+    /// of the incarnation whether or not the workspace lists it: exactly `merged`
+    /// and `pushed`.
+    pub retained_statuses: Vec<String>,
+    /// Reducer-authored statuses that keep such a change published while the
+    /// workspace does not list it only for as long as the status lasts: exactly
+    /// `resolving`.
+    pub settling_statuses: Vec<String>,
+    /// Lifetime of retained rows: always `instance` — exactly as long as this
+    /// `instance_id`; never persisted and never rehydrated by a later instance.
+    pub scope: String,
 }
 
 /// Whether configured-command worktree sessions can be launched here, and the
@@ -1725,7 +1758,9 @@ pub struct ChangeResource {
     pub net_active: Option<NetActiveTiming>,
 }
 
-/// Aggregate counts over the projected changes.
+/// Aggregate counts over the projected changes, rows kept by
+/// `completed_change_retention` included; changes the owner no longer publishes
+/// are not counted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotTotals {
     /// Number of projected changes.
@@ -1770,7 +1805,12 @@ pub struct InstanceSnapshot {
     pub process_error: Option<String>,
     /// Process-wide parallel execution runtime facts.
     pub parallel: ParallelRuntimeState,
-    /// Projected changes.
+    /// Projected changes: every change the current workspace observation lists,
+    /// followed by every change this owner incarnation already published that
+    /// the observation no longer lists while the reducer reports it `merged` or
+    /// `pushed` (published for the rest of the incarnation, also after an
+    /// unpublished wait or failure) or `resolving` (published while it lasts).
+    /// See `CapabilitiesResponse.completed_change_retention`.
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
     pub totals: SnapshotTotals,
@@ -1824,7 +1864,12 @@ pub struct ChangesResponse {
     pub instance_id: String,
     /// Revision the list was read at.
     pub state_revision: u64,
-    /// Projected changes.
+    /// Projected changes: every change the current workspace observation lists,
+    /// followed by every change this owner incarnation already published that
+    /// the observation no longer lists while the reducer reports it `merged` or
+    /// `pushed` (published for the rest of the incarnation, also after an
+    /// unpublished wait or failure) or `resolving` (published while it lasts).
+    /// See `CapabilitiesResponse.completed_change_retention`.
     pub changes: Vec<ChangeResource>,
 }
 

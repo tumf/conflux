@@ -452,6 +452,36 @@ mod legacy_owner_shape {
     }
 
     #[test]
+    fn retain_api_completed_older_owner_capabilities_decode_as_unavailable() {
+        use crate::web::remote_control_api::dto::CompletedChangeRetentionCapability;
+
+        // An owner that predates completed-change retention publishes no
+        // `completed_change_retention` block; this build reads that as
+        // "unavailable", never as available.
+        let decoded: CapabilitiesResponse = serde_json::from_value(legacy_capabilities())
+            .expect("an older owner's capabilities must still decode on this build");
+        assert_eq!(
+            decoded.completed_change_retention,
+            CompletedChangeRetentionCapability::default()
+        );
+        assert!(!decoded.completed_change_retention.available);
+
+        // The additive default does not soften a pre-existing required member.
+        let mut without_limits = legacy_capabilities();
+        without_limits
+            .as_object_mut()
+            .unwrap()
+            .remove("limits")
+            .expect("the legacy shape publishes `limits`");
+        let error = serde_json::from_value::<CapabilitiesResponse>(without_limits)
+            .expect_err("a payload missing a required member is malformed");
+        assert!(
+            error.to_string().contains("limits"),
+            "the rejection must name `limits`: {error}"
+        );
+    }
+
+    #[test]
     fn remote_merge_abort_old_owner_capabilities_decode_as_unavailable() {
         // An owner that predates the abort-on-conflict merge: five worktree
         // operations, no `merge_abort` block, no new command.
@@ -894,4 +924,43 @@ fn remote_progress_timing_old_owner_payload_decodes_as_unpublished() {
     let error = serde_json::from_value::<StateResponse>(malformed)
         .expect_err("a payload missing a pre-existing required member is malformed");
     assert!(error.to_string().contains("force_stop_change"), "{error}");
+}
+
+#[tokio::test]
+async fn retain_api_completed_current_capabilities_publish_the_block() {
+    use super::{get, harness, send, status_and_json};
+    use crate::web::remote_control_api::dto::CapabilitiesResponse;
+    use crate::web::state::completed_change_retention_capability;
+
+    let h = harness(None, &[]);
+    let (status, capabilities) =
+        status_and_json(send(&h.router, get("/api/v2/capabilities", None)).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        capabilities["completed_change_retention"],
+        serde_json::to_value(completed_change_retention_capability()).unwrap()
+    );
+    let decoded: CapabilitiesResponse =
+        serde_json::from_value(capabilities).expect("this build's capabilities decode");
+    assert_eq!(
+        decoded.completed_change_retention,
+        completed_change_retention_capability()
+    );
+    let round_trip: CapabilitiesResponse =
+        serde_json::from_value(serde_json::to_value(&decoded).unwrap()).unwrap();
+    assert_eq!(
+        round_trip.completed_change_retention,
+        completed_change_retention_capability()
+    );
+
+    // Retention adds no command: hiding and restoring rows is client-local.
+    assert_eq!(SUPPORTED_COMMANDS.len(), 23);
+    for command in SUPPORTED_COMMANDS {
+        for word in ["dismiss", "hide", "restore", "retain"] {
+            assert!(
+                !command.contains(word),
+                "{command} must not be a {word} command"
+            );
+        }
+    }
 }

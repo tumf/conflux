@@ -3927,3 +3927,267 @@ async fn stale_refresh_e2e_large_conflict_diagnostics_stay_bounded() {
         "the summary still discloses how much output there was: {summary}"
     );
 }
+
+/// Completed-change retention against a real repository whose change is
+/// archived on a worktree branch and merged into the base with `--no-ff`.
+///
+/// Evidence boundary: the production listing reads behind `ChangesRefreshed`,
+/// `refresh_from_disk_at`, and the production dispatcher → `WebEventSink` →
+/// `WebState` → projection → router. The `ChangesRefreshed` payload is rebuilt
+/// from the same two listing reads the TUI refresh task performs, rather than by
+/// running that task itself.
+#[tokio::test]
+async fn retain_api_completed_git_merge_survives_production_refreshes() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use conflux::events::{EventDispatcher, ExecutionEvent};
+    use conflux::orchestration::state::OrchestratorState;
+    use conflux::web::state::WebEventSink;
+    use conflux::web::{WebConfig, WebState};
+    use stale_refresh_support::*;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let fx =
+        refresh_fixture().expect("the retention Git fixture must be buildable: git init failed");
+    let temp_root = std::env::temp_dir();
+    assert!(
+        fx.repo.starts_with(&temp_root),
+        "the fixture lives under the gate's TMPDIR {}: {}",
+        temp_root.display(),
+        fx.repo.display()
+    );
+    fx.declare_change("alpha");
+    write_and_commit(
+        &fx.repo,
+        "openspec/changes/alpha/tasks.md",
+        "## Implementation Tasks\n\n- [x] one\n- [x] two\n",
+        "Alpha tasks",
+    );
+    fx.declare_change("beta");
+    write_and_commit(
+        &fx.repo,
+        "openspec/changes/beta/tasks.md",
+        "## Implementation Tasks\n\n- [ ] one\n",
+        "Beta tasks",
+    );
+
+    struct Owner {
+        web: Arc<WebState>,
+        dispatcher: EventDispatcher,
+        router: axum::Router,
+    }
+    let owner = |ids: &[&str]| {
+        let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            ids.iter().map(|id| id.to_string()).collect(),
+            0,
+        )));
+        let web = Arc::new(WebState::new(&[]));
+        let dispatcher = EventDispatcher::new(
+            reducer.clone(),
+            vec![Arc::new(WebEventSink::new(web.clone()))],
+        );
+        let router = conflux::web::remote_control_router(
+            &WebConfig::enabled(0, "127.0.0.1".into()),
+            web.clone(),
+        )
+        .expect("the production router builds");
+        (
+            reducer,
+            Owner {
+                web,
+                dispatcher,
+                router,
+            },
+        )
+    };
+    let (reducer, a) = owner(&["alpha", "beta"]);
+    a.web.set_shared_state(reducer.clone()).await;
+
+    async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    async fn production_refresh(owner: &Owner, repo: &std::path::Path) {
+        let changes = conflux::openspec::list_changes_native_from(repo).unwrap();
+        let rejected_changes = conflux::openspec::list_rejected_changes_native_from(repo).unwrap();
+        owner
+            .dispatcher
+            .dispatch(ExecutionEvent::ChangesRefreshed {
+                committed_change_ids: changes.iter().map(|change| change.id.clone()).collect(),
+                changes,
+                rejected_changes,
+                uncommitted_file_change_ids: Default::default(),
+                worktree_change_ids: Default::default(),
+                worktree_paths: Default::default(),
+                worktree_not_ahead_ids: Default::default(),
+                merge_wait_ids: Default::default(),
+            })
+            .await;
+    }
+    fn projected(
+        owner: &Owner,
+        id: &str,
+    ) -> Option<conflux::web::remote_control_api::dto::ChangeResource> {
+        owner
+            .web
+            .remote_control()
+            .projection()
+            .snapshot()
+            .0
+            .changes
+            .into_iter()
+            .find(|row| row.id == id)
+    }
+    let repository_state = |repo: &std::path::Path| {
+        (
+            tree_snapshot(repo),
+            git(repo, &["rev-parse", "HEAD"]),
+            git(repo, &["status", "--porcelain=v1", "-uall"]),
+            git(repo, &["for-each-ref"]),
+        )
+    };
+
+    a.web.refresh_from_disk_at(&fx.repo).await.unwrap();
+    let alpha = projected(&a, "alpha").expect("alpha is published");
+    assert_eq!((alpha.completed_tasks, alpha.total_tasks), (2, 2));
+    let beta = projected(&a, "beta").expect("beta is published");
+    assert_eq!((beta.completed_tasks, beta.total_tasks), (0, 1));
+
+    let alpha_id = || "alpha".to_string();
+    for event in [
+        ExecutionEvent::ProcessingStarted(alpha_id()),
+        ExecutionEvent::ApplyStarted {
+            change_id: alpha_id(),
+            command: "apply".into(),
+        },
+        ExecutionEvent::ApplyCompleted {
+            change_id: alpha_id(),
+            revision: "r".into(),
+        },
+        ExecutionEvent::ArchiveStarted {
+            change_id: alpha_id(),
+            command: "archive".into(),
+        },
+        ExecutionEvent::ChangeArchived(alpha_id()),
+        ExecutionEvent::ResolveStarted {
+            change_id: alpha_id(),
+            command: "merge".into(),
+        },
+    ] {
+        a.dispatcher.dispatch(event).await;
+    }
+
+    // Archive on the change branch, then integrate it into the base.
+    let worktree = fx.add_worktree("alpha");
+    std::fs::create_dir_all(worktree.join("openspec/changes/archive")).unwrap();
+    git(
+        &worktree,
+        &[
+            "mv",
+            "openspec/changes/alpha",
+            "openspec/changes/archive/2026-11-06-alpha",
+        ],
+    );
+    git(&worktree, &["commit", "-m", "Archive alpha"]);
+    git(
+        &fx.repo,
+        &["merge", "--no-ff", "alpha", "-m", "Merge alpha"],
+    );
+    assert!(!fx.repo.join("openspec/changes/alpha").exists());
+    assert!(fx
+        .repo
+        .join("openspec/changes/archive/2026-11-06-alpha")
+        .exists());
+
+    a.web.refresh_from_disk_at(&fx.repo).await.unwrap();
+    production_refresh(&a, &fx.repo).await;
+    let alpha = projected(&a, "alpha").expect("a resolving row survives absence");
+    assert_eq!(alpha.display_status, "resolving");
+    assert_eq!((alpha.completed_tasks, alpha.total_tasks), (2, 2));
+    assert_eq!(alpha.archive_complete, Some(true));
+
+    a.dispatcher
+        .dispatch(ExecutionEvent::MergeCompleted {
+            change_id: alpha_id(),
+            revision: git(&fx.repo, &["rev-parse", "HEAD"]).trim().to_string(),
+        })
+        .await;
+    let mut first_round = None;
+    let mut before_last = None;
+    for round in 0..3 {
+        if round == 2 {
+            before_last = Some(repository_state(&fx.repo));
+        }
+        a.web.refresh_from_disk_at(&fx.repo).await.unwrap();
+        production_refresh(&a, &fx.repo).await;
+        let alpha = projected(&a, "alpha").expect("a merged row survives absence");
+        assert_eq!(alpha.display_status, "merged");
+        assert_eq!((alpha.completed_tasks, alpha.total_tasks), (2, 2));
+        assert_eq!(alpha.archive_complete, Some(true));
+        let revision = a.web.remote_control().projection().revision();
+        assert_eq!(
+            *first_round.get_or_insert(revision),
+            revision,
+            "round {round}"
+        );
+    }
+    assert_eq!(Some(repository_state(&fx.repo)), before_last);
+
+    let before_reads = repository_state(&fx.repo);
+    let revision = a.web.remote_control().projection().revision();
+    let (status, list) = get_json(&a.router, "/api/v2/changes").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, get_alpha) = get_json(&a.router, "/api/v2/changes/alpha").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, state) = get_json(&a.router, "/api/v2/state").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = list["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "alpha")
+        .cloned()
+        .expect("alpha is listed");
+    let in_state = state["snapshot"]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "alpha")
+        .cloned()
+        .expect("alpha is in the state");
+    assert_eq!(listed, get_alpha["change"]);
+    assert_eq!(listed, in_state);
+    assert_eq!(listed["display_status"], "merged");
+    for body in [&list, &get_alpha, &state] {
+        assert_eq!(body["state_revision"].as_u64(), Some(revision));
+        assert_eq!(body["instance_id"], state["instance_id"]);
+    }
+    assert_eq!(repository_state(&fx.repo), before_reads);
+
+    // A new owner over the merged repository publishes no row for alpha.
+    let (fresh_reducer, b) = owner(&["beta"]);
+    b.web.set_shared_state(fresh_reducer).await;
+    b.web.refresh_from_disk_at(&fx.repo).await.unwrap();
+    production_refresh(&b, &fx.repo).await;
+    assert!(projected(&b, "alpha").is_none());
+    assert!(projected(&b, "beta").is_some());
+    let (_, fresh_state) = get_json(&b.router, "/api/v2/state").await;
+    assert_ne!(fresh_state["instance_id"], state["instance_id"]);
+    let (status, _) = get_json(&b.router, "/api/v2/changes/alpha").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

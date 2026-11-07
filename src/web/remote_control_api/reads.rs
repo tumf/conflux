@@ -130,6 +130,9 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             &state.worktree_sessions,
             state.executor.is_command_capable().await,
         ),
+        // A property of how this build projects its snapshot, so it is
+        // published whether or not any runtime is bound.
+        completed_change_retention: crate::web::state::completed_change_retention_capability(),
         proposal_refresh: dto::ProposalRefreshCapability {
             // A read over the projection and the repository, so it is served
             // whether or not a command executor is bound.
