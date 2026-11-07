@@ -1214,3 +1214,187 @@ async fn settled_apply_limit_after_task_exit_starts_a_later_run_for_both_adapter
         wired.scheduler.calls()
     );
 }
+
+// ============================================================================
+// Completed-change retention never reaches admission
+// ============================================================================
+
+/// Where alpha stands when a command arrives: completed or waiting, and either
+/// still listed by the workspace or kept/remembered by retention alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    ListedMerged,
+    KeptMerged,
+    ListedMergeWait,
+    PrivateMergeWait,
+}
+
+async fn alpha_fixture(placement: Placement) -> Wired {
+    let wired = Wired::new(&["alpha", "beta"]).await;
+    wired
+        .observe(&["alpha", "beta"], &["alpha", "beta"], &[], "running")
+        .await;
+    wired.marks.set("alpha", true);
+
+    let id = || "alpha".to_string();
+    let mut events = vec![
+        ExecutionEvent::ApplyStarted {
+            change_id: id(),
+            command: "apply".into(),
+        },
+        ExecutionEvent::ApplyCompleted {
+            change_id: id(),
+            revision: "r".into(),
+        },
+        ExecutionEvent::ArchiveStarted {
+            change_id: id(),
+            command: "archive".into(),
+        },
+        ExecutionEvent::ChangeArchived(id()),
+        ExecutionEvent::ResolveStarted {
+            change_id: id(),
+            command: "merge".into(),
+        },
+    ];
+    events.push(match placement {
+        Placement::ListedMerged | Placement::KeptMerged => ExecutionEvent::MergeCompleted {
+            change_id: id(),
+            revision: "r".into(),
+        },
+        Placement::ListedMergeWait | Placement::PrivateMergeWait => ExecutionEvent::HookFailed {
+            change_id: id(),
+            hook_type: "on_merged".into(),
+            error: "hook exited 1".into(),
+        },
+    });
+    for event in events {
+        wired.reducer.write().await.apply_execution_event(&event);
+        wired.web_state.apply_execution_event(&event).await;
+    }
+    if matches!(
+        placement,
+        Placement::KeptMerged | Placement::PrivateMergeWait
+    ) {
+        wired.observe(&["beta"], &["beta"], &[], "running").await;
+    }
+
+    let published = wired
+        .snapshot()
+        .changes
+        .iter()
+        .any(|change| change.id == "alpha");
+    assert_eq!(
+        published,
+        placement != Placement::PrivateMergeWait,
+        "{placement:?} publishes alpha exactly unless it is private"
+    );
+    wired
+}
+
+/// Everything a command could have touched, read back after it settled.
+#[derive(Debug, PartialEq)]
+struct Settled {
+    outcome: Result<bool, ErrorCode>,
+    marked: Vec<String>,
+    scheduler: String,
+    statuses: (String, String),
+    alpha_queue_intent: String,
+}
+
+async fn settle(wired: &Wired, command: &CommandSpec) -> Settled {
+    let outcome = wired
+        .executor
+        .execute(command)
+        .await
+        .map(|summary| summary.changed)
+        .map_err(|failure| failure.error_code);
+    let mut marked = wired.marks.marked_ids();
+    marked.sort();
+    let alpha_queue_intent = format!(
+        "{:?}",
+        wired
+            .reducer
+            .read()
+            .await
+            .change_runtime("alpha")
+            .map(|runtime| runtime.queue_intent.clone())
+    );
+    Settled {
+        outcome,
+        marked,
+        scheduler: format!("{:?}", wired.scheduler.calls()),
+        statuses: (wired.status("alpha").await, wired.status("beta").await),
+        alpha_queue_intent,
+    }
+}
+
+#[tokio::test]
+async fn retain_api_completed_retained_and_private_rows_admit_like_listed_rows() {
+    let alpha = || "alpha".to_string();
+    let commands = [
+        CommandSpec::SetExecutionMark {
+            change_id: alpha(),
+            marked: true,
+        },
+        CommandSpec::SetExecutionMark {
+            change_id: alpha(),
+            marked: false,
+        },
+        CommandSpec::SetAllExecutionMarks {},
+        CommandSpec::SetQueueIntent {
+            change_id: alpha(),
+            queued: true,
+        },
+        CommandSpec::RetryChange { change_id: alpha() },
+        CommandSpec::RetryErrors {
+            change_ids: vec![alpha()],
+        },
+        CommandSpec::StopAndDequeue { change_id: alpha() },
+        CommandSpec::ForceStopChange { change_id: alpha() },
+        CommandSpec::ResolveMerge { change_id: alpha() },
+        CommandSpec::Start,
+    ];
+    assert_eq!(commands.len(), 10);
+
+    for (listed, retained) in [
+        (Placement::ListedMerged, Placement::KeptMerged),
+        (Placement::ListedMergeWait, Placement::PrivateMergeWait),
+    ] {
+        for command in &commands {
+            let control = alpha_fixture(listed).await;
+            let subject = alpha_fixture(retained).await;
+            let control_settled = settle(&control, command).await;
+            let subject_settled = settle(&subject, command).await;
+            assert_eq!(
+                subject_settled, control_settled,
+                "{command:?} must settle the same for {retained:?} as for {listed:?}"
+            );
+
+            if retained == Placement::KeptMerged {
+                assert_eq!(subject_settled.statuses.0, "merged", "{command:?}");
+                assert!(
+                    !subject_settled.scheduler.contains("\"alpha\""),
+                    "{command:?} reached the scheduler for alpha: {}",
+                    subject_settled.scheduler
+                );
+                let actions = |wired: &Wired| {
+                    wired
+                        .snapshot()
+                        .changes
+                        .into_iter()
+                        .find(|change| change.id == "alpha")
+                        .expect("alpha is published")
+                        .actions
+                };
+                assert_eq!(actions(&subject), actions(&control), "{command:?}");
+            }
+        }
+    }
+
+    // Untouched by any command that refuses a terminal target, the retained
+    // merged row also keeps its lingering mark.
+    let kept = alpha_fixture(Placement::KeptMerged).await;
+    let settled = settle(&kept, &CommandSpec::Start).await;
+    assert_eq!(settled.statuses.0, "merged");
+    assert!(kept.marks.is_marked("alpha"));
+}

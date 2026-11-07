@@ -621,6 +621,98 @@ active_since)` and "run elapsed" as `now - started_at` while `ended_at` is
 `null`. An older owner omits all three; that decodes as `None` — "unpublished" —
 never as `false` or zero, and every `cflx client` verb keeps working against it.
 
+### Completed changes stay listed
+
+A change this owner already published stays in `changes` (state, `GET
+/api/v2/changes`, `GET /api/v2/changes/{id}`, and `GET /api/v2/execution-status`)
+after its proposal leaves `openspec/changes/`, for as long as the reducer reports
+it `merged` or `pushed`: for the rest of this owner incarnation. A previously
+published row the reducer reports `resolving` stays while that status lasts, so
+the merge window — the base already lost the proposal, `MergeCompleted` has not
+arrived yet — cannot drop it. Rows come after the observation's own rows: the
+observation's order, then kept rows in their previous order, then republished
+ones in release order.
+
+- **Only a reducer-authored status keeps a row.** The deciding status is the
+  update's one reducer read (the dispatch's state or the non-blocking
+  read-back), and only when none is readable the row's own last
+  reducer-derived status. Absence, task counts, the archive directory, and
+  `archive_complete` are never consulted, and no row is ever published `merged`
+  or `pushed` unless the reducer authored it. Every other absent row — `not
+  queued` even with all tasks done, `merge wait`, `resolve pending`, `error`,
+  `rejected`, `stopped`, a row with no reducer bound — is not published, exactly
+  as before.
+- **A settled `resolving` row is released only by an observation.** Until an
+  observation that reads the reducer releases it, it stays published with its
+  current reducer status (for example `merge wait` or `error`); an observation
+  that cannot read the reducer keeps it while its stored status still says
+  `resolving`.
+- **Released is not forgotten.** A row an observation releases moves into a
+  private, process-local memory (`released_rows`: the last published row per
+  ID, in release order). When the reducer later authors `merged`, `pushed`, or
+  `resolving` for it — an explicit resolve after an `on_merged` failure, or
+  resumed publication after a push failure — it is published again, at the
+  first reducer event or reducer-reading observation after that, with the
+  timing, latest activity, and attention this owner kept recording for it, and
+  the net-active time it kept (frozen while the row was private). The memory holds at most one row per ID this incarnation
+  published and stopped publishing — the same bound as the reducer's own
+  never-pruned runtime map — and is discarded per ID only when the workspace
+  lists it again. It is never projected, persisted, or read by admission,
+  `classify_actions`, totals, the run clock, text edit, or the refresh preview:
+  a released change is answered everywhere exactly as an ID this owner never
+  observed.
+- **Listed again.** A released ID the workspace lists again is a new arrival
+  with fresh facts, exactly as before retention. A *published* row listed again
+  keeps its facts and updates in place with the listing's fields and the
+  reducer's status, so a re-created directory for a merged ID can show, for
+  example, `merged` 1/3; nothing starts a new lifecycle for it.
+- **Instance-scoped.** Nothing is persisted or rehydrated. A new owner has a new
+  `instance_id`, scans no archive, starts with no retained rows and no memory,
+  and publishes nothing for a reducer completion of an ID it never published.
+- **Non-authority.** Retention changes the row set only. Every action of a kept
+  `merged`/`pushed` row is blocked, totals count it as `completed` (a kept
+  `resolving` row as `in_progress`), and released rows count nowhere. Command
+  admission, marks, the run clock, and `net_active` are unchanged.
+- **Discoverable.** `GET /api/v2/capabilities` publishes
+  `completed_change_retention` `{available: true, retained_statuses: [merged,
+  pushed], settling_statuses: [resolving], scope: instance}`. An older owner
+  omits the block, which decodes as `available: false`: treat its rows as
+  possibly transient, without refusing to start.
+- **Hiding is the client's.** Hiding or restoring a row is client-local and
+  needs no command — there is none. Key that state by `instance_id`, and clear
+  or rekey it when `instance_id` changes. TUI `d`/`D` dismissal never removes
+  an API row.
+- **Run clock.** The resolve-side run-clock rule reads the published rows, so
+  for an explicit resolve started while the resolve lane is free the API
+  `run_clock` and the TUI `Elapsed` line agree during an absent `resolving`
+  refresh, at its settlement, and afterwards. A private `resolve pending` row
+  waiting behind a busy lane is processing for the TUI but not published here,
+  so the API clock can freeze earlier than the TUI's in that interval, as it
+  already could; no parity is claimed for it.
+- `changes_refreshed` event payloads keep counting the observation, not the
+  published rows; the snapshot at the event's revision is the authority for rows.
+
+Owner-side consequences on existing surfaces: for a kept `merged`/`pushed` row,
+`GET /api/v2/changes/{id}` answers 200 instead of 404,
+`GET /api/v2/execution-status` lists it, `GET
+/api/v2/proposals/{id}/refresh-preview` answers 200 with `eligible: false` and
+`refusal: terminal_target` instead of 404, the change text route still answers
+404 `not_found`, and `totals.total`/`totals.completed` include it. Its
+`worktree` is `null` exactly when the latest observation reports no worktree
+path for its ID, and its `parallel.blocked_reason` is `not_committed` exactly
+when the latest event observation's committed set lacks it.
+
+Derived client consequences — documented, not validated by this change, which
+adds no `cflx client` code: `mark`/`unmark` on a kept row settles `unchanged`
+with the non-markable-target reason instead of a local `change_not_found`;
+`force-stop-change` and `refresh-proposal` return `target_ineligible`; `wait`
+certifies a kept `merged`/`pushed` row against the repository as before and,
+when certification fails, returns `change_requires_action` instead of
+`change_not_found`; a `wait` that observes a settled row still published as
+`merge wait` or `error` returns `change_requires_action` (exit 27) where the
+row's disappearance used to keep it observing; and for a released ID `wait`
+behaves as for an absent change today until the row is published again.
+
 ### Merging a worktree over `/api/v2`
 
 `merge_worktree` and `merge_worktree_abort_on_conflict` are separate commands

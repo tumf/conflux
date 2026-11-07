@@ -405,6 +405,180 @@ fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
     state.last_updated = chrono::Utc::now().to_rfc3339();
 }
 
+/// Reducer-authored display statuses that keep an already published row for the
+/// rest of this owner incarnation once a workspace observation stops listing it.
+pub const RETAINED_COMPLETION_STATUSES: [&str; 2] = ["merged", "pushed"];
+
+/// Reducer-authored display statuses that keep an already published row through
+/// workspace absence only while they last: the owner is integrating the change
+/// into the base right now.
+pub const SETTLING_RETENTION_STATUSES: [&str; 1] = ["resolving"];
+
+/// Lifetime published for retained rows: exactly this `instance_id`.
+pub const COMPLETED_CHANGE_RETENTION_SCOPE: &str = "instance";
+
+fn keeps_absent_row(display_status: &str) -> bool {
+    RETAINED_COMPLETION_STATUSES.contains(&display_status)
+        || SETTLING_RETENTION_STATUSES.contains(&display_status)
+}
+
+/// The completed-change retention guarantee this build's projection keeps.
+///
+/// Published unconditionally: retention is a property of how this owner builds
+/// its snapshot, not of any runtime binding.
+pub fn completed_change_retention_capability(
+) -> crate::web::remote_control_api::dto::CompletedChangeRetentionCapability {
+    crate::web::remote_control_api::dto::CompletedChangeRetentionCapability {
+        available: true,
+        retained_statuses: RETAINED_COMPLETION_STATUSES
+            .iter()
+            .map(|status| status.to_string())
+            .collect(),
+        settling_statuses: SETTLING_RETENTION_STATUSES
+            .iter()
+            .map(|status| status.to_string())
+            .collect(),
+        scope: COMPLETED_CHANGE_RETENTION_SCOPE.to_string(),
+    }
+}
+
+/// What one workspace observation did to the published rows and the private
+/// memory.
+#[derive(Debug, Default)]
+struct RetentionObservation {
+    /// Published ids the observation does not list (kept, then published
+    /// again), in published order.
+    kept_ids: Vec<String>,
+    /// Ids held in the private memory after the observation, in release order.
+    private_ids: Vec<String>,
+    /// Private ids the observation lists again; their memory was discarded.
+    reappeared_ids: Vec<String>,
+}
+
+/// The status that decides whether an absent published row stays published.
+///
+/// The update's one reducer read when it has one; otherwise the row's own last
+/// reducer-derived status, exactly the rule listed rows already follow when the
+/// reducer cannot be read. Absence, task counts, and the archive are never
+/// consulted.
+fn retention_deciding_status(
+    row: &ChangeStatus,
+    reducer: Option<&crate::orchestration::state::OrchestratorState>,
+) -> String {
+    match reducer {
+        Some(reducer) => reducer.display_status(&row.id).to_string(),
+        None => row
+            .queue_status
+            .clone()
+            .unwrap_or_else(|| "not queued".to_string()),
+    }
+}
+
+/// Reconcile one workspace observation with this incarnation's published rows.
+///
+/// `rows` holds the observation's rows, already built and preserved;
+/// `previous` is the published list being replaced, moved out of the stored
+/// snapshot; `released` is the private memory; `reducer` is the update's one
+/// reducer read.
+///
+/// The result is the observation's rows in observation order, then the absent
+/// rows kept by their deciding status in their previously published order, then
+/// remembered rows the reducer now completes, in release order. Every other
+/// absent row moves into the private memory, so no observation can erase the
+/// last copy of a row before the reducer completes it.
+fn reconcile_observation(
+    rows: &mut Vec<ChangeStatus>,
+    previous: Vec<ChangeStatus>,
+    released: &mut Vec<ChangeStatus>,
+    reducer: Option<&crate::orchestration::state::OrchestratorState>,
+) -> RetentionObservation {
+    let listed: std::collections::HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let observed_len = rows.len();
+
+    // A remembered change the workspace lists again is that change as the
+    // observation sees it, exactly as before retention existed.
+    let mut reappeared_ids = Vec::new();
+    released.retain(|row| {
+        if listed.contains(&row.id) {
+            reappeared_ids.push(row.id.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    let mut carried = Vec::new();
+    for mut row in previous {
+        if listed.contains(&row.id) {
+            continue;
+        }
+        let deciding = retention_deciding_status(&row, reducer);
+        if keeps_absent_row(&deciding) {
+            row.queue_status = Some(deciding);
+            carried.push(row);
+        } else {
+            released.push(row);
+        }
+    }
+
+    rows.extend(carried);
+    if let Some(reducer) = reducer {
+        rows.extend(take_republishable(released, reducer));
+    }
+
+    RetentionObservation {
+        kept_ids: rows[observed_len..]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect(),
+        private_ids: released.iter().map(|row| row.id.clone()).collect(),
+        reappeared_ids,
+    }
+}
+
+/// Move every private row whose reducer-authored display status keeps an absent
+/// row out of `released`, in release order, each with `queue_status` set to
+/// that status. The rows left behind keep their relative order.
+fn take_republishable(
+    released: &mut Vec<ChangeStatus>,
+    reducer: &crate::orchestration::state::OrchestratorState,
+) -> Vec<ChangeStatus> {
+    let mut republished = Vec::new();
+    let mut remaining = Vec::with_capacity(released.len());
+    for mut row in released.drain(..) {
+        let status = reducer.display_status(&row.id);
+        if keeps_absent_row(status) {
+            row.queue_status = Some(status.to_string());
+            republished.push(row);
+        } else {
+            remaining.push(row);
+        }
+    }
+    *released = remaining;
+    republished
+}
+
+/// Observe one workspace observation's ids in the facts store.
+///
+/// A remembered id the observation lists again is first dropped and then
+/// observed, so it arrives as new with empty facts — exactly what the store
+/// gives a change that was never kept.
+fn observe_with_reappearance(
+    facts: &mut OperatorFactsStore,
+    observed: &[&str],
+    reappeared: &[String],
+) {
+    if !reappeared.is_empty() {
+        facts.observe_changes(
+            observed
+                .iter()
+                .copied()
+                .filter(|id| !reappeared.iter().any(|reappeared| reappeared == id)),
+        );
+    }
+    facts.observe_changes(observed.iter().copied());
+}
+
 /// One monotonic and wall sample shared by everything a single observation
 /// records, so one event yields one instant.
 type ObservationSample = (std::time::Instant, chrono::DateTime<chrono::Utc>);
@@ -606,6 +780,15 @@ pub struct WebState {
     dispatch_revisions: std::sync::Mutex<DispatchRevisions>,
     /// Injected observation sample for tests; production samples the clocks.
     observation_clock: std::sync::Mutex<Option<ObservationSample>>,
+    /// Rows this owner incarnation published and no longer publishes, in release
+    /// order, at most one per change id, never an id `state.changes` holds.
+    ///
+    /// Private observability memory: never projected, never persisted, never read
+    /// by admission. A row leaves it only when the reducer authors `merged`,
+    /// `pushed`, or `resolving` for it (published again) or when an observation
+    /// lists its id again (discarded). Locked only while the `state` write guard
+    /// is held, and never across an `.await`.
+    released_rows: std::sync::Mutex<Vec<ChangeStatus>>,
 }
 
 /// Bounded map from dispatch identity to the revision that dispatch produced.
@@ -698,6 +881,7 @@ impl WebState {
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
             dispatch_revisions: std::sync::Mutex::new(DispatchRevisions::default()),
             observation_clock: std::sync::Mutex::new(None),
+            released_rows: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -827,12 +1011,14 @@ impl WebState {
         self.operator_facts.write().await.set_repo_root(repo_root);
     }
 
-    /// Reconcile attention tracking with a complete change list.
-    async fn observe_changes_for_attention(&self, changes: &[Change]) {
-        self.operator_facts
-            .write()
-            .await
-            .observe_changes(changes.iter().map(|change| change.id.as_str()));
+    /// Reconcile attention tracking with a complete set of observed ids.
+    ///
+    /// `observed` is the listing plus every kept and remembered id;
+    /// `reappeared` names remembered ids the listing holds again, which arrive
+    /// as new.
+    async fn observe_changes_for_attention(&self, observed: &[&str], reappeared: &[String]) {
+        let mut facts = self.operator_facts.write().await;
+        observe_with_reappearance(&mut facts, observed, reappeared);
     }
 
     /// The monitoring snapshot with every authoritative operator field filled in.
@@ -1106,85 +1292,92 @@ impl WebState {
     /// current mode and republishes it, `None` keeps whatever mode the
     /// projection already holds.
     async fn merge_workspace_observation(&self, changes: &[Change], app_mode: Option<&str>) {
-        // Query shared state if available for enriched metadata
-        let shared_state_opt = self.shared_orchestrator_state.read().await;
-        let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
-            shared_arc.try_read().ok()
-        } else {
-            None
-        };
-
-        let mut new_state = OrchestratorStateSnapshot::from_changes_with_shared_state(
-            changes,
-            shared_state_data.as_deref(),
-        );
-        drop(shared_state_data); // Drop guard before awaiting
-        drop(shared_state_opt); // Drop read lock
-
-        // Preserve progress, queue_status, app_mode, and is_resolving from existing state
-        let (old_changes, old_app_mode, old_persistent_idle, old_is_resolving) = {
-            let old_state = self.state.read().await;
-            (
-                old_state.changes.clone(),
-                old_state.app_mode.clone(),
-                old_state.persistent_scheduler_idle,
-                old_state.is_resolving,
-            )
-        };
-
-        // Preserve is_resolving to prevent overwriting runtime state during a
-        // workspace observation.
-        new_state.is_resolving = old_is_resolving;
-        match app_mode {
-            // The idle-episode fact is only meaningful under `select`, so an
-            // observation that publishes a different execution mode clears it
-            // with the mode.
-            Some(mode) => {
-                new_state.app_mode = mode.to_string();
-                new_state.persistent_scheduler_idle = old_persistent_idle && mode == "select";
-            }
-            // The idle-episode fact travels with the mode it qualifies: an
-            // observation that publishes no mode is not evidence that the
-            // scheduler stopped being idle.
-            None => {
-                new_state.app_mode = old_app_mode;
-                new_state.persistent_scheduler_idle = old_persistent_idle;
-            }
-        }
-
-        for new_change in &mut new_state.changes {
-            if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
-                // Preserve queue_status only when shared reducer state did not provide one.
-                if new_change.queue_status.is_none() {
-                    new_change.queue_status = existing.queue_status.clone();
-                }
-
-                // An observation that republishes the run's mode republishes the
-                // iteration identity with it; a mode-preserving one only fills
-                // the gap shared reducer state left.
-                if app_mode.is_some() || new_change.iteration_number.is_none() {
-                    new_change.iteration_number = existing.iteration_number;
-                }
-
-                // Preserve existing progress if retrieval failed (new data is 0/0)
-                // This prevents resetting progress to 0 on retrieval failure
-                if new_change.total_tasks == 0
-                    && (existing.completed_tasks > 0 || existing.total_tasks > 0)
-                {
-                    new_change.completed_tasks = existing.completed_tasks;
-                    new_change.total_tasks = existing.total_tasks;
-                    new_change.progress_percent = existing.progress_percent;
-                    new_change.status = existing.status.clone();
-                }
-            }
-        }
-
-        {
+        // One read-modify-write under a single `state` write guard, so a
+        // dispatch can never land between reading the published rows and
+        // replacing them. Lock order: the late-bound reducer slot (released at
+        // the end of this statement), `state`, the non-blocking reducer read,
+        // then `released_rows`.
+        let shared = self.shared_orchestrator_state.read().await.clone();
+        let retention = {
             let mut state = self.state.write().await;
-            *state = new_state;
-        }
+            let reducer_guard = shared.as_ref().and_then(|shared| shared.try_read().ok());
+            let reducer = reducer_guard.as_deref();
 
-        self.observe_changes_for_attention(changes).await;
+            let mut new_state =
+                OrchestratorStateSnapshot::from_changes_with_shared_state(changes, reducer);
+
+            // Preserve is_resolving to prevent overwriting runtime state during a
+            // workspace observation.
+            new_state.is_resolving = state.is_resolving;
+            match app_mode {
+                // The idle-episode fact is only meaningful under `select`, so an
+                // observation that publishes a different execution mode clears it
+                // with the mode.
+                Some(mode) => {
+                    new_state.app_mode = mode.to_string();
+                    new_state.persistent_scheduler_idle =
+                        state.persistent_scheduler_idle && mode == "select";
+                }
+                // The idle-episode fact travels with the mode it qualifies: an
+                // observation that publishes no mode is not evidence that the
+                // scheduler stopped being idle.
+                None => {
+                    new_state.app_mode = state.app_mode.clone();
+                    new_state.persistent_scheduler_idle = state.persistent_scheduler_idle;
+                }
+            }
+
+            for new_change in &mut new_state.changes {
+                if let Some(existing) = state.changes.iter().find(|c| c.id == new_change.id) {
+                    // Preserve queue_status only when shared reducer state did not provide one.
+                    if new_change.queue_status.is_none() {
+                        new_change.queue_status = existing.queue_status.clone();
+                    }
+
+                    // An observation that republishes the run's mode republishes the
+                    // iteration identity with it; a mode-preserving one only fills
+                    // the gap shared reducer state left.
+                    if app_mode.is_some() || new_change.iteration_number.is_none() {
+                        new_change.iteration_number = existing.iteration_number;
+                    }
+
+                    // Preserve existing progress if retrieval failed (new data is 0/0)
+                    // This prevents resetting progress to 0 on retrieval failure
+                    if new_change.total_tasks == 0
+                        && (existing.completed_tasks > 0 || existing.total_tasks > 0)
+                    {
+                        new_change.completed_tasks = existing.completed_tasks;
+                        new_change.total_tasks = existing.total_tasks;
+                        new_change.progress_percent = existing.progress_percent;
+                        new_change.status = existing.status.clone();
+                    }
+                }
+            }
+
+            let retention = {
+                let mut released = self
+                    .released_rows
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                reconcile_observation(
+                    &mut new_state.changes,
+                    std::mem::take(&mut state.changes),
+                    &mut released,
+                    reducer,
+                )
+            };
+
+            refresh_summary(&mut new_state);
+            drop(reducer_guard);
+            *state = new_state;
+            retention
+        };
+
+        let mut observed: Vec<&str> = changes.iter().map(|change| change.id.as_str()).collect();
+        observed.extend(retention.kept_ids.iter().map(String::as_str));
+        observed.extend(retention.private_ids.iter().map(String::as_str));
+        self.observe_changes_for_attention(&observed, &retention.reappeared_ids)
+            .await;
         self.sync_remote_control_projection().await;
     }
 
@@ -1255,9 +1448,13 @@ impl WebState {
         let sample = self.observation_sample();
         let pre_app_mode;
         let pre_is_resolving;
+        let mut retention: Option<RetentionObservation> = None;
         {
             let mut state = self.state.write().await;
             let mut updated = false;
+            // The published rows a workspace observation replaced, reconciled
+            // with retention after the match.
+            let mut observation_previous: Option<Vec<ChangeStatus>> = None;
             // Read before any arm moves them: the run clock opens on the mode a
             // Start *arrived* in, exactly as the TUI's `admit_run_targets` reads
             // its mode before `begin_run` sets Running.
@@ -1517,7 +1714,8 @@ impl WebState {
                         }
                     }
 
-                    state.changes = new_change_statuses;
+                    observation_previous =
+                        Some(std::mem::replace(&mut state.changes, new_change_statuses));
                     refresh_summary(&mut state);
                     updated = true;
                 }
@@ -1651,19 +1849,50 @@ impl WebState {
                 _ => {}
             }
 
-            if updated {
-                // Prefer the reducer state this dispatch produced; fall back to
-                // a read-back only when the caller had none to give.
-                if let Some(shared) = dispatch.state {
-                    apply_reducer_derived_queue_statuses(&mut state, shared);
-                } else if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
-                    if let Some(shared_arc) = shared_state_opt.as_ref() {
-                        if let Ok(shared) = shared_arc.try_read() {
-                            apply_reducer_derived_queue_statuses(&mut state, &shared);
-                        }
+            // One reducer read for this update, shared by retention and the
+            // stored-row enrichment: the reducer state this dispatch produced,
+            // otherwise a non-blocking read-back taken only when something
+            // below needs it. `released_rows` is locked only under the `state`
+            // write guard and released before any `.await`.
+            {
+                let mut released = self
+                    .released_rows
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let needs_read = observation_previous.is_some() || updated || !released.is_empty();
+                let slot_guard = if dispatch.state.is_none() && needs_read {
+                    self.shared_orchestrator_state.try_read().ok()
+                } else {
+                    None
+                };
+                let reducer_guard = slot_guard
+                    .as_ref()
+                    .and_then(|slot| slot.as_ref())
+                    .and_then(|shared| shared.try_read().ok());
+                let reducer = dispatch.state.or(reducer_guard.as_deref());
+
+                if let Some(previous) = observation_previous.take() {
+                    retention = Some(reconcile_observation(
+                        &mut state.changes,
+                        previous,
+                        &mut released,
+                        reducer,
+                    ));
+                } else if let Some(reducer) = reducer {
+                    let republished = take_republishable(&mut released, reducer);
+                    if !republished.is_empty() {
+                        state.changes.extend(republished);
+                        updated = true;
                     }
                 }
-                refresh_summary(&mut state);
+                drop(released);
+
+                if updated {
+                    if let Some(shared) = reducer {
+                        apply_reducer_derived_queue_statuses(&mut state, shared);
+                    }
+                    refresh_summary(&mut state);
+                }
             }
         }
 
@@ -1675,7 +1904,7 @@ impl WebState {
         // snapshot is projected, so timing, latest activity, eligibility, the
         // worktree relation, and both clocks all reach the client at the
         // revision this event produced rather than one revision late.
-        self.absorb_operator_facts(event, sample, run_clock_step)
+        self.absorb_operator_facts(event, sample, run_clock_step, retention.as_ref())
             .await;
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
@@ -1755,6 +1984,7 @@ impl WebState {
         event: &ExecutionEvent,
         (now, wall): ObservationSample,
         run_clock_step: Option<ContextualRunClockStep>,
+        retention: Option<&RetentionObservation>,
     ) {
         let mut facts = self.operator_facts.write().await;
         match run_clock_step {
@@ -1771,12 +2001,20 @@ impl WebState {
                 worktree_paths,
                 ..
             } => {
-                facts.observe_changes(
-                    changes
-                        .iter()
-                        .chain(rejected_changes.iter())
-                        .map(|change| change.id.as_str()),
-                );
+                // Kept and remembered ids stay observed, so their timing,
+                // latest activity, and attention survive absence and release.
+                let mut observed: Vec<&str> = changes
+                    .iter()
+                    .chain(rejected_changes.iter())
+                    .map(|change| change.id.as_str())
+                    .collect();
+                let mut reappeared: &[String] = &[];
+                if let Some(retention) = retention {
+                    observed.extend(retention.kept_ids.iter().map(String::as_str));
+                    observed.extend(retention.private_ids.iter().map(String::as_str));
+                    reappeared = &retention.reappeared_ids;
+                }
+                observe_with_reappearance(&mut facts, &observed, reappeared);
                 facts.apply_parallel_eligibility(committed_change_ids, uncommitted_file_change_ids);
                 facts.apply_worktree_paths(worktree_paths.clone());
             }
@@ -3005,5 +3243,905 @@ mod tests {
             Some("queued".to_string()),
             "web state should converge back to queued after dependency resolved"
         );
+    }
+
+    mod retain_api_completed {
+        //! Completed-change retention through `WebState`'s own two rebuild
+        //! paths, against a real reducer.
+
+        use super::*;
+        use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+        use crate::web::remote_control_api::dto::ChangeResource;
+
+        pub(super) struct Owner {
+            pub web: Arc<WebState>,
+            pub reducer: Arc<RwLock<OrchestratorState>>,
+        }
+
+        pub(super) fn change(id: &str, completed: u32, total: u32) -> Change {
+            super::create_test_change(id, completed, total)
+        }
+
+        pub(super) fn refreshed(listed: &[Change]) -> ExecutionEvent {
+            ExecutionEvent::ChangesRefreshed {
+                changes: listed.to_vec(),
+                rejected_changes: Vec::new(),
+                committed_change_ids: listed.iter().map(|change| change.id.clone()).collect(),
+                uncommitted_file_change_ids: Default::default(),
+                worktree_change_ids: Default::default(),
+                worktree_paths: Default::default(),
+                worktree_not_ahead_ids: Default::default(),
+                merge_wait_ids: Default::default(),
+            }
+        }
+
+        impl Owner {
+            pub async fn new(initial: &[Change]) -> Self {
+                let reducer = Arc::new(RwLock::new(OrchestratorState::new(
+                    initial.iter().map(|change| change.id.clone()).collect(),
+                    0,
+                )));
+                Self::with_reducer(initial, reducer).await
+            }
+
+            pub async fn with_reducer(
+                initial: &[Change],
+                reducer: Arc<RwLock<OrchestratorState>>,
+            ) -> Self {
+                let web = Arc::new(WebState::new(&[]));
+                web.set_shared_state(reducer.clone()).await;
+                let owner = Self { web, reducer };
+                owner.refresh(initial).await;
+                owner
+            }
+
+            pub async fn deliver(&self, event: ExecutionEvent) {
+                self.reducer.write().await.apply_execution_event(&event);
+                self.web.apply_execution_event(&event).await;
+            }
+
+            pub async fn command(&self, command: ReducerCommand) {
+                self.reducer.write().await.apply_command(command);
+            }
+
+            pub async fn refresh(&self, listed: &[Change]) {
+                self.deliver(refreshed(listed)).await;
+            }
+
+            pub async fn merge(&self, id: &str) {
+                self.archive(id).await;
+                self.deliver(ExecutionEvent::ResolveStarted {
+                    change_id: id.to_string(),
+                    command: "merge".to_string(),
+                })
+                .await;
+                self.deliver(ExecutionEvent::MergeCompleted {
+                    change_id: id.to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn archive(&self, id: &str) {
+                self.deliver(ExecutionEvent::ApplyStarted {
+                    change_id: id.to_string(),
+                    command: "apply".to_string(),
+                })
+                .await;
+                self.deliver(ExecutionEvent::ApplyCompleted {
+                    change_id: id.to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+                self.deliver(ExecutionEvent::ArchiveStarted {
+                    change_id: id.to_string(),
+                    command: "archive".to_string(),
+                })
+                .await;
+                self.deliver(ExecutionEvent::ChangeArchived(id.to_string()))
+                    .await;
+            }
+
+            pub async fn push_started(&self, id: &str) {
+                self.deliver(ExecutionEvent::PushStarted {
+                    change_id: id.to_string(),
+                    remote: "origin".to_string(),
+                    branch: "main".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn push_completed(&self, id: &str) {
+                self.deliver(ExecutionEvent::PushCompleted {
+                    change_id: id.to_string(),
+                    remote: "origin".to_string(),
+                    branch: "main".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn push(&self, id: &str) {
+                self.archive(id).await;
+                self.push_started(id).await;
+                self.push_completed(id).await;
+            }
+
+            pub async fn resolve_started(&self, id: &str) {
+                self.deliver(ExecutionEvent::ResolveStarted {
+                    change_id: id.to_string(),
+                    command: "merge".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn hook_failed(&self, id: &str) {
+                self.deliver(ExecutionEvent::HookFailed {
+                    change_id: id.to_string(),
+                    hook_type: "on_merged".to_string(),
+                    error: "hook exited 1".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn hookfail(&self, id: &str) {
+                self.archive(id).await;
+                self.resolve_started(id).await;
+                self.hook_failed(id).await;
+            }
+
+            pub async fn resolve(&self, id: &str) {
+                self.command(ReducerCommand::ResolveMerge(id.to_string()))
+                    .await;
+                self.resolve_started(id).await;
+                self.deliver(ExecutionEvent::MergeCompleted {
+                    change_id: id.to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn push_failed(&self, id: &str) {
+                self.deliver(ExecutionEvent::PushFailed {
+                    change_id: id.to_string(),
+                    remote: "origin".to_string(),
+                    branch: "main".to_string(),
+                    error: "rejected".to_string(),
+                })
+                .await;
+            }
+
+            pub async fn pushfail(&self, id: &str) {
+                self.archive(id).await;
+                self.push_started(id).await;
+                self.push_failed(id).await;
+            }
+
+            pub async fn resume_push(&self, id: &str) {
+                self.push_started(id).await;
+                self.push_completed(id).await;
+            }
+
+            pub async fn status(&self, id: &str) -> &'static str {
+                self.reducer.read().await.display_status(id)
+            }
+
+            pub async fn stored(&self) -> Vec<ChangeStatus> {
+                self.web.get_state().await.changes
+            }
+
+            pub fn projected(&self) -> Vec<ChangeResource> {
+                self.web.remote_control().projection().snapshot().0.changes
+            }
+
+            pub fn projected_row(&self, id: &str) -> Option<ChangeResource> {
+                self.projected().into_iter().find(|row| row.id == id)
+            }
+
+            pub fn revision(&self) -> u64 {
+                self.web.remote_control().projection().revision()
+            }
+
+            /// The ids published in both the stored rows and the projection.
+            pub async fn published(&self) -> Vec<String> {
+                let stored: Vec<String> =
+                    self.stored().await.into_iter().map(|row| row.id).collect();
+                let projected: Vec<String> =
+                    self.projected().into_iter().map(|row| row.id).collect();
+                assert_eq!(stored, projected, "stored and projected rows diverge");
+                stored
+            }
+        }
+
+        fn ids(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_statuses_are_the_reducer_authored_completion_vocabulary() {
+            assert_eq!(RETAINED_COMPLETION_STATUSES, ["merged", "pushed"]);
+            assert_eq!(SETTLING_RETENTION_STATUSES, ["resolving"]);
+            assert_eq!(COMPLETED_CHANGE_RETENTION_SCOPE, "instance");
+            for status in RETAINED_COMPLETION_STATUSES {
+                assert!(is_completed_status(status), "{status} must be completed");
+                assert!(keeps_absent_row(status));
+            }
+            assert!(is_active_status("resolving"));
+            assert!(keeps_absent_row("resolving"));
+            assert!(is_completed_status("archived"));
+            assert!(!keeps_absent_row("archived"));
+            for status in [
+                "not queued",
+                "queued",
+                "blocked",
+                "stalled",
+                "preparing",
+                "applying",
+                "accepting",
+                "rejecting",
+                "archiving",
+                "merge wait",
+                "resolve pending",
+                "reject pending",
+                "error",
+                "rejected",
+                "stopped",
+            ] {
+                assert!(!keeps_absent_row(status), "{status} must release");
+            }
+
+            let ids = ["m", "p", "a", "w", "f"];
+            let owner = Owner::new(&ids.map(|id| change(id, 1, 1))).await;
+            owner.merge("m").await;
+            assert_eq!(owner.status("m").await, "merged");
+            owner.push("p").await;
+            assert_eq!(owner.status("p").await, "pushed");
+            owner.archive("a").await;
+            assert_eq!(owner.status("a").await, "resolving");
+            owner
+                .deliver(ExecutionEvent::MergeCompleted {
+                    change_id: "a".to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+            owner.hookfail("w").await;
+            assert_eq!(owner.status("w").await, "merge wait");
+            owner.pushfail("f").await;
+            assert_eq!(owner.status("f").await, "error");
+
+            assert_eq!(
+                completed_change_retention_capability(),
+                crate::web::remote_control_api::dto::CompletedChangeRetentionCapability {
+                    available: true,
+                    retained_statuses: vec!["merged".to_string(), "pushed".to_string()],
+                    settling_statuses: vec!["resolving".to_string()],
+                    scope: "instance".to_string(),
+                }
+            );
+        }
+
+        async fn assert_kept_completions(owner: &Owner, iterations: &[(String, Option<u32>)]) {
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha", "beta"]));
+            let stored = owner.stored().await;
+            for (id, status, completed, total) in
+                [("alpha", "merged", 2, 2), ("beta", "pushed", 1, 1)]
+            {
+                let row = stored.iter().find(|row| row.id == id).unwrap();
+                assert_eq!(row.queue_status.as_deref(), Some(status));
+                assert_eq!((row.completed_tasks, row.total_tasks), (completed, total));
+                assert!(row.archive_complete, "{id} keeps archive completion");
+                let iteration = iterations.iter().find(|(i, _)| i == id).unwrap().1;
+                assert_eq!(row.iteration_number, iteration, "{id} iteration");
+                let projected = owner.projected_row(id).unwrap();
+                assert_eq!(projected.display_status, status);
+                assert_eq!(
+                    (projected.completed_tasks, projected.total_tasks),
+                    (completed, total)
+                );
+                assert_eq!(projected.progress_percent, 100.0);
+                assert_eq!(projected.archive_complete, Some(true));
+            }
+        }
+
+        async fn completed_owner() -> (Owner, Vec<(String, Option<u32>)>) {
+            let owner = Owner::new(&[
+                change("alpha", 2, 2),
+                change("beta", 1, 1),
+                change("gamma", 0, 3),
+            ])
+            .await;
+            owner.merge("alpha").await;
+            owner.push("beta").await;
+            let iterations = owner
+                .stored()
+                .await
+                .into_iter()
+                .map(|row| (row.id, row.iteration_number))
+                .collect();
+            (owner, iterations)
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_refresh_event_keeps_merged_and_pushed_rows() {
+            let (owner, iterations) = completed_owner().await;
+            let mut first = None;
+            for _ in 0..3 {
+                owner.refresh(&[change("gamma", 0, 3)]).await;
+                assert_kept_completions(&owner, &iterations).await;
+                first.get_or_insert(owner.revision());
+            }
+            assert_eq!(Some(owner.revision()), first);
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_disk_observation_keeps_merged_and_pushed_rows() {
+            let (owner, iterations) = completed_owner().await;
+            let mut first = None;
+            for _ in 0..3 {
+                owner.web.update(&[change("gamma", 0, 3)]).await;
+                assert_kept_completions(&owner, &iterations).await;
+                first.get_or_insert(owner.revision());
+            }
+            assert_eq!(Some(owner.revision()), first);
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_never_retains_without_reducer_completion() {
+            let all = [
+                "done", "waiting", "pending", "failed", "rejected", "stopped", "lane",
+            ];
+            let owner = Owner::new(&all.map(|id| change(id, 3, 3))).await;
+            owner.hookfail("waiting").await;
+            owner.archive("lane").await;
+            owner
+                .deliver(ExecutionEvent::ChangeArchived("pending".to_string()))
+                .await;
+            owner
+                .deliver(ExecutionEvent::ProcessingError {
+                    id: "failed".to_string(),
+                    error: "boom".to_string(),
+                })
+                .await;
+            owner
+                .deliver(ExecutionEvent::ChangeRejected {
+                    change_id: "rejected".to_string(),
+                    reason: "no".to_string(),
+                })
+                .await;
+            owner
+                .command(ReducerCommand::StopChange("stopped".to_string()))
+                .await;
+            for (id, status) in [
+                ("done", "not queued"),
+                ("waiting", "merge wait"),
+                ("pending", "resolve pending"),
+                ("failed", "error"),
+                ("rejected", "rejected"),
+                ("stopped", "stopped"),
+                ("lane", "resolving"),
+            ] {
+                assert_eq!(owner.status(id).await, status, "{id}");
+            }
+
+            let orphan = WebState::new(&[]);
+            orphan.update(&[change("orphan", 3, 3)]).await;
+            assert_eq!(orphan.get_state().await.changes[0].queue_status, None);
+
+            let lane = [change("lane", 3, 3)];
+            for round in 0..3 {
+                owner.refresh(&lane).await;
+                owner.web.update(&lane).await;
+                orphan.update(&[]).await;
+                orphan.apply_execution_event(&refreshed(&[])).await;
+                if round > 0 {
+                    owner
+                        .deliver(ExecutionEvent::ProcessingError {
+                            id: "failed".to_string(),
+                            error: "boom".to_string(),
+                        })
+                        .await;
+                }
+                assert_eq!(owner.published().await, ids(&["lane"]));
+                assert_eq!(owner.web.get_state().await.total_changes, 1);
+                let (snapshot, _, _) = owner.web.remote_control().projection().snapshot();
+                assert_eq!(snapshot.totals.total, 1);
+                assert!(orphan.get_state().await.changes.is_empty());
+                assert!(orphan
+                    .remote_control()
+                    .projection()
+                    .snapshot()
+                    .0
+                    .changes
+                    .is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_settled_row_is_released_then_republished_on_completion() {
+            let listed = [
+                change("alpha", 2, 2),
+                change("delta", 2, 2),
+                change("gamma", 0, 1),
+            ];
+            let owner = Owner::new(&listed).await;
+            let gamma = [change("gamma", 0, 1)];
+
+            owner.archive("alpha").await;
+            owner.resolve_started("alpha").await;
+            owner
+                .refresh(&[change("delta", 2, 2), change("gamma", 0, 1)])
+                .await;
+            assert_eq!(owner.published().await, ids(&["delta", "gamma", "alpha"]));
+            assert_eq!(
+                owner.projected_row("alpha").unwrap().display_status,
+                "resolving"
+            );
+            let (snapshot, _, _) = owner.web.remote_control().projection().snapshot();
+            assert_eq!(snapshot.totals.in_progress, 1);
+            owner
+                .deliver(ExecutionEvent::MergeCompleted {
+                    change_id: "alpha".to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+            assert_eq!(
+                owner.projected_row("alpha").unwrap().display_status,
+                "merged"
+            );
+            owner
+                .refresh(&[change("delta", 2, 2), change("gamma", 0, 1)])
+                .await;
+            owner
+                .web
+                .update(&[change("delta", 2, 2), change("gamma", 0, 1)])
+                .await;
+            assert_eq!(owner.published().await, ids(&["delta", "gamma", "alpha"]));
+            assert_eq!(
+                owner.projected_row("alpha").unwrap().display_status,
+                "merged"
+            );
+
+            owner.archive("delta").await;
+            owner.resolve_started("delta").await;
+            owner.refresh(&gamma).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "delta", "alpha"]));
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "resolving"
+            );
+            owner.hook_failed("delta").await;
+            // Released only by an observation: until then the settled row is
+            // still published, with its current reducer status.
+            assert_eq!(owner.published().await, ids(&["gamma", "delta", "alpha"]));
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "merge wait"
+            );
+
+            owner.refresh(&gamma).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha"]));
+            owner.web.update(&gamma).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha"]));
+
+            owner
+                .command(ReducerCommand::ResolveMerge("delta".to_string()))
+                .await;
+            owner.resolve_started("delta").await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha", "delta"]));
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "resolving"
+            );
+            owner
+                .deliver(ExecutionEvent::MergeCompleted {
+                    change_id: "delta".to_string(),
+                    revision: "rev".to_string(),
+                })
+                .await;
+            owner.refresh(&gamma).await;
+            owner.web.update(&gamma).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha", "delta"]));
+            let delta = owner.projected_row("delta").unwrap();
+            assert_eq!(delta.display_status, "merged");
+            assert_eq!((delta.completed_tasks, delta.total_tasks), (2, 2));
+            assert_eq!(delta.archive_complete, Some(true));
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_reappearance_updates_one_row_in_place() {
+            let owner = Owner::new(&[change("alpha", 2, 2), change("epsilon", 1, 1)]).await;
+            owner.merge("alpha").await;
+            owner.refresh(&[change("epsilon", 1, 1)]).await;
+            assert_eq!(owner.published().await, ids(&["epsilon", "alpha"]));
+
+            owner
+                .refresh(&[change("epsilon", 1, 1), change("alpha", 1, 3)])
+                .await;
+            assert_eq!(owner.published().await, ids(&["epsilon", "alpha"]));
+            let alpha = owner.projected_row("alpha").unwrap();
+            assert_eq!((alpha.completed_tasks, alpha.total_tasks), (1, 3));
+            assert_eq!(alpha.display_status, "merged");
+            assert_eq!(alpha.attention, AttentionState::None);
+
+            owner
+                .refresh(&[change("alpha", 0, 0), change("epsilon", 1, 1)])
+                .await;
+            assert_eq!(owner.published().await, ids(&["alpha", "epsilon"]));
+            let alpha = owner.projected_row("alpha").unwrap();
+            assert_eq!((alpha.completed_tasks, alpha.total_tasks), (1, 3));
+            owner.refresh(&[change("epsilon", 1, 1)]).await;
+            assert_eq!(owner.published().await, ids(&["epsilon", "alpha"]));
+            let alpha = owner.projected_row("alpha").unwrap();
+            assert_eq!((alpha.completed_tasks, alpha.total_tasks), (1, 3));
+            assert_eq!(alpha.display_status, "merged");
+
+            owner.hookfail("epsilon").await;
+            owner.refresh(&[]).await;
+            assert_eq!(owner.published().await, ids(&["alpha"]));
+            owner.refresh(&[change("epsilon", 1, 1)]).await;
+            assert_eq!(owner.published().await, ids(&["epsilon", "alpha"]));
+            let epsilon = owner.projected_row("epsilon").unwrap();
+            assert_eq!((epsilon.completed_tasks, epsilon.total_tasks), (1, 1));
+            assert_eq!(epsilon.display_status, "merge wait");
+            assert_eq!(epsilon.attention, AttentionState::New);
+            assert_eq!(epsilon.timing, ChangeTiming::default());
+            assert_eq!(epsilon.latest_activity, None);
+
+            owner.resolve("epsilon").await;
+            let epsilons: Vec<_> = owner
+                .projected()
+                .into_iter()
+                .filter(|row| row.id == "epsilon")
+                .collect();
+            assert_eq!(epsilons.len(), 1);
+            assert_eq!(epsilons[0].display_status, "merged");
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_order_is_observation_then_retained_then_republished() {
+            let all = ["a", "b", "c", "d", "e"];
+            let owner = Owner::new(&all.map(|id| change(id, 1, 1))).await;
+            owner.merge("b").await;
+            owner.hookfail("d").await;
+            owner.hookfail("e").await;
+            let listed = [change("a", 1, 1), change("c", 1, 1)];
+            owner.refresh(&listed).await;
+            assert_eq!(owner.published().await, ids(&["a", "c", "b"]));
+            owner.resolve("e").await;
+            assert_eq!(owner.published().await, ids(&["a", "c", "b", "e"]));
+            owner.resolve("d").await;
+            assert_eq!(owner.published().await, ids(&["a", "c", "b", "e", "d"]));
+            let mut first = None;
+            for _ in 0..3 {
+                owner.refresh(&listed).await;
+                assert_eq!(owner.published().await, ids(&["a", "c", "b", "e", "d"]));
+                first.get_or_insert(owner.revision());
+            }
+            assert_eq!(Some(owner.revision()), first);
+            owner
+                .refresh(&[change("a", 1, 1), change("c", 1, 1), change("f", 0, 1)])
+                .await;
+            assert_eq!(
+                owner.published().await,
+                ids(&["a", "c", "f", "b", "e", "d"])
+            );
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_contended_reducer_keeps_the_last_reducer_status() {
+            let owner = Owner::new(&[
+                change("alpha", 1, 1),
+                change("gamma", 0, 1),
+                change("delta", 1, 1),
+            ])
+            .await;
+            owner.merge("alpha").await;
+            owner.archive("delta").await;
+            owner.resolve_started("delta").await;
+            owner.refresh(&[change("gamma", 0, 1)]).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha", "delta"]));
+
+            let beta = [change("beta", 0, 1)];
+            {
+                let mut reducer = owner.reducer.write().await;
+                reducer.apply_execution_event(&ExecutionEvent::HookFailed {
+                    change_id: "delta".to_string(),
+                    hook_type: "on_merged".to_string(),
+                    error: "hook exited 1".to_string(),
+                });
+                owner.web.update(&beta).await;
+                owner.web.apply_execution_event(&refreshed(&beta)).await;
+                assert_eq!(owner.published().await, ids(&["beta", "alpha", "delta"]));
+                let stored = owner.stored().await;
+                assert_eq!(stored[1].queue_status.as_deref(), Some("merged"));
+                assert_eq!(stored[2].queue_status.as_deref(), Some("resolving"));
+                drop(reducer);
+            }
+            owner.web.sync_remote_control_projection().await;
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "merge wait"
+            );
+            owner.web.update(&beta).await;
+            assert_eq!(owner.published().await, ids(&["beta", "alpha"]));
+
+            {
+                let mut reducer = owner.reducer.write().await;
+                reducer.apply_command(ReducerCommand::ResolveMerge("delta".to_string()));
+                reducer.apply_execution_event(&ExecutionEvent::ResolveStarted {
+                    change_id: "delta".to_string(),
+                    command: "merge".to_string(),
+                });
+                let completed = ExecutionEvent::MergeCompleted {
+                    change_id: "delta".to_string(),
+                    revision: "rev".to_string(),
+                };
+                reducer.apply_execution_event(&completed);
+                owner.web.update(&beta).await;
+                owner.web.apply_execution_event(&completed).await;
+                assert_eq!(owner.published().await, ids(&["beta", "alpha"]));
+                drop(reducer);
+            }
+            owner.web.update(&beta).await;
+            assert_eq!(owner.published().await, ids(&["beta", "alpha", "delta"]));
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "merged"
+            );
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_failed_or_empty_refresh_keeps_completed_rows() {
+            let owner = Owner::new(&[
+                change("alpha", 1, 1),
+                change("gamma", 0, 1),
+                change("delta", 1, 1),
+            ])
+            .await;
+            owner.merge("alpha").await;
+            owner.hookfail("delta").await;
+            owner.refresh(&[change("gamma", 0, 1)]).await;
+            assert_eq!(owner.published().await, ids(&["gamma", "alpha"]));
+
+            let broken = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(broken.path().join("openspec")).unwrap();
+            std::fs::write(broken.path().join("openspec/changes"), "not a directory").unwrap();
+            let stored_before = owner.stored().await;
+            let projected_before = owner.web.remote_control().projection().snapshot();
+            assert!(owner.web.refresh_from_disk_at(broken.path()).await.is_err());
+            let stored_after = owner.stored().await;
+            assert_eq!(
+                stored_after.iter().map(|row| &row.id).collect::<Vec<_>>(),
+                stored_before.iter().map(|row| &row.id).collect::<Vec<_>>()
+            );
+            assert_eq!(stored_after, stored_before);
+            assert_eq!(
+                owner.web.remote_control().projection().snapshot(),
+                projected_before
+            );
+
+            let empty = tempfile::tempdir().unwrap();
+            assert!(owner.web.refresh_from_disk_at(empty.path()).await.is_ok());
+            assert_eq!(owner.published().await, ids(&["alpha"]));
+
+            owner.resolve("delta").await;
+            assert_eq!(owner.published().await, ids(&["alpha", "delta"]));
+            assert_eq!(
+                owner.projected_row("delta").unwrap().display_status,
+                "merged"
+            );
+        }
+
+        #[tokio::test]
+        async fn retain_api_completed_facts_survive_absence_and_release() {
+            let base = std::time::Instant::now();
+            let wall0 = chrono::Utc::now();
+            let all = [
+                change("alpha", 1, 1),
+                change("delta", 2, 2),
+                change("epsilon", 1, 1),
+            ];
+            let reducer = Arc::new(RwLock::new(OrchestratorState::new(
+                all.iter().map(|change| change.id.clone()).collect(),
+                0,
+            )));
+            let tested = Owner::with_reducer(&[], reducer.clone()).await;
+            let control = Arc::new(WebState::new(&[]));
+            control.set_shared_state(reducer.clone()).await;
+            let mut second = 0u64;
+            let pin = |second: u64| {
+                let now = base + std::time::Duration::from_secs(second);
+                let wall = wall0 + chrono::Duration::seconds(second as i64);
+                tested.web.pin_observation_clock_for_tests(now, wall);
+                control.pin_observation_clock_for_tests(now, wall);
+            };
+            // Every delivery reaches the reducer once and both stores at the same
+            // instant.
+            macro_rules! both {
+                ($event:expr) => {{
+                    second += 1;
+                    pin(second);
+                    let event = $event;
+                    reducer.write().await.apply_execution_event(&event);
+                    tested.web.apply_execution_event(&event).await;
+                    control.apply_execution_event(&event).await;
+                }};
+            }
+            // Observations are applied to the two stores only, each with its own
+            // listing; the reducer never prunes on `ChangesRefreshed`.
+            macro_rules! observe {
+                ($tested:expr, $control:expr) => {{
+                    second += 1;
+                    pin(second);
+                    tested.web.apply_execution_event(&refreshed($tested)).await;
+                    control.apply_execution_event(&refreshed($control)).await;
+                    tested.web.update($tested).await;
+                    control.update($control).await;
+                }};
+            }
+            both!(refreshed(&all));
+            control.update(&all).await;
+            tested.web.update(&all).await;
+
+            let id = |id: &str| id.to_string();
+            both!(ExecutionEvent::ProcessingStarted(id("alpha")));
+            for event in [
+                ExecutionEvent::ApplyStarted {
+                    change_id: id("alpha"),
+                    command: id("apply"),
+                },
+                ExecutionEvent::ApplyCompleted {
+                    change_id: id("alpha"),
+                    revision: id("r"),
+                },
+                ExecutionEvent::ArchiveStarted {
+                    change_id: id("alpha"),
+                    command: id("archive"),
+                },
+                ExecutionEvent::ChangeArchived(id("alpha")),
+                ExecutionEvent::ResolveStarted {
+                    change_id: id("alpha"),
+                    command: id("merge"),
+                },
+                ExecutionEvent::MergeCompleted {
+                    change_id: id("alpha"),
+                    revision: id("r"),
+                },
+            ] {
+                both!(event);
+            }
+            let before = tested.projected_row("alpha").unwrap();
+            assert!(before.timing.started_at.is_some() && before.timing.completed_at.is_some());
+            assert_eq!(
+                before.latest_activity.as_ref().unwrap().event_type,
+                "merge_completed"
+            );
+            let net_active = before.net_active.clone().unwrap();
+            assert!(net_active.active_since.is_none());
+            assert!(net_active.accumulated_ms > 0);
+
+            let rest = [change("delta", 2, 2), change("epsilon", 1, 1)];
+            for _ in 0..3 {
+                second += 1;
+                pin(second);
+                tested.web.apply_execution_event(&refreshed(&rest)).await;
+            }
+            for _ in 0..2 {
+                tested.web.update(&rest).await;
+            }
+            let after = tested.projected_row("alpha").unwrap();
+            assert_eq!(after.timing, before.timing);
+            assert_eq!(after.latest_activity, before.latest_activity);
+            assert_eq!(after.net_active, before.net_active);
+            assert_eq!(after.attention, before.attention);
+            assert_eq!(after.worktree, None);
+            assert_eq!(
+                after.parallel.blocked_reason,
+                Some(crate::web::remote_control_api::dto::ParallelBlockedReason::NotCommitted)
+            );
+
+            let none: [Change; 0] = [];
+            for event in [
+                ExecutionEvent::ApplyStarted {
+                    change_id: id("delta"),
+                    command: id("apply"),
+                },
+                ExecutionEvent::ApplyCompleted {
+                    change_id: id("delta"),
+                    revision: id("r"),
+                },
+                ExecutionEvent::ArchiveStarted {
+                    change_id: id("delta"),
+                    command: id("archive"),
+                },
+                ExecutionEvent::ChangeArchived(id("delta")),
+                ExecutionEvent::ResolveStarted {
+                    change_id: id("delta"),
+                    command: id("merge"),
+                },
+                ExecutionEvent::HookFailed {
+                    change_id: id("delta"),
+                    hook_type: id("on_merged"),
+                    error: id("hook exited 1"),
+                },
+            ] {
+                both!(event);
+            }
+            for event in [
+                ExecutionEvent::ApplyStarted {
+                    change_id: id("epsilon"),
+                    command: id("apply"),
+                },
+                ExecutionEvent::ApplyCompleted {
+                    change_id: id("epsilon"),
+                    revision: id("r"),
+                },
+                ExecutionEvent::ArchiveStarted {
+                    change_id: id("epsilon"),
+                    command: id("archive"),
+                },
+                ExecutionEvent::ChangeArchived(id("epsilon")),
+                ExecutionEvent::PushStarted {
+                    change_id: id("epsilon"),
+                    remote: id("origin"),
+                    branch: id("main"),
+                },
+                ExecutionEvent::PushFailed {
+                    change_id: id("epsilon"),
+                    remote: id("origin"),
+                    branch: id("main"),
+                    error: id("rejected"),
+                },
+            ] {
+                both!(event);
+            }
+
+            // One event refresh and one disk observation omitting both between
+            // each failure and its recovery.
+            observe!(&none, &rest);
+            assert!(tested.projected_row("delta").is_none());
+            assert!(tested.projected_row("epsilon").is_none());
+            reducer
+                .write()
+                .await
+                .apply_command(ReducerCommand::ResolveMerge(id("delta")));
+            both!(ExecutionEvent::ResolveStarted {
+                change_id: id("delta"),
+                command: id("merge")
+            });
+            both!(ExecutionEvent::MergeCompleted {
+                change_id: id("delta"),
+                revision: id("r")
+            });
+            observe!(&none, &rest);
+            assert!(tested.projected_row("epsilon").is_none());
+            both!(ExecutionEvent::PushStarted {
+                change_id: id("epsilon"),
+                remote: id("origin"),
+                branch: id("main"),
+            });
+            both!(ExecutionEvent::PushCompleted {
+                change_id: id("epsilon"),
+                remote: id("origin"),
+                branch: id("main"),
+            });
+
+            let controlled = control.remote_control().projection().snapshot().0.changes;
+            for (id, status) in [("delta", "merged"), ("epsilon", "pushed")] {
+                let got = tested.projected_row(id).unwrap();
+                let want = controlled.iter().find(|row| row.id == id).unwrap();
+                assert_eq!(got.display_status, status);
+                assert_eq!(got.display_status, want.display_status, "{id}");
+                assert_eq!(got.completed_tasks, want.completed_tasks, "{id}");
+                assert_eq!(got.total_tasks, want.total_tasks, "{id}");
+                assert_eq!(got.progress_percent, want.progress_percent, "{id}");
+                assert_eq!(got.archive_complete, want.archive_complete, "{id}");
+                assert_eq!(got.iteration_number, want.iteration_number, "{id}");
+                assert_eq!(got.timing, want.timing, "{id}");
+                assert_eq!(got.latest_activity, want.latest_activity, "{id}");
+                assert_eq!(got.net_active, want.net_active, "{id}");
+                assert_eq!(got.attention, want.attention, "{id}");
+                assert_eq!(got.worktree, want.worktree, "{id}");
+            }
+        }
     }
 }

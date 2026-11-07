@@ -342,6 +342,7 @@ expanded command, environment values, or absolute paths. Session state events
             crate::web::remote_control_api::dto::SessionRunnerNotice,
             crate::web::remote_control_api::dto::SessionSetupFacts,
             crate::web::remote_control_api::dto::WorktreeSessionCapability,
+            crate::web::remote_control_api::dto::CompletedChangeRetentionCapability,
             crate::web::remote_control_api::dto::WorktreeSessionEventType,
             crate::web::remote_control_api::dto::WorktreeSessionResource,
             crate::web::remote_control_api::dto::WorktreeSessionResponse,

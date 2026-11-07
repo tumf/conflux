@@ -832,3 +832,411 @@ async fn remote_progress_timing_restart_starts_from_zero() {
     assert_eq!(run_clock.ended_at, None);
     assert_eq!(run_clock.elapsed_ms, None);
 }
+
+// ============================================================================
+// Completed-change retention parity
+// ============================================================================
+
+fn counted(id: &str, completed: u32, total: u32) -> Change {
+    Change {
+        completed_tasks: completed,
+        total_tasks: total,
+        ..change(id)
+    }
+}
+
+fn refreshed(listed: &[Change]) -> ExecutionEvent {
+    ExecutionEvent::ChangesRefreshed {
+        changes: listed.to_vec(),
+        rejected_changes: Vec::new(),
+        committed_change_ids: listed.iter().map(|change| change.id.clone()).collect(),
+        uncommitted_file_change_ids: HashSet::new(),
+        worktree_change_ids: HashSet::new(),
+        worktree_paths: Default::default(),
+        worktree_not_ahead_ids: HashSet::new(),
+        merge_wait_ids: HashSet::new(),
+    }
+}
+
+impl Fixture {
+    /// One workspace observation, delivered the way the runner delivers it:
+    /// reducer and web store at `seconds`, the TUI's reducer synchronization,
+    /// then the TUI handler.
+    async fn refresh_both(&mut self, seconds: u64, listed: &[Change]) {
+        let event = refreshed(listed);
+        self.web_event(seconds, &event).await;
+        self.sync_tui(seconds).await;
+        self.tui.handle_orchestrator_event(event);
+    }
+
+    /// The periodic disk observation of the web store at `seconds`.
+    async fn update_at(&self, seconds: u64, listed: &[Change]) {
+        let (now, wall) = self.clock.at(seconds);
+        self.web.pin_observation_clock_for_tests(now, wall);
+        self.web.update(listed).await;
+    }
+
+    /// One lifecycle event on both frontends at `seconds`.
+    ///
+    /// The reducer applies it first, as the dispatcher does. The TUI's reducer
+    /// synchronization then runs at the injected instant *before* the TUI
+    /// handler, so the handler's own `Instant::now()` status write finds the
+    /// status already set and moves no clock boundary. A resolve-side
+    /// settlement the TUI would apply through `try_transition_to_select` is
+    /// applied at the injected instant too, the way
+    /// `remote_progress_timing_run_clock_resolve_settlement_matches_tui` does,
+    /// so the handler's own wall-clock call then finds nothing to do.
+    async fn both(&mut self, seconds: u64, event: ExecutionEvent) {
+        self.reducer.write().await.apply_execution_event(&event);
+        self.sync_tui(seconds).await;
+        let settlement = match &event {
+            ExecutionEvent::MergeCompleted { change_id, .. }
+                if self.tui.is_resolving() || self.tui.has_queued_resolves() =>
+            {
+                Some((change_id.clone(), "merged"))
+            }
+            ExecutionEvent::HookFailed {
+                change_id,
+                hook_type,
+                ..
+            } if hook_type == "on_merged" => {
+                let merged = self
+                    .tui
+                    .changes
+                    .iter()
+                    .any(|row| row.id == *change_id && row.display_status_cache == "merged");
+                Some((
+                    change_id.clone(),
+                    if merged { "merged" } else { "merge wait" },
+                ))
+            }
+            _ => None,
+        };
+        if let Some((target, rewrite)) = settlement {
+            tui_resolve_settles_at(&mut self.tui, &target, rewrite, self.clock.at(seconds).0);
+        }
+        self.tui.handle_orchestrator_event(event.clone());
+        let (now, wall) = self.clock.at(seconds);
+        self.web.pin_observation_clock_for_tests(now, wall);
+        self.web.apply_execution_event(&event).await;
+        self.sync_tui(seconds).await;
+    }
+
+    fn tui_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.tui.changes.iter().map(|row| row.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    fn api_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .snapshot()
+            .0
+            .changes
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Display status, archive completion, and task counts agree for `id`.
+    fn assert_row_parity(&self, id: &str) {
+        let api = self.row(id);
+        let tui = self
+            .tui
+            .changes
+            .iter()
+            .find(|row| row.id == id)
+            .expect("TUI row");
+        assert_eq!(api.display_status, tui.display_status_cache, "{id} status");
+        assert_eq!(
+            api.archive_complete,
+            Some(tui.archive_complete_cache),
+            "{id} archive"
+        );
+        assert_eq!(
+            (api.completed_tasks, api.total_tasks),
+            (tui.completed_tasks, tui.total_tasks),
+            "{id} tasks"
+        );
+    }
+}
+
+fn lifecycle(id: &str, stage: &str) -> ExecutionEvent {
+    let change_id = id.to_string();
+    match stage {
+        "apply" => apply_started(id),
+        "applied" => ExecutionEvent::ApplyCompleted {
+            change_id,
+            revision: "r".into(),
+        },
+        "archive" => ExecutionEvent::ArchiveStarted {
+            change_id,
+            command: "archive".into(),
+        },
+        "archived" => ExecutionEvent::ChangeArchived(change_id),
+        "resolve" => ExecutionEvent::ResolveStarted {
+            change_id,
+            command: "merge".into(),
+        },
+        "merged" => ExecutionEvent::MergeCompleted {
+            change_id,
+            revision: "r".into(),
+        },
+        "hook_failed" => ExecutionEvent::HookFailed {
+            change_id,
+            hook_type: "on_merged".into(),
+            error: "hook exited 1".into(),
+        },
+        "push" => ExecutionEvent::PushStarted {
+            change_id,
+            remote: "origin".into(),
+            branch: "main".into(),
+        },
+        "pushed" => ExecutionEvent::PushCompleted {
+            change_id,
+            remote: "origin".into(),
+            branch: "main".into(),
+        },
+        "push_failed" => ExecutionEvent::PushFailed {
+            change_id,
+            remote: "origin".into(),
+            branch: "main".into(),
+            error: "rejected".into(),
+        },
+        other => panic!("unknown stage {other}"),
+    }
+}
+
+/// Alpha merged and beta pushed through absent `resolving` refreshes; returns
+/// the fixture at +13s with alpha's and beta's timing captured at completion.
+async fn retained_parity_fixture() -> (Fixture, Vec<(String, ChangeResource)>) {
+    let mut fx = Fixture::new(&["alpha", "beta", "gamma"]).await;
+    let all = [
+        counted("alpha", 2, 2),
+        counted("beta", 1, 1),
+        counted("gamma", 0, 3),
+    ];
+    fx.update_at(0, &all).await;
+    fx.start(0, &["alpha", "beta", "gamma"]).await;
+    fx.refresh_both(0, &all).await;
+    let mut completed = Vec::new();
+
+    for (t, stage) in [
+        (1, "apply"),
+        (2, "applied"),
+        (3, "archive"),
+        (4, "archived"),
+        (5, "resolve"),
+    ] {
+        fx.both(t, lifecycle("alpha", stage)).await;
+    }
+    fx.refresh_both(6, &[counted("beta", 1, 1), counted("gamma", 0, 3)])
+        .await;
+    assert_eq!(fx.row("alpha").display_status, "resolving");
+    assert_eq!(fx.tui_ids(), fx.api_ids());
+    fx.assert_row_parity("alpha");
+    fx.assert_net_active_parity("alpha", 6);
+    fx.assert_run_clock_parity(Some(0), None);
+
+    fx.both(7, lifecycle("alpha", "merged")).await;
+    completed.push(("alpha".to_string(), fx.row("alpha")));
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    for (t, stage) in [
+        (8, "apply"),
+        (8, "applied"),
+        (9, "archive"),
+        (9, "archived"),
+        (10, "push"),
+    ] {
+        fx.both(t, lifecycle("beta", stage)).await;
+    }
+    fx.refresh_both(11, &[counted("gamma", 0, 3)]).await;
+    assert_eq!(fx.row("beta").display_status, "resolving");
+    assert_eq!(fx.tui_ids(), fx.api_ids());
+    fx.assert_row_parity("alpha");
+    fx.assert_row_parity("beta");
+    fx.assert_net_active_parity("alpha", 11);
+    fx.assert_net_active_parity("beta", 11);
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    fx.both(12, lifecycle("beta", "pushed")).await;
+    completed.push(("beta".to_string(), fx.row("beta")));
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    fx.refresh_both(13, &[counted("gamma", 0, 3)]).await;
+    (fx, completed)
+}
+
+#[tokio::test]
+async fn retain_api_completed_tui_and_api_retain_the_same_completed_rows() {
+    let (mut fx, completed) = retained_parity_fixture().await;
+    for t in [13, 14, 15] {
+        if t > 13 {
+            fx.refresh_both(t, &[counted("gamma", 0, 3)]).await;
+        }
+        assert_eq!(fx.tui_ids(), fx.api_ids(), "+{t}s");
+        assert_eq!(fx.api_ids(), ["alpha", "beta", "gamma"]);
+        for (id, at_completion) in &completed {
+            fx.assert_row_parity(id);
+            fx.assert_net_active_parity(id, t);
+            assert_eq!(fx.row(id).timing, at_completion.timing, "{id} timing");
+        }
+        assert_eq!(fx.row("alpha").display_status, "merged");
+        assert_eq!(fx.row("beta").display_status, "pushed");
+        fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+    }
+}
+
+#[tokio::test]
+async fn retain_api_completed_tui_dismissal_leaves_the_api_row() {
+    let (mut fx, _) = retained_parity_fixture().await;
+    let (before, revision) = fx.snapshot();
+    fx.tui.cursor_index = fx
+        .tui
+        .changes
+        .iter()
+        .position(|row| row.id == "alpha")
+        .expect("alpha is a TUI row");
+    assert!(fx.tui.dismiss_merged_row());
+    assert!(!fx.tui.changes.iter().any(|row| row.id == "alpha"));
+    assert_eq!(fx.snapshot(), (before.clone(), revision));
+
+    fx.refresh_both(14, &[counted("gamma", 0, 3)]).await;
+    assert!(!fx.tui.changes.iter().any(|row| row.id == "alpha"));
+    let (after, after_revision) = fx.snapshot();
+    assert_eq!(after_revision, revision);
+    assert_eq!(after, before);
+    assert!(after.changes.iter().any(|row| row.id == "alpha"));
+
+    fx.tui.dismiss_all_merged_rows();
+    assert_eq!(fx.snapshot(), (before, revision));
+}
+
+#[tokio::test]
+async fn retain_api_completed_tui_and_api_agree_after_on_merged_hook_recovery() {
+    let mut fx = Fixture::new(&["alpha", "gamma"]).await;
+    let all = [counted("alpha", 2, 2), counted("gamma", 0, 3)];
+    let gamma = [counted("gamma", 0, 3)];
+    fx.update_at(0, &all).await;
+    fx.start(0, &["alpha", "gamma"]).await;
+    fx.refresh_both(0, &all).await;
+    for (t, stage) in [
+        (1, "apply"),
+        (2, "applied"),
+        (3, "archive"),
+        (4, "archived"),
+        (5, "resolve"),
+    ] {
+        fx.both(t, lifecycle("alpha", stage)).await;
+    }
+    fx.refresh_both(6, &gamma).await;
+    assert_eq!(fx.row("alpha").display_status, "resolving");
+    fx.assert_row_parity("alpha");
+    fx.assert_run_clock_parity(Some(0), None);
+
+    fx.both(7, lifecycle("alpha", "hook_failed")).await;
+    fx.assert_row_parity("alpha");
+    assert_eq!(fx.row("alpha").display_status, "merge wait");
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    fx.refresh_both(8, &gamma).await;
+    fx.update_at(8, &gamma).await;
+    let tui_alpha = fx.tui.changes.iter().find(|row| row.id == "alpha").unwrap();
+    assert_eq!(tui_alpha.display_status_cache, "merge wait");
+    let mut without_alpha = fx.tui_ids();
+    without_alpha.retain(|id| id != "alpha");
+    assert_eq!(fx.api_ids(), without_alpha);
+    assert_eq!(fx.snapshot().0.totals.total, 1);
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    fx.command(ReducerCommand::ResolveMerge("alpha".into()))
+        .await;
+    fx.both(9, lifecycle("alpha", "resolve")).await;
+    assert_eq!(fx.row("alpha").display_status, "resolving");
+    assert_eq!(fx.tui_ids(), fx.api_ids());
+    fx.assert_row_parity("alpha");
+    fx.assert_run_clock_parity(Some(0), Some((7, 7)));
+
+    fx.both(10, lifecycle("alpha", "merged")).await;
+    fx.assert_run_clock_parity(Some(0), Some((10, 10)));
+    for t in [10, 11, 12] {
+        if t > 10 {
+            fx.refresh_both(t, &gamma).await;
+            fx.update_at(t, &gamma).await;
+        }
+        assert_eq!(fx.tui_ids(), fx.api_ids(), "+{t}s");
+        fx.assert_row_parity("alpha");
+        assert_eq!(fx.row("alpha").display_status, "merged");
+        assert_eq!(
+            (fx.row("alpha").completed_tasks, fx.row("alpha").total_tasks),
+            (2, 2)
+        );
+        fx.assert_net_active_parity("alpha", t);
+        fx.assert_run_clock_parity(Some(0), Some((10, 10)));
+    }
+}
+
+#[tokio::test]
+async fn retain_api_completed_tui_and_api_agree_after_push_failure_recovery() {
+    let mut fx = Fixture::new(&["beta", "gamma"]).await;
+    let all = [counted("beta", 1, 1), counted("gamma", 0, 3)];
+    let gamma = [counted("gamma", 0, 3)];
+    fx.update_at(0, &all).await;
+    fx.start(0, &["beta", "gamma"]).await;
+    fx.refresh_both(0, &all).await;
+    for (t, stage) in [
+        (1, "apply"),
+        (2, "applied"),
+        (3, "archive"),
+        (4, "archived"),
+        (5, "push"),
+    ] {
+        fx.both(t, lifecycle("beta", stage)).await;
+    }
+    fx.refresh_both(6, &gamma).await;
+    assert_eq!(fx.row("beta").display_status, "resolving");
+    fx.assert_row_parity("beta");
+    fx.assert_run_clock_parity(Some(0), None);
+
+    fx.both(7, lifecycle("beta", "push_failed")).await;
+    fx.assert_row_parity("beta");
+    assert_eq!(fx.row("beta").display_status, "error");
+    fx.assert_run_clock_parity(Some(0), None);
+
+    fx.refresh_both(8, &gamma).await;
+    fx.update_at(8, &gamma).await;
+    let tui_beta = fx.tui.changes.iter().find(|row| row.id == "beta").unwrap();
+    assert_eq!(tui_beta.display_status_cache, "error");
+    let mut without_beta = fx.tui_ids();
+    without_beta.retain(|id| id != "beta");
+    assert_eq!(fx.api_ids(), without_beta);
+    assert_eq!(fx.snapshot().0.totals.total, 1);
+    fx.assert_run_clock_parity(Some(0), None);
+
+    // Resumed publication: the reducer keeps its Error terminal until the
+    // publication completes, so beta stays unpublished at +9s.
+    fx.both(9, lifecycle("beta", "push")).await;
+    assert_eq!(fx.reducer.read().await.display_status("beta"), "error");
+    assert!(!fx.api_ids().contains(&"beta".to_string()));
+    fx.assert_run_clock_parity(Some(0), None);
+
+    fx.both(10, lifecycle("beta", "pushed")).await;
+    for t in [10, 11, 12] {
+        if t > 10 {
+            fx.refresh_both(t, &gamma).await;
+            fx.update_at(t, &gamma).await;
+        }
+        assert_eq!(fx.tui_ids(), fx.api_ids(), "+{t}s");
+        fx.assert_row_parity("beta");
+        assert_eq!(fx.row("beta").display_status, "pushed");
+        assert_eq!(
+            (fx.row("beta").completed_tasks, fx.row("beta").total_tasks),
+            (1, 1)
+        );
+        fx.assert_net_active_parity("beta", t);
+        fx.assert_run_clock_parity(Some(0), None);
+    }
+}
