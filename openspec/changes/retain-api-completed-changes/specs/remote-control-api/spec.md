@@ -130,7 +130,7 @@ Retention is process-local presentation state. No file, store, TTL, or later inc
 **Given**: the TUI and the API observe the same owner
 **When**: `alpha` reaches `merged`, `beta` reaches `pushed`, `gamma` reaches `merged` through an explicit resolve after an `on_merged` failure, and `delta` reaches `pushed` through resumed publication after a publication failure, and all of them are later absent from every observation
 **Then**: after each completion both frontends keep the completed change with the same `id`, display status, task counts, archive completion, and net-active time
-**And**: the API `run_clock` equals the TUI's Elapsed clock during an absent `resolving` refresh, at each settlement, and afterwards
+**And**: when explicit resolve is requested with the resolve lane free, the API `run_clock` equals the TUI's Elapsed clock during the absent `resolving` refresh, at its settlement, and afterwards; no parity is guaranteed while a private `resolve pending` row waits for a busy lane
 
 #### Scenario: TUI dismissal leaves the API row
 

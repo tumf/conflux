@@ -498,12 +498,15 @@ rows count nowhere.
 
 The run clock's resolve-side rule (`contextual_run_clock_step`) reads the
 published rows: a kept `resolving` row is processing there, which is what the
-TUI's `try_transition_to_select` sees because the TUI keeps that row, so the API
-and the TUI evaluate the same rows during an absent resolve and at its
-settlement. Private rows are not read by the rule, exactly as before this
-change, when such a row was gone; in the post-merge flows that create them they
-are `merge wait`, `error`, or `stopped`, none of which is a resolve-settlement
-processing status. `net_active` observes `merged`/`pushed` as a closed status,
+TUI's `try_transition_to_select` sees because the TUI keeps that row. When
+explicit resolve starts with the resolve lane free, API and TUI therefore
+evaluate the same rows during an absent resolve and at its settlement. Private
+rows are not read by the rule, exactly as before this change when such a row
+was gone. A private `resolve pending` row waiting while another change occupies
+the lane is a resolve-settlement processing status in the TUI but not in the
+API's published rows: the API run clock can freeze earlier than the TUI's in
+that interval (as on the existing API). No unconditional parity is claimed for
+private processing rows. `net_active` observes `merged`/`pushed` as a closed status,
 so nothing reopens or resets. Retention introduces no mark revocation or
 creation: `execution_marked` on a published row is the shared store's value (an
 archived change keeps its mark by existing spec), and Start/mark admission
@@ -862,10 +865,16 @@ Reuse `Fixture`, `Clock`, `start`, `web_event`, `sync_tui`, and
 `assert_net_active_parity`. Add `refresh_both(seconds, listed)`: apply one
 `ChangesRefreshed` to the reducer and the web store at `seconds`, then
 `sync_tui(seconds)`, then `tui.handle_orchestrator_event(event)` — the order the
-runner delivers it. "Run-clock parity" means the API `run_clock`
-(`started_at`, `ended_at`, `elapsed_ms`) equals the TUI's Elapsed clock — the
-shared `crate::orchestration::run_clock::RunClock` the TUI state advances from
-its own event table — read as a `RunClockView` at the same injected instant.
+runner delivers it. "Run-clock parity" is checked with the existing
+`Fixture::assert_run_clock_parity(started, frozen)` helper: it compares the API
+`run_clock` (`started_at`, `ended_at`, `elapsed_ms`) to the TUI's
+`orchestration_started_at` and `orchestration_elapsed`, both advanced from the
+same injected event instants. The TUI does not expose a `RunClockView` or use
+the Web `RunClock` struct. Follow the event delivery ordering in
+`remote_progress_timing_run_clock_resolve_settlement_matches_tui` for settlement
+steps. Only assert parity for the free-lane resolve and publication cases in
+this test plan, not for private `resolve pending` while another change owns the
+lane.
 
 15. `retain_api_completed_tui_and_api_retain_the_same_completed_rows` — fixture
     alpha, beta, gamma; start at 0; alpha merge at 1-5 with `ResolveStarted` at
@@ -906,11 +915,11 @@ its own event table — read as a `RunClockView` at the same injected instant.
     `refresh_both(6, [gamma])` keeps beta `resolving` on both; `PushFailed` at 7
     → `error` on both; `refresh_both(8, [gamma])` and `update(&[gamma])` at 8:
     the TUI keeps beta `error`, the API row set is the TUI's minus beta and the
-    API totals exclude it; resumed publication: `PushStarted` at 9 (the API
-    publishes beta exactly when the reducer status after it is `resolving` or
-    `pushed`) and `PushCompleted` at 10, after which the API publishes beta in
-    the snapshot that delivery produced; `refresh_both` and `update(&[gamma])`
-    at 11 and 12. From the first API publication on, the TUI and API row-ID sets
+    API totals exclude it; resumed publication: `PushStarted` at 9 leaves the
+    reducer's Error terminal unchanged and beta private; `PushCompleted` at 10
+    authors `pushed`, so the API first republishes beta in that dispatch's
+    snapshot. Then `refresh_both` and `update(&[gamma])` at 11 and 12. From
+    that first API publication onward, the TUI and API row-ID sets
     are equal and beta's display status, archive completion, and task counts
     (1/1) agree; at 10, 11, and 12 beta is `pushed` on both and
     `assert_net_active_parity` holds; run-clock parity holds at every step from

@@ -208,9 +208,13 @@ gates, and the independent review launch contract are fixed in `design.md`.
    the same retained IDs with the same display status, task counts, archive
    completion, and net-active time, including after `HookFailed` → resolve →
    `MergeCompleted` and `PushFailed` → resumed publication → `PushCompleted`
-   with absent refreshes between; the API `run_clock` equals the TUI's Elapsed
-   clock during absent `resolving` refreshes, at each settlement, and afterwards;
-   TUI `d` dismissal leaves the API row and revision unchanged; no Conflux
+   with absent refreshes between; when an explicit resolve is requested while
+   the resolve lane is free, the API `run_clock` equals the TUI's Elapsed clock
+   during absent `resolving` refreshes, at each settlement, and afterwards.
+   A private `resolve pending` row while another change occupies the lane can
+   make the API freeze earlier than the TUI, as the existing API does; this
+   change makes no unconditional parity claim for that interval. TUI `d`
+   dismissal leaves the API row and revision unchanged; no Conflux
    command exists for hiding or restoring rows.
 10. A new owner over the same workspace starts with a new `instance_id`, no row
     for a change merged by the earlier incarnation, and no memory of released
